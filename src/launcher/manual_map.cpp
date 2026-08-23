@@ -371,6 +371,107 @@ std::filesystem::path ProcessPath(HANDLE process, DWORD& error) {
     return path;
 }
 
+bool PathsEqual(const std::filesystem::path& left, const std::filesystem::path& right) noexcept {
+    try {
+        return Fold(std::filesystem::absolute(left).lexically_normal().wstring()) ==
+            Fold(std::filesystem::absolute(right).lexically_normal().wstring());
+    } catch (...) {
+        return false;
+    }
+}
+
+bool PathIsWithin(
+    const std::filesystem::path& candidate, const std::filesystem::path& root) noexcept {
+    try {
+        std::wstring candidate_value = Fold(
+            std::filesystem::absolute(candidate).lexically_normal().wstring());
+        std::wstring root_value = Fold(
+            std::filesystem::absolute(root).lexically_normal().wstring());
+        if (candidate_value.empty() || root_value.empty()) return false;
+        if (candidate_value == root_value) return true;
+        if (root_value.back() != L'\\') root_value.push_back(L'\\');
+        return candidate_value.starts_with(root_value);
+    } catch (...) {
+        return false;
+    }
+}
+
+std::set<DWORD> SnapshotLauncherProcessIds(
+    const std::filesystem::path& launcher_directory, DWORD& error) noexcept {
+    constexpr std::array<std::wstring_view, 4> launcher_names{
+        L"NTELauncher.exe", L"NTEGame.exe",
+        L"NTEGlobalLauncher.exe", L"NTEGlobalGame.exe"};
+    std::set<DWORD> result;
+    Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot) {
+        error = GetLastError();
+        return result;
+    }
+    PROCESSENTRY32W entry{.dwSize = sizeof(entry)};
+    if (Process32FirstW(snapshot.Get(), &entry) == FALSE) {
+        error = GetLastError();
+        if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+        return result;
+    }
+    do {
+        bool known_launcher{};
+        for (const auto name : launcher_names) {
+            if (_wcsicmp(entry.szExeFile, std::wstring(name).c_str()) == 0) {
+                known_launcher = true;
+                break;
+            }
+        }
+        if (known_launcher && entry.th32ProcessID != GetCurrentProcessId()) {
+            DWORD open_error{};
+            Handle process = OpenProcessWithAccess(
+                entry.th32ProcessID, PROCESS_QUERY_LIMITED_INFORMATION, open_error);
+            if (process) {
+                DWORD path_error{};
+                const auto path = ProcessPath(process.Get(), path_error);
+                if (path_error == ERROR_SUCCESS &&
+                    PathIsWithin(path.parent_path(), launcher_directory)) {
+                    result.insert(entry.th32ProcessID);
+                }
+            }
+        }
+        entry.dwSize = sizeof(entry);
+    } while (Process32NextW(snapshot.Get(), &entry) != FALSE);
+    error = GetLastError();
+    if (error == ERROR_NO_MORE_FILES) error = ERROR_SUCCESS;
+    return result;
+}
+
+bool TerminateExistingLauncherProcesses(
+    const std::filesystem::path& launcher_directory, DWORD& error) noexcept {
+    DWORD snapshot_error{};
+    const auto process_ids = SnapshotLauncherProcessIds(launcher_directory, snapshot_error);
+    if (snapshot_error != ERROR_SUCCESS) {
+        error = snapshot_error;
+        return false;
+    }
+    for (const DWORD process_id : process_ids) {
+        DWORD open_error{};
+        Handle process = OpenProcessWithAccess(
+            process_id, PROCESS_TERMINATE | SYNCHRONIZE, open_error);
+        if (!process) {
+            error = open_error;
+            return false;
+        }
+        if (TerminateProcess(process.Get(), ERROR_PROCESS_ABORTED) == FALSE &&
+            WaitForSingleObject(process.Get(), 0) != WAIT_OBJECT_0) {
+            error = GetLastError();
+            return false;
+        }
+        const DWORD wait = WaitForSingleObject(process.Get(), 5000);
+        if (wait != WAIT_OBJECT_0) {
+            error = wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT;
+            return false;
+        }
+    }
+    error = ERROR_SUCCESS;
+    return true;
+}
+
 DWORD NtStatusToWin32(NTSTATUS status) noexcept {
     using RtlNtStatusToDosErrorFn = ULONG(WINAPI*)(NTSTATUS);
     const auto convert = reinterpret_cast<RtlNtStatusToDosErrorFn>(
@@ -1772,6 +1873,15 @@ ManualMapLaunchResult LaunchAndManualMapRuntimeCore(
         if (!options.launcher_arguments.empty()) {
             command_line.push_back(L' ');
             command_line.append(options.launcher_arguments);
+        }
+
+        DWORD launcher_cleanup_error{};
+        if (!TerminateExistingLauncherProcesses(
+                launcher.parent_path(), launcher_cleanup_error)) {
+            result.mapping = Failure(
+                ManualMapError::ProcessControlFailure, launcher_cleanup_error,
+                "existing official launcher processes could not be stopped");
+            return result;
         }
 
         // Debugger and Job membership both alter launcher-visible process state.
