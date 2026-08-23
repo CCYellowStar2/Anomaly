@@ -58,17 +58,21 @@ constexpr std::size_t kMapLootSnapshotMetadataMaximumBytes = 256U;
 constexpr std::size_t kMapLootSnapshotMaximumItemsBytes =
     kMapLootSnapshotMaximumTextBytes - kMapLootSnapshotMetadataMaximumBytes;
 constexpr std::string_view kSettingsSchemaId = "settings";
-constexpr std::uint32_t kSettingsSchemaVersion = 9;
+constexpr std::uint32_t kSettingsSchemaVersion = 11;
+constexpr std::uint32_t kSettingsSchemaVersionBeforeAutoTeleportPickupDelay = 10;
+constexpr std::uint32_t kSettingsSchemaVersionBeforeAutoTeleportPickup = 9;
 constexpr std::uint32_t kPreviousSettingsSchemaVersion = 8;
 constexpr std::uint32_t kLegacySettingsSchemaVersion = 7;
 constexpr std::uint32_t kOldestSettingsSchemaVersion = 6;
-constexpr double kDefaultTeleportZOffsetCentimeters = 150.0;
+constexpr double kDefaultTeleportZOffsetCentimeters = 0.0;
 constexpr std::uint32_t kDefaultWebSocketPort = 14514U;
 constexpr std::uint32_t kMinimumWebSocketPort = 1U;
 constexpr std::uint32_t kMaximumWebSocketPort = 65535U;
+constexpr std::uint32_t kDefaultAutoTeleportPickupDelayMilliseconds = 100U;
+constexpr std::uint32_t kMaximumAutoTeleportPickupDelayMilliseconds = 60000U;
 constexpr std::uint32_t kEternalHeartValue = 666666U;
 constexpr std::string_view kSettingsSchema = R"json(
-{"type":"object","additionalProperties":false,"required":["menuOpen","enabled","drawLootBoxes","drawExtractions","showActiveExtractionsOnly","showPickableOnly","alwaysShowAccessCards","minimumValue","teleportZOffset","websocketEnabled","websocketPort"],"properties":{"menuOpen":{"type":"boolean"},"enabled":{"type":"boolean"},"drawLootBoxes":{"type":"boolean"},"drawExtractions":{"type":"boolean"},"showActiveExtractionsOnly":{"type":"boolean"},"showPickableOnly":{"type":"boolean"},"alwaysShowAccessCards":{"type":"boolean"},"minimumValue":{"type":"integer","minimum":0,"maximum":4294967295},"teleportZOffset":{"type":"number"},"websocketEnabled":{"type":"boolean"},"websocketPort":{"type":"integer","minimum":1,"maximum":65535}}}
+{"type":"object","additionalProperties":false,"required":["menuOpen","enabled","autoTeleportPickup","autoTeleportPickupDelayMs","drawLootBoxes","drawExtractions","showActiveExtractionsOnly","showPickableOnly","alwaysShowAccessCards","minimumValue","teleportZOffset","websocketEnabled","websocketPort"],"properties":{"menuOpen":{"type":"boolean"},"enabled":{"type":"boolean"},"autoTeleportPickup":{"type":"boolean"},"autoTeleportPickupDelayMs":{"type":"integer","minimum":0,"maximum":60000},"drawLootBoxes":{"type":"boolean"},"drawExtractions":{"type":"boolean"},"showActiveExtractionsOnly":{"type":"boolean"},"showPickableOnly":{"type":"boolean"},"alwaysShowAccessCards":{"type":"boolean"},"minimumValue":{"type":"integer","minimum":0,"maximum":4294967295},"teleportZOffset":{"type":"number"},"websocketEnabled":{"type":"boolean"},"websocketPort":{"type":"integer","minimum":1,"maximum":65535}}}
 )json";
 
 struct LootEntity final {
@@ -148,6 +152,9 @@ struct ExtractionDisplaySnapshot final {
 struct Settings final {
     bool menu_open{true};
     bool enabled{true};
+    bool auto_teleport_pickup{};
+    std::uint32_t auto_teleport_pickup_delay_ms{
+        kDefaultAutoTeleportPickupDelayMilliseconds};
     bool draw_loot_boxes{true};
     bool draw_extractions{true};
     bool show_active_extractions_only{true};
@@ -184,11 +191,11 @@ struct TeleportState final {
     bool has_result{};
     std::uint32_t result_code{ANOMALY_STATUS_V1_UNAVAILABLE};
     char result_message[192]{};
-    std::atomic_bool developer_mode{};
 };
 
 struct PendingPickup final {
     bool queued{};
+    bool automatic{};
     pink_paw_heist_esp::RobBankEntity entity;
 };
 
@@ -199,7 +206,15 @@ struct PickupState final {
     bool has_result{};
     std::uint32_t result_code{ANOMALY_STATUS_V1_UNAVAILABLE};
     char result_message[192]{};
-    std::atomic_bool developer_mode{};
+};
+
+struct AutoTeleportPickupState final {
+    bool waiting_for_teleport{};
+    bool waiting_for_pickup_delay{};
+    bool waiting_for_pickup_result{};
+    pink_paw_heist_esp::RobBankEntity entity{};
+    Clock::time_point pickup_due{};
+    std::vector<pink_paw_heist_esp::RobBankEntity> attempted;
 };
 
 struct Context final {
@@ -214,6 +229,9 @@ struct Context final {
 
     int menu_open{1};
     int enabled{1};
+    int auto_teleport_pickup{};
+    std::uint32_t auto_teleport_pickup_delay_ms{
+        kDefaultAutoTeleportPickupDelayMilliseconds};
     int draw_loot_boxes{1};
     int draw_extractions{1};
     int show_active_extractions_only{1};
@@ -237,6 +255,7 @@ struct Context final {
 Context g_context;
 TeleportState g_teleport;
 PickupState g_pickup;
+AutoTeleportPickupState g_auto_teleport_pickup;
 ExtractionCache g_extractions;
 pink_paw_heist_esp::RobBankRuntime g_rob_bank;
 pink_paw_heist_esp::PinkPawWorldGate g_world_gate;
@@ -249,6 +268,7 @@ std::atomic_bool g_loot_refresh_requested{true};
 AnomalyGenerationHandleV1 g_ahud_subscription{};
 MapSyncState g_map_sync;
 std::atomic_bool g_websocket_map_enabled{true};
+std::atomic_bool g_developer_mode{};
 
 template <typename Struct, typename Field>
 bool HasField(const Struct* value, const std::size_t offset) noexcept {
@@ -268,10 +288,17 @@ public:
 
         const bool require_hud_draw_settings = schema_version >= kLegacySettingsSchemaVersion;
         const bool require_websocket_settings = schema_version >= kPreviousSettingsSchemaVersion;
-        const bool require_access_card_setting = schema_version >= kSettingsSchemaVersion;
+        const bool require_access_card_setting =
+            schema_version >= kSettingsSchemaVersionBeforeAutoTeleportPickup;
+        const bool require_auto_teleport_pickup =
+            schema_version > kSettingsSchemaVersionBeforeAutoTeleportPickup;
+        const bool require_auto_teleport_pickup_delay =
+            schema_version >= kSettingsSchemaVersion;
 
         bool menu_open_seen{};
         bool enabled_seen{};
+        bool auto_teleport_pickup_seen{};
+        bool auto_teleport_pickup_delay_seen{};
         bool draw_loot_boxes_seen{};
         bool draw_extractions_seen{};
         bool show_active_extractions_only_seen{};
@@ -292,6 +319,20 @@ public:
             } else if (key == "enabled") {
                 if (enabled_seen || !ReadBoolean(settings.enabled)) return false;
                 enabled_seen = true;
+            } else if (key == "autoTeleportPickup") {
+                if (!require_auto_teleport_pickup || auto_teleport_pickup_seen ||
+                    !ReadBoolean(settings.auto_teleport_pickup)) {
+                    return false;
+                }
+                auto_teleport_pickup_seen = true;
+            } else if (key == "autoTeleportPickupDelayMs") {
+                if (!require_auto_teleport_pickup_delay || auto_teleport_pickup_delay_seen ||
+                    !ReadUInt32(settings.auto_teleport_pickup_delay_ms) ||
+                    settings.auto_teleport_pickup_delay_ms >
+                        kMaximumAutoTeleportPickupDelayMilliseconds) {
+                    return false;
+                }
+                auto_teleport_pickup_delay_seen = true;
             } else if (key == "drawLootBoxes") {
                 if (draw_loot_boxes_seen || !ReadBoolean(settings.draw_loot_boxes)) return false;
                 draw_loot_boxes_seen = true;
@@ -346,6 +387,8 @@ public:
 
         SkipWhitespace();
         return menu_open_seen && enabled_seen &&
+            (!require_auto_teleport_pickup || auto_teleport_pickup_seen) &&
+            (!require_auto_teleport_pickup_delay || auto_teleport_pickup_delay_seen) &&
             (!require_hud_draw_settings || (draw_loot_boxes_seen && draw_extractions_seen)) &&
             show_active_extractions_only_seen && show_pickable_only_seen &&
             (!require_access_card_setting || always_show_access_cards_seen) &&
@@ -512,6 +555,9 @@ Settings CurrentSettings() noexcept {
     return {
         g_context.menu_open != 0,
         g_context.enabled != 0,
+        g_context.auto_teleport_pickup != 0,
+        std::clamp(g_context.auto_teleport_pickup_delay_ms, 0U,
+            kMaximumAutoTeleportPickupDelayMilliseconds),
         g_context.draw_loot_boxes != 0,
         g_context.draw_extractions != 0,
         g_context.show_active_extractions_only != 0,
@@ -546,6 +592,10 @@ void PublishDisplaySettings() {
 void ApplySettings(const Settings& settings) noexcept {
     g_context.menu_open = settings.menu_open ? 1 : 0;
     g_context.enabled = settings.enabled ? 1 : 0;
+    g_context.auto_teleport_pickup = settings.auto_teleport_pickup ? 1 : 0;
+    g_context.auto_teleport_pickup_delay_ms = std::clamp(
+        settings.auto_teleport_pickup_delay_ms, 0U,
+        kMaximumAutoTeleportPickupDelayMilliseconds);
     g_context.draw_loot_boxes = settings.draw_loot_boxes ? 1 : 0;
     g_context.draw_extractions = settings.draw_extractions ? 1 : 0;
     g_context.show_active_extractions_only = settings.show_active_extractions_only ? 1 : 0;
@@ -566,13 +616,17 @@ std::string FormatSettingsDouble(const double value) {
     char buffer[64]{};
     const auto [end, error] = std::to_chars(
         buffer, buffer + sizeof(buffer), value, std::chars_format::general);
-    return error == std::errc{} ? std::string(buffer, end) : "150";
+    return error == std::errc{} ? std::string(buffer, end) : "0";
 }
 
 std::string SerializeSettings() {
     const Settings settings = CurrentSettings();
     return std::string{"{\"menuOpen\":"} + (settings.menu_open ? "true" : "false") +
         ",\"enabled\":" + (settings.enabled ? "true" : "false") +
+        ",\"autoTeleportPickup\":" +
+        (settings.auto_teleport_pickup ? "true" : "false") +
+        ",\"autoTeleportPickupDelayMs\":" +
+        std::to_string(settings.auto_teleport_pickup_delay_ms) +
         ",\"drawLootBoxes\":" + (settings.draw_loot_boxes ? "true" : "false") +
         ",\"drawExtractions\":" + (settings.draw_extractions ? "true" : "false") +
         ",\"showActiveExtractionsOnly\":" +
@@ -597,6 +651,8 @@ bool LoadSettings() {
         {nullptr, 0}, &size);
     if (size_status.code != ANOMALY_STATUS_V1_OK ||
         (schema_version != kSettingsSchemaVersion &&
+         schema_version != kSettingsSchemaVersionBeforeAutoTeleportPickupDelay &&
+         schema_version != kSettingsSchemaVersionBeforeAutoTeleportPickup &&
          schema_version != kPreviousSettingsSchemaVersion &&
          schema_version != kLegacySettingsSchemaVersion &&
          schema_version != kOldestSettingsSchemaVersion) ||
@@ -1257,21 +1313,6 @@ void RefreshKnownLootIfDue() {
     g_loot_cache.store(std::move(next), std::memory_order_release);
 }
 
-void RemoveCachedLoot(const pink_paw_heist_esp::RobBankEntity entity) {
-    if (!entity.Valid()) return;
-    const auto current = g_loot_cache.load(std::memory_order_acquire);
-    if (!current || !current->available) return;
-
-    auto next = std::make_shared<LootCache>(*current);
-    const std::size_t removed = std::erase_if(next->loot, [&](const LootEntity& entry) {
-        return entry.rob_bank.entity.object_index == entity.object_index &&
-            entry.rob_bank.entity.object_serial == entity.object_serial;
-    });
-    if (removed != 0) {
-        g_loot_cache.store(std::move(next), std::memory_order_release);
-    }
-}
-
 bool PassesItemFilters(
     const LootEntity& entry,
     const DisplaySettings& settings) noexcept {
@@ -1445,6 +1486,14 @@ bool Button(
         ui->button(ui->user, anomaly::sdk::StringView(label), width, height) != 0;
 }
 
+bool DeveloperModeEnabled(const AnomalyUiServiceV1* ui) noexcept {
+    return HasField<AnomalyUiServiceV1,
+                  decltype(AnomalyUiServiceV1::developer_mode_enabled)>(
+             ui, offsetof(AnomalyUiServiceV1, developer_mode_enabled)) &&
+         ui->developer_mode_enabled != nullptr &&
+         ui->developer_mode_enabled(ui->user) != 0;
+}
+
 const AnomalyUiServiceV1* ButtonEnabledUi(const AnomalyUiServiceV1* ui) noexcept {
     if (ui == nullptr || ui->service_version != ANOMALY_UI_SERVICE_V1_VERSION) return nullptr;
     return HasField<AnomalyUiServiceV1, decltype(AnomalyUiServiceV1::button_enabled)>(
@@ -1495,12 +1544,6 @@ bool InputDouble(
         input_ui->user, anomaly::sdk::StringView(label), value, step, step_fast) != 0;
 }
 
-bool DeveloperModeEnabled(const AnomalyUiServiceV1* ui) noexcept {
-    const auto* button_ui = ButtonEnabledUi(ui);
-    return button_ui != nullptr && button_ui->developer_mode_enabled != nullptr &&
-        button_ui->developer_mode_enabled(button_ui->user) != 0;
-}
-
 constexpr AnomalyStatusV1 StatusCode(const std::uint32_t code) noexcept {
     return {code, 0, {}};
 }
@@ -1542,12 +1585,7 @@ ServiceQuery<Service> QueryService(
 bool DeveloperModeEnabled(const AnomalyHostApiV1* host) noexcept {
     const auto ui = QueryService<AnomalyUiServiceV1>(
         host, ANOMALY_UI_SERVICE_V1_ID, ANOMALY_UI_SERVICE_V1_VERSION);
-    return ui &&
-        HasField<AnomalyUiServiceV1, decltype(AnomalyUiServiceV1::button_enabled)>(
-            ui.service, offsetof(AnomalyUiServiceV1, button_enabled)) &&
-        ui.service->button_enabled != nullptr &&
-        ui.service->developer_mode_enabled != nullptr &&
-        ui.service->developer_mode_enabled(ui.service->user) != 0;
+    return ui && DeveloperModeEnabled(ui.service);
 }
 
 const char* StatusName(const std::uint32_t code) noexcept {
@@ -2030,13 +2068,6 @@ void RecordTeleportResult(const AnomalyStatusV1 status) noexcept {
     g_teleport.result_message[count] = '\0';
 }
 
-void SetTeleportDeveloperMode(const bool enabled) noexcept {
-    g_teleport.developer_mode.store(enabled, std::memory_order_release);
-    if (enabled) return;
-    std::scoped_lock lock(g_teleport.mutex);
-    g_teleport.pending = {};
-}
-
 void RecordPickupResult(const AnomalyStatusV1 status) noexcept {
     std::scoped_lock lock(g_pickup.mutex);
     g_pickup.has_result = true;
@@ -2047,18 +2078,6 @@ void RecordPickupResult(const AnomalyStatusV1 status) noexcept {
         status.message.size, sizeof(g_pickup.result_message) - 1U);
     std::memcpy(g_pickup.result_message, status.message.data, count);
     g_pickup.result_message[count] = '\0';
-}
-
-void SetPickupDeveloperMode(const bool enabled) noexcept {
-    g_pickup.developer_mode.store(enabled, std::memory_order_release);
-    if (enabled) return;
-    std::scoped_lock lock(g_pickup.mutex);
-    g_pickup.pending = {};
-}
-
-void SetDeveloperMode(const bool enabled) noexcept {
-    SetTeleportDeveloperMode(enabled);
-    SetPickupDeveloperMode(enabled);
 }
 
 void QueueTeleport(
@@ -2076,11 +2095,14 @@ void QueueTeleport(
 }
 
 void TryQueueTeleport(const AnomalyNteEntitySnapshotV1& snapshot) {
+    if (!g_developer_mode.load(std::memory_order_acquire)) {
+        RecordTeleportResult(StatusCode(ANOMALY_STATUS_V1_PERMISSION_DENIED));
+        return;
+    }
     const double position[3]{
         snapshot.bounds_center[0], snapshot.bounds_center[1],
         snapshot.bounds_center[2] + g_context.teleport_z_offset};
-    if (!g_teleport.developer_mode.load(std::memory_order_acquire) ||
-        !IsFinitePosition(position) || g_context.host == nullptr) {
+    if (!IsFinitePosition(position) || g_context.host == nullptr) {
         RecordTeleportResult(StatusCode(ANOMALY_STATUS_V1_INVALID_ARGUMENT));
         return;
     }
@@ -2132,22 +2154,138 @@ void TryQueueTeleport(const LootEntity& entry) {
 }
 
 void QueuePickup(
-    const pink_paw_heist_esp::RobBankEntity entity) noexcept {
+    const pink_paw_heist_esp::RobBankEntity entity, const bool automatic = false) noexcept {
     std::scoped_lock lock(g_pickup.mutex);
     g_pickup.pending.queued = true;
+    g_pickup.pending.automatic = automatic;
     g_pickup.pending.entity = entity;
     g_pickup.has_result = false;
     g_pickup.result_message[0] = '\0';
 }
 
 void TryQueuePickup(const LootEntity& entry) {
-    if (!g_pickup.developer_mode.load(std::memory_order_acquire) ||
-        !IsCompleteSnapshot(entry.snapshot.flags) || !IsPickable(entry) ||
+    if (!IsCompleteSnapshot(entry.snapshot.flags) || !IsPickable(entry) ||
         !entry.rob_bank.entity.Valid()) {
         RecordPickupResult(StatusCode(ANOMALY_STATUS_V1_INVALID_ARGUMENT));
         return;
     }
     QueuePickup(entry.rob_bank.entity);
+}
+
+bool SameRobBankEntity(
+    const pink_paw_heist_esp::RobBankEntity left,
+    const pink_paw_heist_esp::RobBankEntity right) noexcept {
+    return left.object_index == right.object_index &&
+        left.object_serial == right.object_serial;
+}
+
+bool AutoTargetAttempted(const pink_paw_heist_esp::RobBankEntity entity) noexcept {
+    return std::ranges::any_of(
+        g_auto_teleport_pickup.attempted,
+        [entity](const pink_paw_heist_esp::RobBankEntity attempted) {
+            return SameRobBankEntity(attempted, entity);
+        });
+}
+
+void FinishAutoTarget() {
+    if (g_auto_teleport_pickup.entity.Valid() &&
+        !AutoTargetAttempted(g_auto_teleport_pickup.entity)) {
+        g_auto_teleport_pickup.attempted.push_back(g_auto_teleport_pickup.entity);
+    }
+    g_auto_teleport_pickup.waiting_for_teleport = false;
+    g_auto_teleport_pickup.waiting_for_pickup_delay = false;
+    g_auto_teleport_pickup.waiting_for_pickup_result = false;
+    g_auto_teleport_pickup.entity = {};
+    g_auto_teleport_pickup.pickup_due = {};
+}
+
+void ProcessAutoTeleportPickup() {
+    if (!g_developer_mode.load(std::memory_order_acquire) ||
+        !DeveloperModeEnabled(g_context.host) ||
+        !g_in_pink_paw_world || g_context.auto_teleport_pickup == 0) {
+        g_auto_teleport_pickup = {};
+        return;
+    }
+
+    const Clock::time_point now = Clock::now();
+    if (g_auto_teleport_pickup.waiting_for_teleport) {
+        bool has_result{};
+        std::uint32_t result_code{ANOMALY_STATUS_V1_UNAVAILABLE};
+        {
+            std::scoped_lock lock(g_teleport.mutex);
+            has_result = g_teleport.has_result;
+            result_code = g_teleport.result_code;
+        }
+        if (!has_result) return;
+        g_auto_teleport_pickup.waiting_for_teleport = false;
+        if (result_code == ANOMALY_STATUS_V1_OK) {
+            g_auto_teleport_pickup.waiting_for_pickup_delay = true;
+            g_auto_teleport_pickup.pickup_due = now + std::chrono::milliseconds(
+                g_context.auto_teleport_pickup_delay_ms);
+        } else {
+            FinishAutoTarget();
+        }
+        return;
+    }
+
+    if (g_auto_teleport_pickup.waiting_for_pickup_delay) {
+        if (now < g_auto_teleport_pickup.pickup_due) return;
+        {
+            std::scoped_lock lock(g_pickup.mutex);
+            if (g_pickup.pending.queued) return;
+        }
+        QueuePickup(g_auto_teleport_pickup.entity, true);
+        g_auto_teleport_pickup.waiting_for_pickup_delay = false;
+        g_auto_teleport_pickup.waiting_for_pickup_result = true;
+        return;
+    }
+
+    if (g_auto_teleport_pickup.waiting_for_pickup_result) {
+        bool has_result{};
+        std::uint32_t result_code{ANOMALY_STATUS_V1_UNAVAILABLE};
+        {
+            std::scoped_lock lock(g_pickup.mutex);
+            has_result = g_pickup.has_result;
+            result_code = g_pickup.result_code;
+        }
+        if (!has_result) return;
+        if (result_code == ANOMALY_STATUS_V1_OK) {
+            g_loot_refresh_requested.store(true, std::memory_order_release);
+        }
+        FinishAutoTarget();
+        return;
+    }
+
+    const auto cache = g_loot_cache.load(std::memory_order_acquire);
+    if (!cache || !cache->available) return;
+    const DisplaySettings settings = CurrentDisplaySettings();
+    const std::vector<const LootEntity*> visible_loot = CollectVisibleLoot(*cache, settings);
+    for (const LootEntity* const visible_entry : visible_loot) {
+        if (visible_entry == nullptr) continue;
+        const LootEntity& entry = *visible_entry;
+        if (!IsCompleteSnapshot(entry.snapshot.flags) || !PassesItemFilters(entry, settings) ||
+            !IsPickable(entry) || !entry.rob_bank.entity.Valid() ||
+            AutoTargetAttempted(entry.rob_bank.entity)) {
+            continue;
+        }
+        {
+            std::scoped_lock lock(g_teleport.mutex);
+            if (g_teleport.pending.queued) return;
+        }
+        TryQueueTeleport(entry);
+        bool queued{};
+        {
+            std::scoped_lock lock(g_teleport.mutex);
+            queued = g_teleport.pending.queued;
+        }
+        if (queued) {
+            g_auto_teleport_pickup.entity = entry.rob_bank.entity;
+            g_auto_teleport_pickup.waiting_for_teleport = true;
+        } else {
+            FinishAutoTarget();
+        }
+        return;
+    }
 }
 
 void DrawTeleportStatus(const AnomalyUiServiceV1* ui) {
@@ -2278,12 +2416,15 @@ void DrawWebSocketInstructions(const AnomalyUiServiceV1* ui) {
 
 void DrawLootRows(
     const AnomalyUiServiceV1* ui, const std::vector<const LootEntity*>& visible_loot,
-    const std::size_t first, const std::size_t last, const bool developer_mode) {
+    const std::size_t first, const std::size_t last,
+    const bool show_teleport, const bool show_pickup) {
     const auto* table_ui = TableUi(ui);
     constexpr std::uint32_t table_flags = ANOMALY_UI_TABLE_V1_NONE;
+    const int action_columns = (show_teleport ? 1 : 0) + (show_pickup ? 1 : 0);
+    const bool show_actions = action_columns != 0;
     if (table_ui != nullptr && table_ui->begin_table(
-            table_ui->user, anomaly::sdk::StringView("loot"), developer_mode ? 6 : 4,
-            table_flags, 0.0F, developer_mode ? 250.0F : 0.0F) != 0) {
+            table_ui->user, anomaly::sdk::StringView("loot"), 4 + action_columns,
+            table_flags, 0.0F, show_actions ? 250.0F : 0.0F) != 0) {
         table_ui->table_next_row(table_ui->user);
         static_cast<void>(table_ui->table_next_column(table_ui->user));
         Text(ui, g_context.localizer.Text("column.loot", "Loot"));
@@ -2293,9 +2434,11 @@ void DrawLootRows(
         Text(ui, g_context.localizer.Text("column.pink_paw_coin_value", "Pink Paw Coin"));
         static_cast<void>(table_ui->table_next_column(table_ui->user));
         Text(ui, g_context.localizer.Text("column.world_coordinates", "World coordinates"));
-        if (developer_mode) {
+        if (show_teleport) {
             static_cast<void>(table_ui->table_next_column(table_ui->user));
             Text(ui, g_context.localizer.Text("column.teleport", "Teleport"));
+        }
+        if (show_pickup) {
             static_cast<void>(table_ui->table_next_column(table_ui->user));
             Text(ui, g_context.localizer.Text("column.pickup", "Pickup"));
         }
@@ -2311,12 +2454,14 @@ void DrawLootRows(
             Text(ui, PinkPawCoinValueText(entry));
             static_cast<void>(table_ui->table_next_column(table_ui->user));
             Text(ui, BuildWorldCoordinates(entry));
-            if (developer_mode) {
+            if (show_teleport) {
                 static_cast<void>(table_ui->table_next_column(table_ui->user));
                 const std::string button = g_context.localizer.Label(
                     "action.teleport", "Teleport",
                     "loot-teleport-" + std::to_string(entry.snapshot.entity_id));
                 if (Button(ui, button)) TryQueueTeleport(entry);
+            }
+            if (show_pickup) {
                 static_cast<void>(table_ui->table_next_column(table_ui->user));
                 const std::string pickup = g_context.localizer.Label(
                     "action.pickup", "Pickup",
@@ -2346,11 +2491,13 @@ void DrawLootRows(
             Text(ui, g_context.localizer.Format(
                 "loot.row", "{0}  {1} Fons  {2} Pink Paw Coin  {3}", arguments));
         }
-        if (developer_mode) {
+        if (show_teleport) {
             const std::string button = g_context.localizer.Label(
                 "action.teleport", "Teleport",
                 "loot-teleport-" + std::to_string(entry.snapshot.entity_id));
             if (Button(ui, button)) TryQueueTeleport(entry);
+        }
+        if (show_pickup) {
             const std::string pickup = g_context.localizer.Label(
                 "action.pickup", "Pickup",
                 "loot-pickup-" + std::to_string(entry.snapshot.entity_id));
@@ -2501,12 +2648,12 @@ void FilterExtractionPoints(
 void DrawExtractionRows(
     const AnomalyUiServiceV1* ui,
     const std::vector<ExtractionPoint>& points,
-    const bool developer_mode) {
+    const bool show_teleport) {
     const auto* table_ui = TableUi(ui);
     constexpr std::uint32_t table_flags = ANOMALY_UI_TABLE_V1_NONE;
     if (table_ui != nullptr && table_ui->begin_table(
-            table_ui->user, anomaly::sdk::StringView("extractions"), developer_mode ? 4 : 3,
-            table_flags, 0.0F, developer_mode ? 220.0F : 0.0F) != 0) {
+            table_ui->user, anomaly::sdk::StringView("extractions"), show_teleport ? 4 : 3,
+            table_flags, 0.0F, show_teleport ? 220.0F : 0.0F) != 0) {
         table_ui->table_next_row(table_ui->user);
         static_cast<void>(table_ui->table_next_column(table_ui->user));
         Text(ui, g_context.localizer.Text("column.extraction", "Extraction"));
@@ -2514,7 +2661,7 @@ void DrawExtractionRows(
         Text(ui, g_context.localizer.Text("column.status", "Status"));
         static_cast<void>(table_ui->table_next_column(table_ui->user));
         Text(ui, g_context.localizer.Text("column.world_coordinates", "World coordinates"));
-        if (developer_mode) {
+        if (show_teleport) {
             static_cast<void>(table_ui->table_next_column(table_ui->user));
             Text(ui, g_context.localizer.Text("column.teleport", "Teleport"));
         }
@@ -2526,7 +2673,7 @@ void DrawExtractionRows(
             Text(ui, ExtractionActivationText(point.activation));
             static_cast<void>(table_ui->table_next_column(table_ui->user));
             Text(ui, BuildWorldCoordinates(point.snapshot));
-            if (developer_mode) {
+            if (show_teleport) {
                 static_cast<void>(table_ui->table_next_column(table_ui->user));
                 const std::string button = g_context.localizer.Label(
                     "action.teleport", "Teleport",
@@ -2546,7 +2693,7 @@ void DrawExtractionRows(
             std::string_view(coordinates)};
         Text(ui, g_context.localizer.Format(
             "extraction.row", "{0}  {1}  {2}", arguments));
-        if (developer_mode) {
+        if (show_teleport) {
             const std::string button = g_context.localizer.Label(
                 "action.teleport", "Teleport",
                 "extract-teleport-" + std::to_string(point.snapshot.entity_id));
@@ -2558,7 +2705,8 @@ void DrawExtractionRows(
 void DrawMenu(const AnomalyUiServiceV1* ui, const LootCache& loot_cache) {
     if (ui == nullptr || ui->begin_window == nullptr || ui->end_window == nullptr) return;
     const bool developer_mode = DeveloperModeEnabled(ui);
-    SetDeveloperMode(developer_mode);
+    g_developer_mode.store(developer_mode, std::memory_order_release);
+    if (!developer_mode) g_auto_teleport_pickup = {};
     if (ui->set_next_window_size != nullptr) {
         ui->set_next_window_size(ui->user, 640.0F, 500.0F, 4U);
     }
@@ -2604,10 +2752,13 @@ void DrawMenu(const AnomalyUiServiceV1* ui, const LootCache& loot_cache) {
         const bool changed_minimum =
             InputUInt32(ui, minimum_value, &g_context.minimum_value, 1000, 10000);
         const bool supports_double_input = DoubleInputUi(ui) != nullptr;
-        const std::string teleport_offset = g_context.localizer.Label(
-            "option.teleport_z_offset", "Teleport Z offset (cm)", "teleport-z-offset");
-        const bool changed_teleport_offset = developer_mode && InputDouble(
-            ui, teleport_offset, &g_context.teleport_z_offset, 10.0, 100.0);
+        bool changed_teleport_offset{};
+        if (developer_mode) {
+            const std::string teleport_offset = g_context.localizer.Label(
+                "option.teleport_z_offset", "Teleport Z offset (cm)", "teleport-z-offset");
+            changed_teleport_offset = InputDouble(
+                ui, teleport_offset, &g_context.teleport_z_offset, 10.0, 100.0);
+        }
         const std::string websocket_enabled = g_context.localizer.Label(
             "option.websocket_enabled", "Enable WebSocket real-time positioning",
             "websocket-enabled");
@@ -2689,6 +2840,31 @@ void DrawMenu(const AnomalyUiServiceV1* ui, const LootCache& loot_cache) {
 
         const std::vector<const LootEntity*> visible_loot =
             CollectVisibleLoot(loot_cache, display_settings);
+        bool changed_auto_teleport_pickup{};
+        bool changed_auto_teleport_pickup_delay{};
+        if (developer_mode) {
+            const std::string auto_teleport_pickup = g_context.localizer.Label(
+                "option.auto_teleport_pickup", "Auto teleport and pickup",
+                "auto-teleport-pickup");
+            changed_auto_teleport_pickup = Checkbox(
+                ui, auto_teleport_pickup, &g_context.auto_teleport_pickup);
+            const std::string auto_teleport_pickup_delay = g_context.localizer.Label(
+                "option.auto_teleport_pickup_delay", "Teleport-pickup delay (ms)",
+                "auto-teleport-pickup-delay");
+            changed_auto_teleport_pickup_delay = InputUInt32(
+                ui, auto_teleport_pickup_delay, &g_context.auto_teleport_pickup_delay_ms,
+                10U, 100U);
+            g_context.auto_teleport_pickup_delay_ms = std::clamp(
+                g_context.auto_teleport_pickup_delay_ms, 0U,
+                kMaximumAutoTeleportPickupDelayMilliseconds);
+            if (!supports_numeric_input) {
+                const std::string delay = std::to_string(g_context.auto_teleport_pickup_delay_ms);
+                const std::array arguments{std::string_view(delay)};
+                Text(ui, g_context.localizer.Format(
+                    "option.auto_teleport_pickup_delay.summary",
+                    "Teleport-pickup delay (ms): {0}", arguments));
+            }
+        }
         const std::size_t visible_count = visible_loot.size();
         const std::string total = std::to_string(loot_cache.loot.size());
         const std::string visible_total = std::to_string(visible_count);
@@ -2708,13 +2884,11 @@ void DrawMenu(const AnomalyUiServiceV1* ui, const LootCache& loot_cache) {
             g_context.current_page = (std::min)(g_context.current_page, page_count - 1);
             const std::size_t first = g_context.current_page * kLootRowsPerPage;
             const std::size_t last = (std::min)(first + kLootRowsPerPage, visible_count);
-            DrawLootRows(ui, visible_loot, first, last, developer_mode);
+            DrawLootRows(ui, visible_loot, first, last, developer_mode, true);
             DrawLootPagination(ui, page_count);
         }
-        if (developer_mode) {
-            DrawTeleportStatus(ui);
-            DrawPickupStatus(ui);
-        }
+        if (developer_mode) DrawTeleportStatus(ui);
+        DrawPickupStatus(ui);
     }
     ui->end_window(ui->user);
 }
@@ -2985,6 +3159,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
     }
 
     g_context = {};
+    g_developer_mode.store(false, std::memory_order_release);
     g_websocket_map_enabled.store(true, std::memory_order_release);
     g_ahud_subscription = {};
     g_loot_cache.store({}, std::memory_order_release);
@@ -3002,6 +3177,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         ? websocket.get()
         : nullptr;
     g_map_sync = {};
+    g_auto_teleport_pickup = {};
     const AnomalyStatusV1 schema_status = g_context.config->register_schema(
         g_context.config->user, anomaly::sdk::StringView(kSettingsSchemaId),
         kSettingsSchemaVersion, Bytes(kSettingsSchema), &g_context.settings_schema);
@@ -3023,7 +3199,6 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         g_teleport.result_code = ANOMALY_STATUS_V1_UNAVAILABLE;
         g_teleport.result_message[0] = '\0';
     }
-    g_teleport.developer_mode.store(false, std::memory_order_release);
     {
         std::scoped_lock lock(g_pickup.mutex);
         g_pickup.host = host;
@@ -3032,12 +3207,12 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         g_pickup.result_code = ANOMALY_STATUS_V1_UNAVAILABLE;
         g_pickup.result_message[0] = '\0';
     }
-    g_pickup.developer_mode.store(false, std::memory_order_release);
     *context = &g_context;
     return anomaly::sdk::Ok();
 }
 
 AnomalyStatusV1 ANOMALY_CALL Start(void*) {
+    g_developer_mode.store(false, std::memory_order_release);
     {
         std::scoped_lock lock(g_teleport.mutex);
         g_teleport.pending = {};
@@ -3050,6 +3225,7 @@ AnomalyStatusV1 ANOMALY_CALL Start(void*) {
         g_pickup.has_result = false;
         g_pickup.result_message[0] = '\0';
     }
+    g_auto_teleport_pickup = {};
     static_cast<void>(g_rob_bank.Start(g_context.host));
     g_world_gate.Reset();
     g_in_pink_paw_world = false;
@@ -3069,9 +3245,9 @@ AnomalyStatusV1 ANOMALY_CALL Start(void*) {
 }
 
 AnomalyStatusV1 ANOMALY_CALL Stop(void*, std::uint32_t) {
+    g_developer_mode.store(false, std::memory_order_release);
     const AnomalyStatusV1 ahud_status = UnsubscribeAhud();
     const bool saved = SaveSettings();
-    SetDeveloperMode(false);
     g_world_gate.Reset();
     g_in_pink_paw_world = false;
     g_world_gate_refresh_requested.store(false, std::memory_order_release);
@@ -3081,6 +3257,7 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void*, std::uint32_t) {
     } catch (...) {
     }
     g_rob_bank.Stop();
+    g_auto_teleport_pickup = {};
     ClearCache();
     ClearExtractionCache();
     g_display_settings.store({}, std::memory_order_release);
@@ -3090,8 +3267,8 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void*, std::uint32_t) {
 }
 
 void ANOMALY_CALL Unload(void*) {
+    g_developer_mode.store(false, std::memory_order_release);
     static_cast<void>(UnsubscribeAhud());
-    SetDeveloperMode(false);
     g_world_gate.Reset();
     g_in_pink_paw_world = false;
     g_world_gate_refresh_requested.store(false, std::memory_order_release);
@@ -3101,6 +3278,7 @@ void ANOMALY_CALL Unload(void*) {
     } catch (...) {
     }
     g_rob_bank.Stop();
+    g_auto_teleport_pickup = {};
     {
         std::scoped_lock lock(g_teleport.mutex);
         g_teleport.host = nullptr;
@@ -3131,9 +3309,9 @@ void ProcessPendingTeleport() {
         g_teleport.pending = {};
         host = g_teleport.host;
     }
-    if (!g_teleport.developer_mode.load(std::memory_order_acquire) ||
+    if (!g_developer_mode.load(std::memory_order_acquire) ||
         !DeveloperModeEnabled(host)) {
-        SetTeleportDeveloperMode(false);
+        RecordTeleportResult(StatusCode(ANOMALY_STATUS_V1_PERMISSION_DENIED));
         return;
     }
     if (host == nullptr || !IsFinitePosition(pending.position)) {
@@ -3172,9 +3350,10 @@ void ProcessPendingPickup() {
         g_pickup.pending = {};
         host = g_pickup.host;
     }
-    if (!g_pickup.developer_mode.load(std::memory_order_acquire) ||
-        !DeveloperModeEnabled(host)) {
-        SetPickupDeveloperMode(false);
+    if (pending.automatic &&
+        (!g_developer_mode.load(std::memory_order_acquire) ||
+         !DeveloperModeEnabled(host))) {
+        RecordPickupResult(StatusCode(ANOMALY_STATUS_V1_PERMISSION_DENIED));
         return;
     }
     if (host == nullptr || !pending.entity.Valid()) {
@@ -3216,7 +3395,8 @@ void ProcessPendingPickup() {
     const AnomalyStatusV1 status = g_rob_bank.Pickup(pending.entity);
     RecordPickupResult(status);
     if (status.code == ANOMALY_STATUS_V1_OK) {
-        RemoveCachedLoot(pending.entity);
+        // Keep the item visible until a fresh entity snapshot confirms that it is gone.
+        g_loot_refresh_requested.store(true, std::memory_order_release);
     }
 }
 
@@ -3250,6 +3430,7 @@ void ANOMALY_CALL Update(void*, double) {
     g_in_pink_paw_world = active;
     ProcessPendingTeleport();
     ProcessPendingPickup();
+    ProcessAutoTeleportPickup();
 }
 
 void ANOMALY_CALL Draw(void*, const AnomalyUiServiceV1* ui) {
@@ -3270,6 +3451,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
         anomaly::sdk::StringView("anomaly.builtin.pink-paw-heist-esp"),
         anomaly::sdk::StringView("Pink Paw Heist ESP"), anomaly::sdk::StringView("Anomaly"),
-        anomaly::sdk::StringView("1.10.0"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("1.14.0"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
