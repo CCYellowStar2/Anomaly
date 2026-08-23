@@ -30,15 +30,13 @@ CMake 文件、构建产物或正在运行的游戏文件来掩盖源码问题�
    或用户明确要求时扩大范围。不得仅因改动属于 Runtime、Launcher、CMake 或工具等类别就默认扩大
    验证范围。具体命令见 `.agents/tooling.md`。
 4. 完成前执行 `git diff --check`，检查暂存差异，并说明实际执行的验证或未执行原因。
-5. **每一项代码改动都必须 Git commit，没有例外。** 源码、构建、CI、Profile/Schema、运行时行为
-   或工具脚本的任何变更，都必须在同一任务中落到对应的原子 Git commit，不允许把已实现的代码
-   变更留在工作区未提交。纯文档改动也应提交，除非用户明确要求不提交。任务结束时工作区必须干净
-   （`git status --short` 无与本任务相关的残留）。无法提交时必须明确说明阻塞原因。
+5. `.local/` 仅用于本机临时 fixture；其中的源码、测试代码和构建脚本禁止暂存、提交或通过
+   `git add -f` 强制加入。需要纳入版本控制的实现必须移到受版本管理的模块目录。
 
-提交信息采用 Conventional Commit 风格，例如 `fix(plugin): drain callbacks before unload`、
+提交不是每项修改的必需步骤。只有用户或任务流程明确要求提交时才创建 Git commit；需要提交时，
+使用 Conventional Commit 风格，例如 `fix(plugin): drain callbacks before unload`、
 `build(cmake): unify the local preset entry point`。只暂存明确文件，禁止 `git add -A`；不要改写
-他人的提交，也不要用 `reset --hard` 或强制 checkout 隐藏工作。一个提交只能包含当前任务的文件。
-无法创建预期提交时，必须明确说明阻塞原因。
+他人的提交，也不要用 `reset --hard` 或强制 checkout 隐藏工作。
 
 除非用户明确要求，不生成额外的审计记录、补丁副本或回滚脚本；验证结果直接在任务回复中说明。
 
