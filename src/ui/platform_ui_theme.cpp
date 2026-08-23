@@ -344,6 +344,9 @@ void ApplyPlatformUiStyle() noexcept {
     // FrameBg matches ChildBg, so without a frame border an unchecked checkbox
     // (and other empty frames) is indistinguishable from its surroundings.
     style.FrameBorderSize = 1.0f;
+    // Keep native tab controls legible against the plugin body background.
+    style.TabBorderSize = 1.0f;
+    style.TabBarBorderSize = 1.0f;
     style.PopupRounding = 4.0f;
     style.ScrollbarRounding = 3.0f;
     style.WindowPadding = ImVec2(12.0f, 12.0f);
