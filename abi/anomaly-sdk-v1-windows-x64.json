@@ -220,6 +220,31 @@
         "ANOMALY_UI_TEXT_INPUT_V1_DIGITS": 1
       }
     },
+    "AnomalyUiTabBarFlagsV1": {
+      "size": 4,
+      "alignment": 4,
+      "values": {
+        "ANOMALY_UI_TAB_BAR_V1_NONE": 0,
+        "ANOMALY_UI_TAB_BAR_V1_REORDERABLE": 1,
+        "ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS": 2,
+        "ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS": 4,
+        "ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP": 8,
+        "ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN": 16,
+        "ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL": 32
+      }
+    },
+    "AnomalyUiTabItemFlagsV1": {
+      "size": 4,
+      "alignment": 4,
+      "values": {
+        "ANOMALY_UI_TAB_ITEM_V1_NONE": 0,
+        "ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT": 1,
+        "ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED": 2,
+        "ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON": 4,
+        "ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID": 8,
+        "ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP": 16
+      }
+    },
     "AnomalyWindowFlagsV1": {
       "size": 4,
       "alignment": 4,
@@ -734,7 +759,7 @@
       }
     },
     "AnomalyUiServiceV1": {
-      "size": 304,
+      "size": 336,
       "alignment": 8,
       "offsets": {
         "struct_size": 0,
@@ -775,7 +800,11 @@
         "button_enabled": 272,
         "same_line": 280,
         "set_cursor_pos_x": 288,
-        "text_link": 296
+        "text_link": 296,
+        "begin_tab_bar": 304,
+        "begin_tab_item": 312,
+        "end_tab_item": 320,
+        "end_tab_bar": 328
       }
     },
     "AnomalyWindowSpecV1": {

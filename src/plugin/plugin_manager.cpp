@@ -417,6 +417,8 @@ enum class UiStackEntryKind : std::uint8_t {
     ScopedWindow,
     Child,
     Table,
+    TabBar,
+    TabItem,
     Menu,
     Popup,
     Font,
@@ -915,6 +917,73 @@ void ANOMALY_CALL ProxyEndTable(void* user) {
     }
 }
 
+int ANOMALY_CALL ProxyBeginTabBar(
+    void* user, AnomalyStringViewV1 id, const std::uint32_t flags) {
+    auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    if (context == nullptr ||
+        !HasUiField<decltype(AnomalyUiServiceV1::begin_tab_bar)>(
+            context->service, offsetof(AnomalyUiServiceV1, begin_tab_bar)) ||
+        !HasUiField<decltype(AnomalyUiServiceV1::end_tab_bar)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_bar)) ||
+        context->service->begin_tab_bar == nullptr || context->service->end_tab_bar == nullptr ||
+        !ReserveUiStackEntry(context)) {
+        return 0;
+    }
+    const int result = context->service->begin_tab_bar(
+        context->service->user, id, flags);
+    if (result != 0) context->ui_stack->PushReserved({UiStackEntryKind::TabBar});
+    return result;
+}
+
+int ANOMALY_CALL ProxyBeginTabItem(
+    void* user, AnomalyStringViewV1 label, int* open, const std::uint32_t flags,
+    const int enabled) {
+    auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return 0;
+    if (context == nullptr ||
+        !HasUiField<decltype(AnomalyUiServiceV1::begin_tab_item)>(
+            context->service, offsetof(AnomalyUiServiceV1, begin_tab_item)) ||
+        !HasUiField<decltype(AnomalyUiServiceV1::end_tab_item)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_item)) ||
+        context->service->begin_tab_item == nullptr || context->service->end_tab_item == nullptr ||
+        !ReserveUiStackEntry(context)) {
+        return 0;
+    }
+    const int result = context->service->begin_tab_item(
+        context->service->user, label, open, flags, enabled);
+    if (result != 0) context->ui_stack->PushReserved({UiStackEntryKind::TabItem});
+    return result;
+}
+
+void ANOMALY_CALL ProxyEndTabItem(void* user) {
+    auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return;
+    if (context != nullptr &&
+        HasUiField<decltype(AnomalyUiServiceV1::end_tab_item)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_item)) &&
+        context->service->end_tab_item != nullptr &&
+        ConsumeUiStackEntry(context, UiStackEntryKind::TabItem)) {
+        context->service->end_tab_item(context->service->user);
+    }
+}
+
+void ANOMALY_CALL ProxyEndTabBar(void* user) {
+    auto* context = UiProxyContext(user);
+    auto callback = AcquireUiCallback(context);
+    if (context != nullptr && context->scope != nullptr && !callback) return;
+    if (context != nullptr &&
+        HasUiField<decltype(AnomalyUiServiceV1::end_tab_bar)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_bar)) &&
+        context->service->end_tab_bar != nullptr &&
+        ConsumeUiStackEntry(context, UiStackEntryKind::TabBar)) {
+        context->service->end_tab_bar(context->service->user);
+    }
+}
+
 int ANOMALY_CALL ProxyBeginMenu(void* user, AnomalyStringViewV1 label, int enabled) {
     auto* context = UiProxyContext(user);
     auto callback = AcquireUiCallback(context);
@@ -1110,7 +1179,8 @@ AnomalyUiServiceV1 MakeUiProxy(PluginUiProxyContext* context) noexcept {
         ProxyCloseCurrentPopup, ProxyFilterMatch, ProxyFrameState,
         ProxySetNextWindowSizeConstraints, ProxyGetWindowSize, ProxyInputUInt32, ProxyInputDouble,
         ProxyDeveloperModeEnabled, ProxyInputText, ProxyButtonEnabled,
-        ProxySameLine, ProxySetCursorPosX, ProxyTextLink};
+        ProxySameLine, ProxySetCursorPosX, ProxyTextLink,
+        ProxyBeginTabBar, ProxyBeginTabItem, ProxyEndTabItem, ProxyEndTabBar};
     if (context == nullptr || context->service == nullptr) {
         proxy.struct_size = offsetof(AnomalyUiServiceV1, user) + sizeof(proxy.user);
         return proxy;
@@ -1135,6 +1205,30 @@ AnomalyUiServiceV1 MakeUiProxy(PluginUiProxyContext* context) noexcept {
         context->service->text_link == nullptr) {
         advertised_size = (std::min)(
             advertised_size, offsetof(AnomalyUiServiceV1, text_link));
+    }
+    if (!HasUiField<decltype(AnomalyUiServiceV1::begin_tab_bar)>(
+            context->service, offsetof(AnomalyUiServiceV1, begin_tab_bar)) ||
+        context->service->begin_tab_bar == nullptr) {
+        advertised_size = (std::min)(
+            advertised_size, offsetof(AnomalyUiServiceV1, begin_tab_bar));
+    }
+    if (!HasUiField<decltype(AnomalyUiServiceV1::begin_tab_item)>(
+            context->service, offsetof(AnomalyUiServiceV1, begin_tab_item)) ||
+        context->service->begin_tab_item == nullptr) {
+        advertised_size = (std::min)(
+            advertised_size, offsetof(AnomalyUiServiceV1, begin_tab_item));
+    }
+    if (!HasUiField<decltype(AnomalyUiServiceV1::end_tab_item)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_item)) ||
+        context->service->end_tab_item == nullptr) {
+        advertised_size = (std::min)(
+            advertised_size, offsetof(AnomalyUiServiceV1, end_tab_item));
+    }
+    if (!HasUiField<decltype(AnomalyUiServiceV1::end_tab_bar)>(
+            context->service, offsetof(AnomalyUiServiceV1, end_tab_bar)) ||
+        context->service->end_tab_bar == nullptr) {
+        advertised_size = (std::min)(
+            advertised_size, offsetof(AnomalyUiServiceV1, end_tab_bar));
     }
     proxy.struct_size = static_cast<std::uint32_t>(advertised_size);
     return proxy;

@@ -417,6 +417,37 @@ std::string BuildSnapshot() {
         false);
     AppendEnum(
         output,
+        "AnomalyUiTabBarFlagsV1",
+        sizeof(AnomalyUiTabBarFlagsV1),
+        alignof(AnomalyUiTabBarFlagsV1),
+        {{"ANOMALY_UI_TAB_BAR_V1_NONE", ANOMALY_UI_TAB_BAR_V1_NONE},
+         {"ANOMALY_UI_TAB_BAR_V1_REORDERABLE", ANOMALY_UI_TAB_BAR_V1_REORDERABLE},
+         {"ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS",
+          ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS},
+         {"ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS",
+          ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS},
+         {"ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP", ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP},
+         {"ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN",
+          ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN},
+         {"ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL",
+          ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL}},
+        false);
+    AppendEnum(
+        output,
+        "AnomalyUiTabItemFlagsV1",
+        sizeof(AnomalyUiTabItemFlagsV1),
+        alignof(AnomalyUiTabItemFlagsV1),
+        {{"ANOMALY_UI_TAB_ITEM_V1_NONE", ANOMALY_UI_TAB_ITEM_V1_NONE},
+         {"ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT",
+          ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT},
+         {"ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED", ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED},
+         {"ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON",
+          ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON},
+         {"ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID", ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID},
+         {"ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP", ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP}},
+        false);
+    AppendEnum(
+        output,
         "AnomalyWindowFlagsV1",
         sizeof(AnomalyWindowFlagsV1),
         alignof(AnomalyWindowFlagsV1),
@@ -980,7 +1011,11 @@ std::string BuildSnapshot() {
          {"button_enabled", offsetof(AnomalyUiServiceV1, button_enabled)},
          {"same_line", offsetof(AnomalyUiServiceV1, same_line)},
          {"set_cursor_pos_x", offsetof(AnomalyUiServiceV1, set_cursor_pos_x)},
-         {"text_link", offsetof(AnomalyUiServiceV1, text_link)}},
+         {"text_link", offsetof(AnomalyUiServiceV1, text_link)},
+         {"begin_tab_bar", offsetof(AnomalyUiServiceV1, begin_tab_bar)},
+         {"begin_tab_item", offsetof(AnomalyUiServiceV1, begin_tab_item)},
+         {"end_tab_item", offsetof(AnomalyUiServiceV1, end_tab_item)},
+         {"end_tab_bar", offsetof(AnomalyUiServiceV1, end_tab_bar)}},
         false);
     AppendStruct(
         output,

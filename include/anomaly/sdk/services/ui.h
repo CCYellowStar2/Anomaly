@@ -61,6 +61,25 @@ typedef enum AnomalyUiTableFlagsV1 {
     ANOMALY_UI_TABLE_V1_SIZING_FIXED_FIT = 1u << 0u
 } AnomalyUiTableFlagsV1;
 
+typedef enum AnomalyUiTabBarFlagsV1 {
+    ANOMALY_UI_TAB_BAR_V1_NONE = 0,
+    ANOMALY_UI_TAB_BAR_V1_REORDERABLE = 1u << 0u,
+    ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS = 1u << 1u,
+    ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS = 1u << 2u,
+    ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP = 1u << 3u,
+    ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN = 1u << 4u,
+    ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL = 1u << 5u
+} AnomalyUiTabBarFlagsV1;
+
+typedef enum AnomalyUiTabItemFlagsV1 {
+    ANOMALY_UI_TAB_ITEM_V1_NONE = 0,
+    ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT = 1u << 0u,
+    ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED = 1u << 1u,
+    ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON = 1u << 2u,
+    ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID = 1u << 3u,
+    ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP = 1u << 4u
+} AnomalyUiTabItemFlagsV1;
+
 // Stable C facade over the host UI implementation. Plugins never exchange C++ UI types.
 // Draw callbacks are valid only during the current on_draw callback unless documented otherwise.
 typedef struct AnomalyUiServiceV1 {
@@ -140,6 +159,15 @@ typedef struct AnomalyUiServiceV1 {
     // left-clicked. The URL must use the http:// or https:// scheme.
     int (ANOMALY_CALL *text_link)(
         void* user, AnomalyStringViewV1 label, AnomalyStringViewV1 url);
+    // Tab containers are scoped like begin_table/begin_menu. The matching
+    // end function is required only when the begin function returns non-zero.
+    int (ANOMALY_CALL *begin_tab_bar)(
+        void* user, AnomalyStringViewV1 id, uint32_t flags);
+    int (ANOMALY_CALL *begin_tab_item)(
+        void* user, AnomalyStringViewV1 label, int* open,
+        uint32_t flags, int enabled);
+    void (ANOMALY_CALL *end_tab_item)(void* user);
+    void (ANOMALY_CALL *end_tab_bar)(void* user);
 } AnomalyUiServiceV1;
 
 #ifdef __cplusplus

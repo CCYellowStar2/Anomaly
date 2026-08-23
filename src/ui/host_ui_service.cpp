@@ -576,6 +576,76 @@ int ANOMALY_CALL TextLink(
     }
 }
 
+ImGuiTabBarFlags ToImGuiTabBarFlags(const std::uint32_t flags) noexcept {
+    ImGuiTabBarFlags result = ImGuiTabBarFlags_None;
+    if ((flags & ANOMALY_UI_TAB_BAR_V1_REORDERABLE) != 0) {
+        result |= ImGuiTabBarFlags_Reorderable;
+    }
+    if ((flags & ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS) != 0) {
+        result |= ImGuiTabBarFlags_AutoSelectNewTabs;
+    }
+    if ((flags & ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS) != 0) {
+        result |= ImGuiTabBarFlags_NoTabListScrollingButtons;
+    }
+    if ((flags & ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP) != 0) {
+        result |= ImGuiTabBarFlags_NoTooltip;
+    }
+    if ((flags & ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN) != 0) {
+        result |= ImGuiTabBarFlags_FittingPolicyResizeDown;
+    } else if ((flags & ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL) != 0) {
+        result |= ImGuiTabBarFlags_FittingPolicyScroll;
+    }
+    return result;
+}
+
+ImGuiTabItemFlags ToImGuiTabItemFlags(const std::uint32_t flags) noexcept {
+    ImGuiTabItemFlags result = ImGuiTabItemFlags_None;
+    if ((flags & ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT) != 0) {
+        result |= ImGuiTabItemFlags_UnsavedDocument;
+    }
+    if ((flags & ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED) != 0) {
+        result |= ImGuiTabItemFlags_SetSelected;
+    }
+    if ((flags & ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON) != 0) {
+        result |= ImGuiTabItemFlags_NoCloseWithMiddleMouseButton;
+    }
+    if ((flags & ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID) != 0) {
+        result |= ImGuiTabItemFlags_NoPushId;
+    }
+    if ((flags & ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP) != 0) {
+        result |= ImGuiTabItemFlags_NoTooltip;
+    }
+    return result;
+}
+
+int ANOMALY_CALL BeginTabBar(
+    void*, AnomalyStringViewV1 id, const std::uint32_t flags) {
+    const std::string text = Copy(id);
+    return ImGui::BeginTabBar(text.c_str(), ToImGuiTabBarFlags(flags)) ? 1 : 0;
+}
+
+int ANOMALY_CALL BeginTabItem(
+    void*, AnomalyStringViewV1 label, int* open, const std::uint32_t flags,
+    const int enabled) {
+    const std::string text = Copy(label);
+    bool visible = open == nullptr || *open != 0;
+    if (enabled == 0) ImGui::BeginDisabled();
+    const bool result = ImGui::BeginTabItem(
+        text.c_str(), open == nullptr ? nullptr : &visible, ToImGuiTabItemFlags(flags));
+    if (enabled == 0) {
+        ImGui::EndDisabled();
+        if (result) ImGui::EndTabItem();
+        if (open != nullptr) *open = visible ? 1 : 0;
+        return 0;
+    }
+    if (open != nullptr) *open = visible ? 1 : 0;
+    return result ? 1 : 0;
+}
+
+void ANOMALY_CALL EndTabItem(void*) { ImGui::EndTabItem(); }
+
+void ANOMALY_CALL EndTabBar(void*) { ImGui::EndTabBar(); }
+
 int ANOMALY_CALL Checkbox(void*, AnomalyStringViewV1 label, int* value) {
     if (value == nullptr) return 0;
     const std::string text = Copy(label);
@@ -1034,7 +1104,8 @@ const AnomalyUiServiceV1 kUiService{
     EndTable, BeginMenu, EndMenu, OpenPopup, BeginPopupModal, EndPopup,
     CloseCurrentPopup, FilterMatch, FrameState,
     SetNextWindowSizeConstraints, GetWindowSize, InputUInt32, InputDouble,
-    DeveloperModeEnabled, InputText, ButtonEnabled, SameLine, SetCursorPosX, TextLink};
+    DeveloperModeEnabled, InputText, ButtonEnabled, SameLine, SetCursorPosX, TextLink,
+    BeginTabBar, BeginTabItem, EndTabItem, EndTabBar};
 
 }  // namespace
 

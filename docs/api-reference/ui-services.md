@@ -70,6 +70,10 @@ typedef struct AnomalyUiServiceV1 {
     void (ANOMALY_CALL *same_line)(void* user, float offset_from_start_x, float spacing);
     void (ANOMALY_CALL *set_cursor_pos_x)(void* user, float local_x);
     int  (ANOMALY_CALL *text_link)(void* user, AnomalyStringViewV1 label, AnomalyStringViewV1 url);
+    int  (ANOMALY_CALL *begin_tab_bar)(void* user, AnomalyStringViewV1 id, uint32_t flags);
+    int  (ANOMALY_CALL *begin_tab_item)(void* user, AnomalyStringViewV1 label, int* open, uint32_t flags, int enabled);
+    void (ANOMALY_CALL *end_tab_item)(void* user);
+    void (ANOMALY_CALL *end_tab_bar)(void* user);
 } AnomalyUiServiceV1;
 ```
 
@@ -81,6 +85,7 @@ typedef struct AnomalyUiServiceV1 {
 | `same_line` / `set_cursor_pos_x` | 紧凑的内联控件和局部水平定位 |
 | `text_link(label, url)` | 显示左键可点的文本链接；仅接受 `http://` 或 `https://`，点击后由宿主在绘制结束后请求默认浏览器打开 |
 | `begin_child` / `begin_table` / `begin_menu` / `begin_popup_modal` 及对应 `end_*` | 作用域 UI 容器 |
+| `begin_tab_bar` / `begin_tab_item` 及对应 `end_*` | 原生选项卡容器；只有 begin 返回 1 时才调用匹配的 end 函数 |
 | `filter_match` / `frame_state` / `developer_mode_enabled` | 当前帧和会话状态查询 |
 | `draw_entity_bbox` | 用 Unreal rotator 约定投影一个轴对齐世界盒并在前景绘制；仅当可见时返回 1 |
 | `draw_entity_box3d` | 投影并绘制世界盒的全部 12 条棱 |
@@ -106,6 +111,23 @@ typedef enum AnomalyUiTextInputFlagsV1 {
 typedef enum AnomalyUiTableFlagsV1 {
     ANOMALY_UI_TABLE_V1_NONE = 0, ANOMALY_UI_TABLE_V1_SIZING_FIXED_FIT = 1<<0
 } AnomalyUiTableFlagsV1;
+typedef enum AnomalyUiTabBarFlagsV1 {
+    ANOMALY_UI_TAB_BAR_V1_NONE = 0,
+    ANOMALY_UI_TAB_BAR_V1_REORDERABLE = 1<<0,
+    ANOMALY_UI_TAB_BAR_V1_AUTO_SELECT_NEW_TABS = 1<<1,
+    ANOMALY_UI_TAB_BAR_V1_NO_TAB_LIST_SCROLLING_BUTTONS = 1<<2,
+    ANOMALY_UI_TAB_BAR_V1_NO_TOOLTIP = 1<<3,
+    ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_RESIZE_DOWN = 1<<4,
+    ANOMALY_UI_TAB_BAR_V1_FITTING_POLICY_SCROLL = 1<<5
+} AnomalyUiTabBarFlagsV1;
+typedef enum AnomalyUiTabItemFlagsV1 {
+    ANOMALY_UI_TAB_ITEM_V1_NONE = 0,
+    ANOMALY_UI_TAB_ITEM_V1_UNSAVED_DOCUMENT = 1<<0,
+    ANOMALY_UI_TAB_ITEM_V1_SET_SELECTED = 1<<1,
+    ANOMALY_UI_TAB_ITEM_V1_NO_CLOSE_WITH_MIDDLE_MOUSE_BUTTON = 1<<2,
+    ANOMALY_UI_TAB_ITEM_V1_NO_PUSH_ID = 1<<3,
+    ANOMALY_UI_TAB_ITEM_V1_NO_TOOLTIP = 1<<4
+} AnomalyUiTabItemFlagsV1;
 ```
 
 `begin_table` 的 `flags` 只接受 `AnomalyUiTableFlagsV1`。使用
