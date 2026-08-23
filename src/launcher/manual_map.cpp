@@ -398,9 +398,11 @@ bool PathIsWithin(
 
 std::set<DWORD> SnapshotLauncherProcessIds(
     const std::filesystem::path& launcher_directory, DWORD& error) noexcept {
-    constexpr std::array<std::wstring_view, 4> launcher_names{
-        L"NTELauncher.exe", L"NTEGame.exe",
-        L"NTEGlobalLauncher.exe", L"NTEGlobalGame.exe"};
+    constexpr std::array<std::wstring_view, 12> launcher_names{
+        L"NTELauncher.exe", L"NTEGame.exe", L"NTEBrowser.exe", L"NTEWebBooster.exe",
+        L"NTEUpdate.exe", L"NTEErrRep.exe",
+        L"NTEGlobalLauncher.exe", L"NTEGlobalGame.exe", L"NTEGlobalBrowser.exe",
+        L"NTEGlobalWebBooster.exe", L"NTEGlobalUpdate.exe", L"NTEGlobalErrRep.exe"};
     std::set<DWORD> result;
     Handle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
     if (!snapshot) {
