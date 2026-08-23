@@ -24,9 +24,7 @@ if errorlevel 1 exit /b %errorlevel%
 "%CMAKE%" --build --preset windows-relwithdebinfo --parallel
 if errorlevel 1 exit /b %errorlevel%
 
-"%CMAKE%" -E remove_directory "%PACKAGE_DIR%"
-if errorlevel 1 exit /b %errorlevel%
-
+rem Keep the existing package tree and replace only files owned by the install set.
 "%CMAKE%" --install "%BUILD_DIR%" --config RelWithDebInfo --prefix "%PACKAGE_DIR%" --component GameRuntime
 exit /b %errorlevel%
 
