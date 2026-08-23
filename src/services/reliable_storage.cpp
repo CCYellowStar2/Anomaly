@@ -33,6 +33,8 @@ constexpr FILE_INFORMATION_CLASS kNtFileRenameInformationEx =
     static_cast<FILE_INFORMATION_CLASS>(65);
 constexpr ULONG kNtFileRenameReplaceIfExists = 0x00000001;
 constexpr ULONG kNtFileRenamePosixSemantics = 0x00000002;
+// Allow replacing a shipped read-only configuration file atomically.
+constexpr ULONG kNtFileRenameIgnoreReadonlyAttribute = 0x00000040;
 
 StorageResult Success(std::size_t bytes = 0) noexcept {
     return {StorageError::None, ERROR_SUCCESS, bytes};
@@ -325,7 +327,8 @@ StorageResult RenameRelative(
     const std::size_t name_bytes = target_name.size() * sizeof(wchar_t);
     const std::size_t buffer_size =
         offsetof(NativeRenameInformationEx, file_name) + name_bytes;
-    rename.flags = kNtFileRenameReplaceIfExists | kNtFileRenamePosixSemantics;
+    rename.flags = kNtFileRenameReplaceIfExists | kNtFileRenamePosixSemantics |
+        kNtFileRenameIgnoreReadonlyAttribute;
     rename.root_directory = parent;
     rename.file_name_length = static_cast<ULONG>(name_bytes);
     std::memcpy(rename.file_name.data(), target_name.data(), name_bytes);
