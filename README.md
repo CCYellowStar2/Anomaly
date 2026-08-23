@@ -72,6 +72,7 @@ qq交流群: 1037114140
 | **Custom UID** | 自定义客户端界面上显示的 UID |
 | **Camera Tools** | 增加视距和自由相机视角 |
 | **WalletCollector** | 扫描钱包刷新点，按目标数量规划路线并自动拾取 |
+| **Map Spawn Exporter** | 从静态地图数据导出传送点、怪物、OracleStone 和钱包生成点 JSON |
 
 ### 🌐 第三方插件
 

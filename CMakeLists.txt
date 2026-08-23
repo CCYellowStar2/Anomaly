@@ -1095,6 +1095,11 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         MANIFEST plugins/TeleportLandmarksProbe/manifest.json
         PACKAGE_NAME TeleportLandmarksProbe
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/TeleportLandmarksProbe")
+    anomaly_add_plugin(anomaly_builtin_map_spawn_exporter
+        SOURCES plugins/MapSpawnExporter/plugin.cpp
+        MANIFEST plugins/MapSpawnExporter/manifest.json
+        PACKAGE_NAME MapSpawnExporter
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/MapSpawnExporter")
     anomaly_add_plugin(anomaly_builtin_wallet_collector
         SOURCES plugins/WalletCollector/plugin.cpp
         MANIFEST plugins/WalletCollector/manifest.json
@@ -1115,6 +1120,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
             anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
             anomaly_builtin_fake_uid anomaly_builtin_camera_tools
             anomaly_builtin_teleport_landmarks_probe
+            anomaly_builtin_map_spawn_exporter
             anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
         target_include_directories(${builtin_target} PRIVATE "${CMAKE_SOURCE_DIR}")
         target_compile_definitions(${builtin_target} PRIVATE
@@ -1146,6 +1152,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     set_target_properties(anomaly_builtin_fake_uid PROPERTIES PDB_NAME FakeUID)
     set_target_properties(anomaly_builtin_camera_tools PROPERTIES PDB_NAME CameraTools)
     set_target_properties(anomaly_builtin_teleport_landmarks_probe PROPERTIES PDB_NAME TeleportLandmarksProbe)
+    set_target_properties(anomaly_builtin_map_spawn_exporter PROPERTIES PDB_NAME MapSpawnExporter)
     set_target_properties(anomaly_builtin_wallet_collector PROPERTIES PDB_NAME WalletCollector)
     set_target_properties(anomaly_builtin_dll_loader PROPERTIES PDB_NAME DllLoader)
     if(MSVC)
@@ -1157,12 +1164,14 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
         anomaly_builtin_teleport_landmarks_probe
+        anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
     add_dependencies(anomaly-platform-preview
         anomaly_builtin_nte_position anomaly_builtin_nte_teleport
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
+        anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
 endif()
 
@@ -1198,6 +1207,8 @@ anomaly_stage_platform_preview_plugin(anomaly_builtin_fake_uid FakeUID)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_camera_tools CameraTools)
 anomaly_stage_platform_preview_plugin(
     anomaly_builtin_teleport_landmarks_probe TeleportLandmarksProbe)
+anomaly_stage_platform_preview_plugin(
+    anomaly_builtin_map_spawn_exporter MapSpawnExporter)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_wallet_collector WalletCollector)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_dll_loader DllLoader)
 
@@ -1398,6 +1409,13 @@ if(TARGET anomaly_builtin_teleport_landmarks_probe)
         LIBRARY DESTINATION Anomaly/plugins/TeleportLandmarksProbe COMPONENT GameRuntime)
     install(FILES plugins/TeleportLandmarksProbe/manifest.json
         DESTINATION Anomaly/plugins/TeleportLandmarksProbe COMPONENT GameRuntime)
+endif()
+if(TARGET anomaly_builtin_map_spawn_exporter)
+    install(TARGETS anomaly_builtin_map_spawn_exporter
+        RUNTIME DESTINATION Anomaly/plugins/MapSpawnExporter COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/MapSpawnExporter COMPONENT GameRuntime)
+    install(FILES plugins/MapSpawnExporter/manifest.json
+        DESTINATION Anomaly/plugins/MapSpawnExporter COMPONENT GameRuntime)
 endif()
 if(TARGET anomaly_builtin_wallet_collector)
     install(TARGETS anomaly_builtin_wallet_collector

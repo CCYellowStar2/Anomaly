@@ -105,6 +105,15 @@ pickup 调用只存在于插件内；宿主提供签名扫描、Game 回调、AH
 `anomaly.nte.map-landmarks`，不保存签名或偏移，也不自行扫描对象、解析 DataTable 或调用
 UE `ProcessEvent`；关闭开发者模式后不会出现在已安装插件视图中，也不会执行传送请求。
 
+### Map Spawn Exporter
+
+开发者模式下还可以使用 `Map Spawn Exporter`（`anomaly.builtin.map-spawn-exporter`）。点击
+**Scan static map** 后，它在插件侧枚举 UE 对象注册表中的静态 DataTable，解析 `TeleportPoint`
+和带反射坐标字段的 Monster spawn 行，以及 OracleStone 和 RandomItem 行；不遍历 UWorld 的
+Actor/Entity 快照。点击 **Export JSON** 会通过 Host storage 原子写出插件存储目录中的
+`map-spawns.json`，文件包含点位类型、行 ID、地图名、来源表和三维坐标。候选 DataTable 未加载
+或当前 Profile 不支持时，该类别显示为不可用，不会用已加载对象推断点位。
+
 ### DLL Loader
 
 | | |
