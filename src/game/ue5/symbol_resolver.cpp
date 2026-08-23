@@ -187,7 +187,8 @@ bool RuntimeObjectInitializationPending(const std::string_view message) noexcept
         message == "world is not initialized" ||
         message == "persistent level is not initialized" ||
         message == "object registry is not initialized" ||
-        message == "local player chain is incomplete";
+        message == "local player chain is incomplete" ||
+        message.ends_with(" is unreadable");
 }
 
 FeatureValidationResult FeatureFailure(std::string message) {
