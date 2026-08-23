@@ -4505,6 +4505,11 @@ private:
         };
         for (std::uint32_t key = 8; key <= 0xff; ++key) {
             if (key >= VK_LBUTTON && key <= VK_XBUTTON2) continue;
+            // Generic modifier VKs report both physical keys. Ignore the
+            // aliases and capture VK_LSHIFT/VK_RSHIFT distinctly.
+            if (key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+                key == VK_LCONTROL || key == VK_RCONTROL ||
+                key == VK_LMENU || key == VK_RMENU) continue;
             const bool down = is_down(key);
             const bool pressed = down && !settings_hotkey_down_[key];
             settings_hotkey_down_[key] = down;
@@ -6961,6 +6966,8 @@ void RunPlatform(
     static_cast<void>(ConfigurePlatformUiFontAtlas(root));
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigNavCursorVisibleAuto = false;
+    io.ConfigNavEscapeClearFocusWindow = true;
     host.imgui_ini_path = std::make_shared<std::string>((root / L"anomaly-imgui.ini").string());
     io.IniFilename = host.imgui_ini_path->c_str();
     imgui_win32_initialized = ImGui_ImplWin32_Init(host.window);

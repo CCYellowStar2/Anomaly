@@ -124,7 +124,7 @@ qq交流群: 1037114140
 > [!TIP]
 > 更多问题见[故障排查与 FAQ](docs/user-guide/troubleshooting.md)。
 
-- **按 `Insert` 没反应？** 切换键可在 `anomaly.ini` 的 `[Platform] ToggleKey` 修改（Win32 虚拟键码，默认 `45` = `VK_INSERT`）。
+- **按 `Insert` 没反应？** 在 **Anomaly Launcher > 启动设置** 中按键修改主窗口快捷键；也可编辑 `anomaly.ini` 的 `[Platform] ToggleKey`（Win32 虚拟键码，默认 `45` = `VK_INSERT`）。
 - **“可用”里没有插件？** 到 **Plugins > 第三方插件** 确认总开关和插件源都已启用，再回到 **可用** 点击刷新。详见[第三方插件](docs/user-guide/third-party-plugins.md)。
 - **第三方插件安装失败？** 常见原因是下载地址不可用、ZIP 结构不对，或插件 ID、版本、游戏和 API 与列表不一致。界面会显示失败原因，详细记录在 `Anomaly\anomaly-platform.log`。
 - **插件加载失败？** 确认它是含 `manifest.json` 的目录包；根级 DLL 与无 Manifest 的目录不会被加载。

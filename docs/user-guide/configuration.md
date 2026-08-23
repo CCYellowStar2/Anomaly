@@ -46,7 +46,7 @@ ManagedDirectory=state/profiles/managed
 | `Visible` | 启动时界面是否可见，默认 `0`；按 `Insert` 手动呼出。 |
 | `Embedded` | `1` 启用 D3D12 交换链内嵌模式（游戏内界面）。 |
 | `AttachToProcessWindow` | 仅在关闭内嵌模式、使用 Win32 回退后端时生效；独立演示程序始终使用普通窗口。 |
-| `ToggleKey` | 呼出 / 折叠界面的 Win32 虚拟键码。默认 `45` 即 `VK_INSERT`。 |
+| `ToggleKey` | 呼出 / 折叠界面的 Win32 虚拟键码。默认 `45` 即 `VK_INSERT`；推荐直接在 **Anomaly Launcher > 启动设置** 中按键修改。 |
 | `Language` | UI 语言，见下文。 |
 | `PluginDirectory` | 插件目录（相对 `Anomaly\`），默认 `plugins`。 |
 
@@ -84,6 +84,8 @@ Runtime 的选择顺序是：本地覆盖 > 更新源下发 > 运行包自带。
 ## 切换键
 
 `ToggleKey` 使用 Win32 虚拟键码。常见值：
+
+启动器会显示当前快捷键并捕获下一次按键，保存到运行时设置；手动编辑 `anomaly.ini` 仍然兼容，重启 Runtime 后生效。
 
 | 键 | 十进制码 |
 | --- | --- |

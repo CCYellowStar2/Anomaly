@@ -26,7 +26,7 @@
 ### 按 `Insert` 没反应，界面不出现
 
 1. 确认 Runtime 已注入：上述日志文件是否生成并记录了 PID？
-2. 确认切换键：`anomaly.ini` 的 `[Platform] ToggleKey`（Win32 虚拟键码，默认 `45` = `Insert`）。
+2. 确认切换键：优先查看 **Anomaly Launcher > 启动设置**；手动配置为 `anomaly.ini` 的 `[Platform] ToggleKey`（Win32 虚拟键码，默认 `45` = `Insert`）。
 3. 确认平台已启用：`[Platform]` 中应为 `Enabled=1` 和 `Embedded=1`。`Visible=0` 是正常默认值，只表示启动时先隐藏界面。
 4. 确认 `dwmapi.dll` 放在**游戏主 EXE 所在目录**，且没有被重命名为 `dwmapi.dll.disabled`。
 5. 检查是否与 RE-UE4SS 冲突（见下）。

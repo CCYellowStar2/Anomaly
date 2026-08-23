@@ -454,6 +454,10 @@
     "launcher.section.installation": "INSTALLATION",
     "launcher.section.nte_launcher": "NTE LAUNCHER",
     "launcher.section.processes": "HTGAME.EXE PROCESSES",
+    "launcher.section.settings": "STARTUP SETTINGS",
+    "launcher.setting.menu_toggle": "Main window hotkey",
+    "launcher.setting.press_key": "Press a key...",
+    "launcher.setting.escape_hint": "Press Escape to cancel",
     "launcher.action.choose_game_directory": "Choose game directory",
     "launcher.action.choose_nte_launcher": "Choose NTELauncher.exe",
     "launcher.dialog.game_directory": "Select the directory containing HTGame.exe",
@@ -506,6 +510,8 @@
     "launcher.status.recovery_restore_failed": "Recovery setting could not be restored",
     "launcher.status.core_unavailable": "Anomaly.Core.dll is unavailable",
     "launcher.status.no_processes": "No running HTGame.exe process found",
-    "launcher.status.processes_refreshed": "Process list refreshed"
+    "launcher.status.processes_refreshed": "Process list refreshed",
+    "launcher.status.saving_settings": "Saving startup settings",
+    "launcher.status.settings_saved": "Startup settings saved"
   }
 }

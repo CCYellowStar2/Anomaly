@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstddef>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -21,6 +22,25 @@ constexpr std::wstring_view kSettingsPath = L"config/platform-settings.json";
 constexpr std::wstring_view kAnalyzerConfigPath = L"anomaly.ini";
 constexpr std::size_t kMaximumSettingsBytes = 64U * 1024U;
 constexpr std::uint32_t kLegacyInterfaceScaleMinimumPercent = 75;
+
+bool IsMenuKeyValid(std::uint32_t key) noexcept;
+
+std::optional<std::uint32_t> ReadMenuToggle(
+    const std::filesystem::path& path) noexcept {
+    std::array<wchar_t, 32> buffer{};
+    GetPrivateProfileStringW(
+        L"Platform", L"ToggleKey", L"", buffer.data(),
+        static_cast<DWORD>(buffer.size()), path.c_str());
+    const std::wstring_view text(buffer.data());
+    if (text.empty()) return std::nullopt;
+    std::uint32_t value{};
+    for (const wchar_t character : text) {
+        if (character < L'0' || character > L'9') return std::nullopt;
+        value = value * 10U + static_cast<std::uint32_t>(character - L'0');
+        if (value > 0xffU) return std::nullopt;
+    }
+    return IsMenuKeyValid(value) ? std::optional<std::uint32_t>(value) : std::nullopt;
+}
 
 LanguagePreference ReadLanguagePreference(const std::filesystem::path& path) noexcept {
     std::array<wchar_t, 32> buffer{};
@@ -48,13 +68,20 @@ bool WriteLanguagePreference(
         WritePrivateProfileStringW(L"Platform", L"Language", text, path.c_str()) != FALSE;
 }
 
+bool WriteMenuToggle(
+    const std::filesystem::path& path, const std::uint32_t value) noexcept {
+    const std::wstring text = std::to_wstring(value);
+    return WritePrivateProfileStringW(
+        L"Platform", L"ToggleKey", text.c_str(), path.c_str()) != FALSE;
+}
+
 bool IsMenuKeyValid(const std::uint32_t key) noexcept {
     if (key == 0 || key > 0xff || key == VK_ESCAPE ||
         (key >= VK_LBUTTON && key <= VK_XBUTTON2)) {
         return false;
     }
     return key != VK_SHIFT && key != VK_CONTROL && key != VK_MENU &&
-        key != VK_LSHIFT && key != VK_RSHIFT && key != VK_LCONTROL &&
+        key != VK_LCONTROL &&
         key != VK_RCONTROL && key != VK_LMENU && key != VK_RMENU;
 }
 
@@ -232,6 +259,8 @@ public:
         const LanguagePreference configured_language = ReadLanguagePreference(
             runtime_root_ / kAnalyzerConfigPath);
         snapshot_.values.interface_language = configured_language;
+        const auto configured_toggle = ReadMenuToggle(runtime_root_ / kAnalyzerConfigPath);
+        if (configured_toggle) snapshot_.values.input_menu_toggle = *configured_toggle;
         snapshot_.revision = 1;
         snapshot_.reason.clear();
         const StorageResult initialized = storage_.InitializationResult();
@@ -288,7 +317,16 @@ public:
             ReadValue(values, "interface.opacity_percent", snapshot_.values.interface_opacity_percent);
             ReadValue(values, "interface.reduced_motion", snapshot_.values.interface_reduced_motion);
             ReadValue(values, "interface.remember_last_route", snapshot_.values.interface_remember_last_route);
-            ReadValue(values, "input.menu_toggle", snapshot_.values.input_menu_toggle);
+            const auto persisted_toggle = values.find("input.menu_toggle");
+            if (persisted_toggle != values.end()) {
+                const auto json_toggle = persisted_toggle->get<std::uint32_t>();
+                // The INI is the compatibility and user-facing source of truth when it
+                // explicitly contains a valid ToggleKey. JSON remains the fallback for
+                // old fixture roots that do not have an INI yet.
+                if (!configured_toggle) {
+                    snapshot_.values.input_menu_toggle = json_toggle;
+                }
+            }
             ReadValue(values, "input.gamepad_navigation", snapshot_.values.input_gamepad_navigation);
             ReadValue(values, "updates.automatic_check", snapshot_.values.updates_automatic_check);
             ReadValue(values, "updates.include_disabled", snapshot_.values.updates_include_disabled);
@@ -314,6 +352,7 @@ public:
         } catch (...) {
             snapshot_.values = {};
             snapshot_.values.interface_language = configured_language;
+            if (configured_toggle) snapshot_.values.input_menu_toggle = *configured_toggle;
             snapshot_.revision = 1;
             snapshot_.last_route = "plugins";
             snapshot_.ready = true;
@@ -353,6 +392,8 @@ public:
         const auto bytes = std::as_bytes(std::span(text.data(), text.size()));
         const bool language_changed =
             request.values.interface_language != snapshot_.values.interface_language;
+        const bool toggle_changed =
+            request.values.input_menu_toggle != snapshot_.values.input_menu_toggle;
         const std::filesystem::path config_path = runtime_root_ / kAnalyzerConfigPath;
         if (language_changed &&
             !WriteLanguagePreference(config_path, request.values.interface_language)) {
@@ -360,14 +401,25 @@ public:
             result.message = "language preference could not be written";
             return result;
         }
+        if (toggle_changed && !WriteMenuToggle(config_path, request.values.input_menu_toggle)) {
+            if (language_changed) {
+                static_cast<void>(WriteLanguagePreference(
+                    config_path, snapshot_.values.interface_language));
+            }
+            result.code = PlatformSettingsApplyCode::IoFailure;
+            result.message = "menu toggle preference could not be written";
+            return result;
+        }
         const StorageResult write = storage_.WriteAtomic(kSettingsPath, bytes);
         if (!write) {
-            const bool rolled_back = !language_changed ||
+            const bool language_rolled_back = !language_changed ||
                 WriteLanguagePreference(config_path, snapshot_.values.interface_language);
+            const bool toggle_rolled_back = !toggle_changed ||
+                WriteMenuToggle(config_path, snapshot_.values.input_menu_toggle);
             result.code = PlatformSettingsApplyCode::IoFailure;
-            result.message = rolled_back
+            result.message = language_rolled_back && toggle_rolled_back
                 ? "settings could not be written atomically"
-                : "settings write failed and the language preference rollback also failed";
+                : "settings write failed and the INI rollback also failed";
             return result;
         }
         snapshot_.values = request.values;

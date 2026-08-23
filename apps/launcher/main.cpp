@@ -3,6 +3,7 @@
 #include "anomaly/launcher/proxy_installation.hpp"
 #include "anomaly/i18n.hpp"
 #include "anomaly/platform_ui_theme.hpp"
+#include "anomaly/platform_settings.hpp"
 #include "anomaly/runtime_launch.hpp"
 #include "anomaly/runtime_recovery.hpp"
 #include "anomaly/ui_resource_decoder.hpp"
@@ -88,6 +89,7 @@ struct LauncherSnapshot final {
     bool core_available{};
     std::string runtime_version;
     std::string runtime_message;
+    std::uint32_t toggle_key{VK_INSERT};
     bool busy{};
     LauncherMessage message;
     MessageKind message_kind{MessageKind::Neutral};
@@ -188,6 +190,24 @@ std::wstring Utf8Wide(std::string_view value) {
 std::string PathUtf8(const std::filesystem::path& path) {
     const std::wstring value = path.wstring();
     return WideUtf8(value);
+}
+
+std::string VirtualKeyName(const std::uint32_t key) {
+    const std::string fallback = "Key " + std::to_string(key);
+    const UINT scan_code = MapVirtualKeyW(key, MAPVK_VK_TO_VSC);
+    wchar_t buffer[64]{};
+    const LONG parameter = static_cast<LONG>(scan_code << 16U);
+    if (GetKeyNameTextW(parameter, buffer, static_cast<int>(std::size(buffer))) <= 0) {
+        return fallback;
+    }
+    const int size = WideCharToMultiByte(
+        CP_UTF8, 0, buffer, -1, nullptr, 0, nullptr, nullptr);
+    if (size <= 1) return fallback;
+    std::string result(static_cast<std::size_t>(size), '\0');
+    static_cast<void>(WideCharToMultiByte(
+        CP_UTF8, 0, buffer, -1, result.data(), size, nullptr, nullptr));
+    result.pop_back();
+    return result;
 }
 
 bool PathsEqual(
@@ -318,6 +338,7 @@ public:
         Queue(anomaly::MessageId::LauncherStatusInspectingProxy, [this] {
             ReconcileRelatedPathsImpl();
             const auto saved = PersistConfigurationImpl();
+            RefreshHotkeyImpl();
             RefreshProxyImpl();
             RefreshRecoveryImpl();
             RefreshProcessesImpl(false);
@@ -405,6 +426,7 @@ public:
         Queue(anomaly::MessageId::LauncherStatusScanningLocal, [this] {
             ReconcileRelatedPathsImpl();
             const auto saved = PersistConfigurationImpl();
+            RefreshHotkeyImpl();
             RefreshProxyImpl();
             RefreshRecoveryImpl();
             RefreshProcessesImpl();
@@ -450,6 +472,22 @@ public:
         });
     }
 
+    void SetToggleKey(const std::uint32_t key) {
+        Queue(anomaly::MessageId::LauncherStatusSavingSettings, [this, key] {
+            const auto result = SaveToggleKeyImpl(key);
+            if (!result.Applied()) {
+                PublishMessage(anomaly::MessageId::LauncherStatusUnexpectedFailure,
+                    MessageKind::Error, result.message);
+                return;
+            }
+            std::scoped_lock lock(state_mutex_);
+            state_.toggle_key = result.snapshot.values.input_menu_toggle;
+            state_.message = MakeLauncherMessage(
+                anomaly::MessageId::LauncherStatusSettingsSaved);
+            state_.message_kind = MessageKind::Success;
+        });
+    }
+
 private:
     using Work = std::function<void()>;
 
@@ -484,6 +522,56 @@ private:
     [[nodiscard]] std::filesystem::path LauncherExecutable() const {
         std::scoped_lock lock(state_mutex_);
         return state_.launcher_executable;
+    }
+
+    [[nodiscard]] std::filesystem::path RuntimeSettingsRoot() const {
+        const auto game_directory = GameDirectory();
+        if (!game_directory.empty()) {
+            const auto installed = game_directory / L"Anomaly";
+            std::error_code error;
+            if (std::filesystem::is_regular_file(
+                    installed / L"Anomaly.Core.dll", error) && !error) {
+                return installed;
+            }
+        }
+        return source_.runtime_directory;
+    }
+
+    void RefreshHotkeyImpl() {
+        const auto root = RuntimeSettingsRoot();
+        anomaly::PlatformSettingsStore settings(root);
+        if (settings.Start()) {
+            const auto snapshot = settings.Snapshot();
+            if (snapshot.ready) {
+                std::scoped_lock lock(state_mutex_);
+                state_.toggle_key = snapshot.values.input_menu_toggle;
+                return;
+            }
+        }
+        const auto config = ue5mem::AnalyzerConfig::Load(root / L"anomaly.ini");
+        std::scoped_lock lock(state_mutex_);
+        state_.toggle_key = config.platform_toggle_key;
+    }
+
+    [[nodiscard]] anomaly::PlatformSettingsApplyResult SaveToggleKeyImpl(
+        const std::uint32_t key) const {
+        anomaly::PlatformSettingsStore settings(RuntimeSettingsRoot());
+        if (!settings.Start()) {
+            anomaly::PlatformSettingsApplyResult result;
+            result.message = "startup settings are unavailable";
+            return result;
+        }
+        const auto snapshot = settings.Snapshot();
+        if (!snapshot.ready) {
+            anomaly::PlatformSettingsApplyResult result;
+            result.message = snapshot.reason;
+            return result;
+        }
+        anomaly::PlatformSettingsApplyRequest request;
+        request.expected_revision = snapshot.revision;
+        request.values = snapshot.values;
+        request.values.input_menu_toggle = key;
+        return settings.Apply(request);
     }
 
     bool Queue(anomaly::MessageId activity, Work work) {
@@ -639,6 +727,7 @@ private:
             state_.launcher_executable = selected.launcher_executable;
         }
         const auto saved = PersistConfigurationImpl();
+        RefreshHotkeyImpl();
         RefreshProxyImpl();
         RefreshRecoveryImpl();
         RefreshProcessesImpl();
@@ -747,6 +836,45 @@ struct Graphics final {
 Graphics* g_graphics{};
 float g_launcher_dpi_scale{1.0f};
 bool g_launcher_dpi_changed{};
+bool g_launcher_hotkey_capture{};
+std::array<bool, 256> g_launcher_hotkey_down{};
+
+bool IsLauncherHotkeyModifier(const std::uint32_t key) noexcept {
+    return key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU ||
+        key == VK_LCONTROL ||
+        key == VK_RCONTROL || key == VK_LMENU || key == VK_RMENU;
+}
+
+void BeginLauncherHotkeyCapture() {
+    g_launcher_hotkey_capture = true;
+    for (std::uint32_t key = 0; key <= 0xff; ++key) {
+        g_launcher_hotkey_down[key] =
+            (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
+    }
+}
+
+std::optional<std::uint32_t> CaptureLauncherHotkey() {
+    if (!g_launcher_hotkey_capture) return std::nullopt;
+    for (std::uint32_t key = 8; key <= 0xff; ++key) {
+        if (key >= VK_LBUTTON && key <= VK_XBUTTON2) continue;
+        // The generic aliases report both physical Shift keys. Skip them so
+        // the left/right virtual key, especially VK_RSHIFT, can be captured.
+        if (key == VK_SHIFT || key == VK_CONTROL || key == VK_MENU) continue;
+        const bool down =
+            (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;
+        const bool pressed = down && !g_launcher_hotkey_down[key];
+        g_launcher_hotkey_down[key] = down;
+        if (!pressed) continue;
+        if (key == VK_ESCAPE) {
+            g_launcher_hotkey_capture = false;
+            return std::nullopt;
+        }
+        if (IsLauncherHotkeyModifier(key)) continue;
+        g_launcher_hotkey_capture = false;
+        return key;
+    }
+    return std::nullopt;
+}
 
 float DpiScale(UINT dpi) noexcept {
     return dpi == 0 ? 1.0f : static_cast<float>(dpi) / kDefaultDpi;
@@ -1232,6 +1360,31 @@ void DrawRecoveryState(
     }
 }
 
+void DrawStartupSettings(
+    LauncherController& controller, const LauncherSnapshot& snapshot,
+    const anomaly::Translator& translator) {
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionSettings));
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextUnformatted(Text(translator, anomaly::MessageId::LauncherSettingMenuToggle));
+    ImGui::SameLine(ImGui::GetContentRegionMax().x - Scale(190.0f));
+    const auto captured = CaptureLauncherHotkey();
+    if (captured) controller.SetToggleKey(*captured);
+    const std::string label = g_launcher_hotkey_capture
+        ? std::string(Text(translator, anomaly::MessageId::LauncherSettingPressKey))
+        : VirtualKeyName(snapshot.toggle_key);
+    ImGui::BeginDisabled(snapshot.busy);
+    if (ImGui::Button(label.c_str(), ImVec2(Scale(180.0f), ButtonHeight(30.0f)))) {
+        BeginLauncherHotkeyCapture();
+    }
+    ImGui::EndDisabled();
+    if (g_launcher_hotkey_capture) {
+        ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSettingEscapeHint));
+    }
+}
+
 void DrawProxyMode(
     HWND window, LauncherController& controller, const LauncherSnapshot& snapshot,
     const anomaly::Translator& translator) {
@@ -1270,6 +1423,7 @@ void DrawProxyMode(
     }
 
     DrawRecoveryState(controller, snapshot, translator);
+    DrawStartupSettings(controller, snapshot, translator);
 
     const float action_y = (std::max)(
         ImGui::GetCursorPosY() + Scale(16.0f),
@@ -1354,6 +1508,7 @@ void DrawAttachMode(
             anomaly::MessageId::LauncherRuntimeVersion, {snapshot.runtime_version});
         ImGui::TextColored(ThemeColor(theme.text_muted), "%s", runtime.c_str());
     }
+    DrawStartupSettings(controller, snapshot, translator);
     ImGui::AlignTextToFramePadding();
     ImGui::TextDisabled("%s", Text(translator, anomaly::MessageId::LauncherSectionProcesses));
     ImGui::SameLine(ImGui::GetContentRegionMax().x - Scale(30.0f));
@@ -1547,6 +1702,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command_line, int) {
     ApplyLauncherDpiScale();
     ImGuiIO& io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.ConfigNavCursorVisibleAuto = false;
+    io.ConfigNavEscapeClearFocusWindow = true;
     io.IniFilename = nullptr;
     if (!ImGui_ImplWin32_Init(window) ||
         !ImGui_ImplDX11_Init(graphics.device.Get(), graphics.context.Get())) {
