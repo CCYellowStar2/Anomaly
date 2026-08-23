@@ -1204,6 +1204,11 @@ void DrawModes(
     LauncherController& controller, const LauncherSnapshot& snapshot,
     LauncherMode& mode, const anomaly::Translator& translator) {
     const auto& theme = ue5mem::PlatformUiTheme();
+    const bool proxy_enabled = snapshot.proxy.state ==
+        anomaly::launcher::ProxyInstallationState::Enabled;
+    if (proxy_enabled && mode == LauncherMode::Attach) {
+        mode = LauncherMode::Proxy;
+    }
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, Scale(16.0f, 9.0f));
     ImGui::PushStyleColor(ImGuiCol_ChildBg, ThemeColor(theme.toolbar_background));
     ImGui::BeginChild(
@@ -1220,11 +1225,13 @@ void DrawModes(
             mode = LauncherMode::Proxy;
         }
         ImGui::SameLine();
+        ImGui::BeginDisabled(snapshot.busy || proxy_enabled);
         if (ModeButton("live-attach", Text(translator,
                 anomaly::MessageId::LauncherModeLiveAttach),
                 mode == LauncherMode::Attach, 126.0f)) {
             mode = LauncherMode::Attach;
         }
+        ImGui::EndDisabled();
         ImGui::TableSetColumnIndex(1);
         ImGui::BeginDisabled(snapshot.busy);
         if (ModeButton("client-cn", "CN",
