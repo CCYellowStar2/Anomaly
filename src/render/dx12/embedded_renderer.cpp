@@ -975,11 +975,11 @@ bool CompleteGraphicsInitialization(EmbeddedState& state) {
             const auto lifecycle_invoke = state.diagnostics.lifecycle_invoke;
             const auto lifecycle_post = state.diagnostics.lifecycle_post;
             const auto plugin_mutex = state.plugin_mutex;
-            state.diagnostics.lifecycle_invoke = [lifecycle_invoke, plugin_mutex](
+            auto* const plugins = state.plugins;
+            state.diagnostics.lifecycle_invoke = [lifecycle_invoke, plugin_mutex, plugins](
                 std::function<void()> operation) -> std::uint32_t {
-                auto guarded = [plugin_mutex, operation = std::move(operation)]() mutable {
-                    std::scoped_lock lock(*plugin_mutex);
-                    operation();
+                auto guarded = [plugin_mutex, plugins, operation = std::move(operation)]() mutable {
+                    plugins->RunLifecycleOperation(*plugin_mutex, std::move(operation));
                 };
                 if (lifecycle_invoke) return lifecycle_invoke(std::move(guarded));
                 try {
@@ -989,11 +989,11 @@ bool CompleteGraphicsInitialization(EmbeddedState& state) {
                     return ERROR_UNHANDLED_EXCEPTION;
                 }
             };
-            state.diagnostics.lifecycle_post = [lifecycle_post, lifecycle_invoke, plugin_mutex](
+            state.diagnostics.lifecycle_post = [
+                lifecycle_post, lifecycle_invoke, plugin_mutex, plugins](
                 std::function<void()> operation) -> std::uint32_t {
-                auto guarded = [plugin_mutex, operation = std::move(operation)]() mutable {
-                    std::scoped_lock lock(*plugin_mutex);
-                    operation();
+                auto guarded = [plugin_mutex, plugins, operation = std::move(operation)]() mutable {
+                    plugins->RunLifecycleOperation(*plugin_mutex, std::move(operation));
                 };
                 if (lifecycle_post) return lifecycle_post(std::move(guarded));
                 if (lifecycle_invoke) return lifecycle_invoke(std::move(guarded));

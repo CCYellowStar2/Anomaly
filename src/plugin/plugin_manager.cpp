@@ -105,6 +105,7 @@ anomaly::ThreadLocalScalar<anomaly::LogThreadDomain> g_log_thread_domain;
 anomaly::ThreadLocalScalar<anomaly::PluginScope*> g_callback_scope;
 anomaly::ThreadLocalScalar<std::uint64_t> g_callback_generation;
 anomaly::ThreadLocalScalar<bool> g_lifecycle_callback;
+anomaly::ThreadLocalScalar<std::unique_lock<std::mutex>*> g_lifecycle_plugin_lock;
 
 constexpr std::wstring_view kPluginCacheOwnerFile{L".owner.lock"};
 constexpr std::size_t kMaximumNteEscMenuButtonIconBytes = 1024U * 1024U;
@@ -3399,6 +3400,49 @@ PluginManager::~PluginManager() {
     if (g_manager == this) g_manager = nullptr;
 }
 
+void PluginManager::RunLifecycleOperation(
+    std::mutex& execution_mutex, std::function<void()> operation) {
+    std::unique_lock lock(execution_mutex);
+    while (plugin_load_step_in_progress_.load(std::memory_order_acquire)) {
+        lock.unlock();
+        plugin_load_step_in_progress_.wait(true, std::memory_order_acquire);
+        lock.lock();
+    }
+    g_lifecycle_plugin_lock.Set(&lock);
+    try {
+        operation();
+    } catch (...) {
+        g_lifecycle_plugin_lock.Set(nullptr);
+        throw;
+    }
+    g_lifecycle_plugin_lock.Set(nullptr);
+}
+
+bool PluginManager::PluginLoadStepInProgress() const noexcept {
+    return plugin_load_step_in_progress_.load(std::memory_order_acquire);
+}
+
+void PluginManager::RunPluginLoadStep(std::function<void()> operation) {
+    auto* const lock = g_lifecycle_plugin_lock.Get();
+    if (lock == nullptr) {
+        operation();
+        return;
+    }
+    plugin_load_step_in_progress_.store(true, std::memory_order_release);
+    lock->unlock();
+    try {
+        operation();
+    } catch (...) {
+        lock->lock();
+        plugin_load_step_in_progress_.store(false, std::memory_order_release);
+        plugin_load_step_in_progress_.notify_all();
+        throw;
+    }
+    lock->lock();
+    plugin_load_step_in_progress_.store(false, std::memory_order_release);
+    plugin_load_step_in_progress_.notify_all();
+}
+
 void PluginManager::Log(AnomalyCoreLogLevelV1 level, std::string message) {
     LogImpl(level, std::move(message), {}, 0);
 }
@@ -3737,7 +3781,8 @@ bool PluginManager::LoadCatalogEntry(const anomaly::PluginCatalogEntry& entry) {
         PublishSuspended(entry);
         return false;
     }
-    anomaly::PluginShadowResult staged = shadow_store_.Stage(entry);
+    anomaly::PluginShadowResult staged;
+    RunPluginLoadStep([&] { staged = shadow_store_.Stage(entry); });
     if (!staged.Ok()) {
         Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
             "package shadow failed for " + std::string(entry.Id()) + ": " + staged.error);
@@ -3930,12 +3975,15 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         auto callback = plugin.scope->AcquireCallback(plugin.view.generation);
         if (callback) {
             ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
-            try {
-                load_status = plugin.descriptor_v1.on_load(
-                    &plugin.host_api, &plugin.plugin_context);
-            } catch (...) {
-                Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "exception while loading ABI v1 plugin " + plugin.view.id);
-            }
+            RunPluginLoadStep([&] {
+                try {
+                    load_status = plugin.descriptor_v1.on_load(
+                        &plugin.host_api, &plugin.plugin_context);
+                } catch (...) {
+                    Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+                        "exception while loading ABI v1 plugin " + plugin.view.id);
+                }
+            });
         } else {
             Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "plugin scope rejected ABI v1 load: " + plugin.view.id);
         }
@@ -3959,14 +4007,18 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
         auto callback = plugin.scope->AcquireCallback(plugin.view.generation);
         if (callback) {
             ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
-            try { start_status = plugin.descriptor_v1.on_start(plugin.plugin_context); }
-            catch (...) {}
+            RunPluginLoadStep([&] {
+                try { start_status = plugin.descriptor_v1.on_start(plugin.plugin_context); }
+                catch (...) {}
+            });
         }
         if (start_status.code != ANOMALY_STATUS_V1_OK) {
             auto unload_callback = plugin.scope->AcquireCallback(plugin.view.generation);
             if (unload_callback) {
                 ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
-                try { plugin.descriptor_v1.on_unload(plugin.plugin_context); } catch (...) {}
+                RunPluginLoadStep([&] {
+                    try { plugin.descriptor_v1.on_unload(plugin.plugin_context); } catch (...) {}
+                });
             }
             plugin.plugin_context = nullptr;
             if (start_status.code == ANOMALY_STATUS_V1_UNAVAILABLE) {
@@ -4016,8 +4068,10 @@ bool PluginManager::LoadBinary(
         return false;
     }
 
-    const anomaly::PluginNativeDependencyPreflightResult dependency_preflight =
-        anomaly::PreflightPluginNativeDependencies(binary);
+    anomaly::PluginNativeDependencyPreflightResult dependency_preflight;
+    RunPluginLoadStep([&] {
+        dependency_preflight = anomaly::PreflightPluginNativeDependencies(binary);
+    });
     if (!dependency_preflight.Ok()) {
         for (const auto& diagnostic : dependency_preflight.diagnostics) {
             std::string message = "plugin native dependency denied: package=" +
@@ -4038,25 +4092,37 @@ bool PluginManager::LoadBinary(
         return false;
     }
 
-    const DLL_DIRECTORY_COOKIE search_cookie = AddDllDirectory(binary.parent_path().c_str());
-    const HMODULE module = LoadLibraryExW(
-        binary.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-            LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-    if (search_cookie != nullptr) RemoveDllDirectory(search_cookie);
+    HMODULE module{};
+    DWORD load_error{ERROR_SUCCESS};
+    RunPluginLoadStep([&] {
+        const DLL_DIRECTORY_COOKIE search_cookie = AddDllDirectory(binary.parent_path().c_str());
+        module = LoadLibraryExW(
+            binary.c_str(), nullptr, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                LOAD_LIBRARY_SEARCH_USER_DIRS | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+        if (module == nullptr) load_error = GetLastError();
+        if (search_cookie != nullptr) RemoveDllDirectory(search_cookie);
+    });
     if (module == nullptr) {
-        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "load failed for " + source.string() + ": " + std::to_string(GetLastError()));
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+            "load failed for " + source.string() + ": " + std::to_string(load_error));
         discard_shadow();
         return false;
     }
+    const auto unload_module = [&] {
+        RunPluginLoadStep([&] { FreeLibrary(module); });
+    };
     const auto entry_v1 = reinterpret_cast<AnomalyPluginEntryV1Fn>(
         GetProcAddress(module, ANOMALY_PLUGIN_V1_ENTRY_NAME));
     if (entry_v1 != nullptr) {
         AnomalyPluginDescriptorV1 descriptor{};
         descriptor.struct_size = sizeof(descriptor);
         AnomalyStatusV1 entry_status = StatusV1(ANOMALY_STATUS_V1_FAILED);
-        try { entry_status = entry_v1(&descriptor); } catch (...) {
-            Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "exception in ABI v1 plugin entry: " + source.string());
-        }
+        RunPluginLoadStep([&] {
+            try { entry_status = entry_v1(&descriptor); } catch (...) {
+                Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+                    "exception in ABI v1 plugin entry: " + source.string());
+            }
+        });
         constexpr std::size_t minimum_size = offsetof(AnomalyPluginDescriptorV1, on_draw) +
             sizeof(descriptor.on_draw);
         const bool valid = entry_status.code == ANOMALY_STATUS_V1_OK &&
@@ -4069,7 +4135,7 @@ bool PluginManager::LoadBinary(
             descriptor.on_load != nullptr && descriptor.on_unload != nullptr;
         if (!valid) {
             Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "invalid ABI v1 plugin metadata: " + source.string());
-            FreeLibrary(module);
+            unload_module();
             discard_shadow();
             return false;
         }
@@ -4091,7 +4157,7 @@ bool PluginManager::LoadBinary(
             Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
                 "plugin identity mismatch: manifest=" + shadow_generation.plugin_id +
                     " descriptor=" + plugin->view.id);
-            FreeLibrary(module);
+            unload_module();
             discard_shadow();
             return false;
         }
@@ -4117,14 +4183,14 @@ bool PluginManager::LoadBinary(
                 [&](const auto& loaded) { return loaded->view.id == plugin->view.id; })) {
             Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "duplicate plugin id: " + plugin->view.id);
             static_cast<void>(plugin->scope->RevokeAll());
-            FreeLibrary(module);
+            unload_module();
             discard_shadow();
             return false;
         }
         if (!Activate(*plugin)) {
             Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "ABI v1 plugin rejected activation: " + plugin->view.id);
             static_cast<void>(plugin->scope->RevokeAll());
-            FreeLibrary(module);
+            unload_module();
             discard_shadow();
             return false;
         }
@@ -4134,7 +4200,7 @@ bool PluginManager::LoadBinary(
         return true;
     }
     Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "plugin does not export the current ABI entry: " + source.string());
-    FreeLibrary(module);
+    unload_module();
     discard_shadow();
     return false;
 }
@@ -4145,14 +4211,17 @@ void PluginManager::LoadAll() {
         std::scoped_lock lock(pending_package_changes_mutex_);
         pending_package_changes_.clear();
     }
-    std::error_code error;
-    std::filesystem::create_directories(plugin_directory_, error);
-    const anomaly::PluginCatalogSnapshot catalog =
-        anomaly::DiscoverPluginCatalog(plugin_directory_);
-    const anomaly::PluginDependencyPlan plan =
-        anomaly::ResolvePluginDependencies(catalog);
+    anomaly::PluginCatalogSnapshot catalog;
+    anomaly::PluginDependencyPlan plan;
+    std::map<std::string, anomaly::PluginEnablementDecision, std::less<>> enablement;
+    RunPluginLoadStep([&] {
+        std::error_code error;
+        std::filesystem::create_directories(plugin_directory_, error);
+        catalog = anomaly::DiscoverPluginCatalog(plugin_directory_);
+        plan = anomaly::ResolvePluginDependencies(catalog);
+        enablement = enablement_store_.Resolve(catalog);
+    });
     disabled_plugins_.clear();
-    const auto enablement = enablement_store_.Resolve(catalog);
     const auto disabled_view = [&](const anomaly::PluginCatalogEntry& entry,
                                    std::string state, std::string reason) {
         if (!entry.manifest) return;
@@ -4236,9 +4305,15 @@ bool PluginManager::Reload(std::string_view plugin_id) {
 }
 
 bool PluginManager::SetEnabled(std::string_view plugin_id, bool enabled) {
-    const auto catalog = anomaly::DiscoverPluginCatalog(plugin_directory_);
+    anomaly::PluginCatalogSnapshot catalog;
     std::string error;
-    if (!enablement_store_.SetPluginEnabled(catalog, plugin_id, enabled, &error)) {
+    bool updated{};
+    RunPluginLoadStep([&] {
+        catalog = anomaly::DiscoverPluginCatalog(plugin_directory_);
+        updated = enablement_store_.SetPluginEnabled(
+            catalog, plugin_id, enabled, &error);
+    });
+    if (!updated) {
         Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "enablement update failed: " + error);
         return false;
     }
@@ -4876,8 +4951,10 @@ bool PluginManager::ReloadPackages(const std::vector<std::string>& package_names
         }
     }
 
-    const anomaly::PluginCatalogSnapshot catalog =
-        anomaly::DiscoverPluginCatalog(plugin_directory_);
+    anomaly::PluginCatalogSnapshot catalog;
+    RunPluginLoadStep([&] {
+        catalog = anomaly::DiscoverPluginCatalog(plugin_directory_);
+    });
     for (const anomaly::PluginCatalogEntry& entry : catalog.Entries()) {
         if (entry.manifest && changed.contains(Utf8(entry.package_root.filename()))) {
             affected.insert(entry.manifest->id);

@@ -857,7 +857,9 @@ void RunEmbeddedPlatform(
                     maintenance_work_started - plugin_lock_started);
             }
             PluginMaintenanceTiming timing;
-            if (state.plugins != nullptr) timing = state.plugins->MaintenancePluginState();
+            if (state.plugins != nullptr && !state.plugins->PluginLoadStepInProgress()) {
+                timing = state.plugins->MaintenancePluginState();
+            }
             if (sampled) {
                 state.performance.Record(
                     EmbeddedPerformanceStage::WorkerRetryServices,

@@ -170,6 +170,11 @@ public:
     PluginManager(const PluginManager&) = delete;
     PluginManager& operator=(const PluginManager&) = delete;
 
+    // Serializes lifecycle mutation while allowing unpublished plugin load
+    // steps to yield the host execution gate.
+    void RunLifecycleOperation(
+        std::mutex& execution_mutex, std::function<void()> operation);
+    [[nodiscard]] bool PluginLoadStepInProgress() const noexcept;
     void LoadAll();
     void ReloadAll();
     bool Reload(std::string_view plugin_id);
@@ -296,6 +301,7 @@ private:
         const std::filesystem::path& binary,
         const std::filesystem::path& package_directory,
         anomaly::PluginShadowGeneration shadow_generation);
+    void RunPluginLoadStep(std::function<void()> operation);
     bool Activate(LoadedPlugin& plugin);
     void RetryWaitingForAdapterServices();
     void RetryWaitingPlugins();
@@ -341,6 +347,7 @@ private:
     anomaly::PluginShadowStore shadow_store_;
     anomaly::PluginFileWatcher file_watcher_;
     std::atomic_bool performance_diagnostics_enabled_{};
+    std::atomic_bool plugin_load_step_in_progress_{};
     mutable std::mutex pending_package_changes_mutex_;
     std::vector<std::string> pending_package_changes_;
     anomaly::PluginEnablementStore enablement_store_;

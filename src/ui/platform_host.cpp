@@ -1007,6 +1007,8 @@ public:
                 ImGuiWindowFlags_NoScrollWithMouse) != 0;
         ImGui::PopStyleVar();
         if (visible) {
+            const ImVec2 management_window_origin = ImGui::GetWindowPos();
+            const ImVec2 management_window_size = ImGui::GetWindowSize();
             management_shell_locked_ = anomaly::HostUiCurrentWindowLocked();
             UpdateLayout();
             HandleShellShortcuts();
@@ -1025,7 +1027,7 @@ public:
                 DrawMemoryConfirmationPopup();
                 DrawSettingsLeavePopup();
             }
-            DrawStatusToast();
+            DrawStatusToast(management_window_origin, management_window_size);
             RecordPerformance(PlatformUiPerformanceStage::Popups, phase_started);
             phase_started = measure ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -1418,7 +1420,6 @@ private:
             PlatformUi* owner;
             ~CallbackScope() { owner->LeaveCallback(); }
         } scope{this};
-        std::scoped_lock operation_lock(operation_mutex_);
         ExecuteIntent(*pending);
     }
 
@@ -5200,13 +5201,11 @@ private:
         toast_expires_at_ = ImGui::GetTime() + 3.2;
     }
 
-    void DrawStatusToast() {
+    void DrawStatusToast(const ImVec2 origin, const ImVec2 size) {
         if (toast_status_.empty() || ImGui::GetTime() >= toast_expires_at_) {
             toast_status_.clear();
             return;
         }
-        const ImVec2 origin = ImGui::GetWindowPos();
-        const ImVec2 size = ImGui::GetWindowSize();
         const float text_width = ImGui::CalcTextSize(toast_status_.c_str()).x;
         const float minimum_width = Scaled(220.0f);
         const float width = std::min(std::max(minimum_width, text_width + Scaled(58.0f)),
@@ -5218,6 +5217,7 @@ private:
         const ImVec4 color = toast_failure_ ? ErrorColor() : SuccessColor();
         const auto& theme = anomaly::PlatformUiTheme();
         ImDrawList* const draw_list = ImGui::GetForegroundDrawList();
+        draw_list->PushClipRect(origin, Offset(origin, size.x, size.y), true);
         draw_list->AddRectFilled(position, Offset(position, width, height),
             ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.toast_background)), Scaled(4.0f));
         draw_list->AddRect(position, Offset(position, width, height),
@@ -5229,6 +5229,7 @@ private:
         draw_list->AddText(ScaledOffset(position, 34.0f, 11.0f),
             ImGui::ColorConvertFloat4ToU32(ThemeColor(theme.text)),
             Ellipsize(toast_status_, width - Scaled(46.0f)).c_str());
+        draw_list->PopClipRect();
     }
 
     void RequestOperationDetailsPopup() noexcept {
@@ -6042,8 +6043,19 @@ private:
 
     void ExecuteIntent(QueuedIntent queued) {
         if (!TryClaimIntent(queued)) return;
+        std::unique_lock operation_lock(operation_mutex_);
         try {
             const auto& intent = queued.intent;
+            const auto run_backend = [&](auto&& callback) {
+                operation_lock.unlock();
+                try {
+                    callback();
+                } catch (...) {
+                    operation_lock.lock();
+                    throw;
+                }
+                operation_lock.lock();
+            };
             const auto observed_revision = model_.Snapshot().revision;
             if (intent.expected_revision != observed_revision) {
                 ApplyIntentFailure(
@@ -6065,7 +6077,7 @@ private:
                 // ReloadAll is synchronous at the PluginManager boundary, but
                 // snapshot publication can lag one render frame. Keep the
                 // operation Running until the resulting generations are stable.
-                plugins_.ReloadAll();
+                run_backend([&] { plugins_.ReloadAll(); });
                 batch.queued = queued;
                 batch.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
                 awaiting_batches_.push_back(std::move(batch));
@@ -6074,20 +6086,24 @@ private:
                 return;
             }
 
-            const auto* target = intent.subject_id.empty()
-                ? nullptr : model_.Snapshot().FindPlugin(intent.subject_id);
+            const bool target_exists = !intent.subject_id.empty() &&
+                model_.Snapshot().FindPlugin(intent.subject_id) != nullptr;
             bool succeeded = false;
             bool has_backend = true;
             switch (intent.kind) {
             case anomaly::PlatformUiIntentKind::SetPluginEnabled:
-                succeeded = target != nullptr &&
-                    plugins_.SetEnabled(intent.subject_id, intent.bool_value);
+                run_backend([&] {
+                    succeeded = target_exists &&
+                        plugins_.SetEnabled(intent.subject_id, intent.bool_value);
+                });
                 break;
             case anomaly::PlatformUiIntentKind::ReloadPlugin:
-                succeeded = target != nullptr && plugins_.Reload(intent.subject_id);
+                run_backend([&] {
+                    succeeded = target_exists && plugins_.Reload(intent.subject_id);
+                });
                 break;
             case anomaly::PlatformUiIntentKind::SetPluginVisible:
-                succeeded = target != nullptr &&
+                succeeded = target_exists &&
                     plugins_.SetVisible(intent.subject_id, intent.bool_value);
                 break;
             default:
@@ -6978,11 +6994,11 @@ void RunPlatform(
 
     plugin_mutex = std::make_shared<std::mutex>();
     const auto lifecycle_invoke = diagnostics.lifecycle_invoke;
-    diagnostics.lifecycle_invoke = [lifecycle_invoke, plugin_mutex](
+    auto* const plugin_manager = &plugins;
+    diagnostics.lifecycle_invoke = [lifecycle_invoke, plugin_mutex, plugin_manager](
         std::function<void()> operation) -> std::uint32_t {
-        auto guarded = [plugin_mutex, operation = std::move(operation)]() mutable {
-            std::scoped_lock lock(*plugin_mutex);
-            operation();
+        auto guarded = [plugin_mutex, plugin_manager, operation = std::move(operation)]() mutable {
+            plugin_manager->RunLifecycleOperation(*plugin_mutex, std::move(operation));
         };
         if (lifecycle_invoke) return lifecycle_invoke(std::move(guarded));
         try {
@@ -6993,11 +7009,11 @@ void RunPlatform(
         }
     };
     const auto lifecycle_post = diagnostics.lifecycle_post;
-    diagnostics.lifecycle_post = [lifecycle_post, lifecycle_invoke, plugin_mutex](
+    diagnostics.lifecycle_post = [
+        lifecycle_post, lifecycle_invoke, plugin_mutex, plugin_manager](
         std::function<void()> operation) -> std::uint32_t {
-        auto guarded = [plugin_mutex, operation = std::move(operation)]() mutable {
-            std::scoped_lock lock(*plugin_mutex);
-            operation();
+        auto guarded = [plugin_mutex, plugin_manager, operation = std::move(operation)]() mutable {
+            plugin_manager->RunLifecycleOperation(*plugin_mutex, std::move(operation));
         };
         if (lifecycle_post) return lifecycle_post(std::move(guarded));
         if (lifecycle_invoke) return lifecycle_invoke(std::move(guarded));
@@ -7087,13 +7103,12 @@ void RunPlatform(
         previous = now;
         {
             std::scoped_lock lock(*plugin_mutex);
-            if (adapter != nullptr) {
-                plugins.Maintenance();
-            } else {
-                plugins.Maintenance();
-                plugins.GameUpdate(delta);
+            if (!plugins.PluginLoadStepInProgress()) {
+                static_cast<void>(plugins.MaintenancePluginState());
+                if (adapter == nullptr) plugins.GameUpdate(delta);
             }
         }
+        plugins.PersistUiWindowState();
         if (host.attached && !IsWindow(host.target)) running = false;
         if (host.visible && host.attached && !IsIconic(host.target)) PlaceAttachedWindow(host);
         if (!host.visible || IsIconic(host.window) || (host.attached && IsIconic(host.target))) {
