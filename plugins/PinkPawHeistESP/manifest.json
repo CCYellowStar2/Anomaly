@@ -25,7 +25,8 @@
     {"id": "anomaly.nte.player-teleport", "minVersion": 1, "optional": true},
     {"id": "anomaly.nte.entities", "minVersion": 1, "optional": true},
     {"id": "anomaly.nte.actors", "minVersion": 1, "optional": true},
+    {"id": "anomaly.nte.pickup", "minVersion": 1, "optional": true},
     {"id": "anomaly.font", "minVersion": 1, "optional": true}
   ],
-  "capabilities": ["ui", "configuration", "game-events", "interop-signature", "memory-read", "ue5-ahud", "ue5-names", "ue5-objects", "websocket", "nte-entity-snapshot", "nte-actor-snapshot", "nte-session-snapshot", "nte-player-snapshot", "nte-player-teleport", "ui-font"]
+  "capabilities": ["ui", "configuration", "game-events", "interop-signature", "memory-read", "ue5-ahud", "ue5-names", "ue5-objects", "websocket", "nte-entity-snapshot", "nte-actor-snapshot", "nte-session-snapshot", "nte-player-snapshot", "nte-player-teleport", "nte-pickup", "ui-font"]
 }

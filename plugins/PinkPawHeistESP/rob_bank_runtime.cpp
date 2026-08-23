@@ -73,15 +73,16 @@ constexpr std::uint32_t kObjectItemStride = 24;
 constexpr std::uint32_t kObjectPointerOffset = 0;
 constexpr std::uint32_t kObjectSerialOffset = 16;
 
-constexpr std::ptrdiff_t kRobBankCanInteractOffset = 3088;
+constexpr std::ptrdiff_t kRobBankCanInteractOffset = 0xC10;
 constexpr std::uint8_t kRobBankCanInteractMask = 1;
-constexpr std::ptrdiff_t kRobBankDelayInteractOffset = 3160;
+constexpr std::ptrdiff_t kRobBankDelayInteractOffset = 0xC58;
 constexpr std::uint8_t kRobBankDelayInteractMask = 1;
 constexpr std::ptrdiff_t kRobBankPointUidOffset = 2968;
 constexpr std::ptrdiff_t kRobBankPointKeyDoorIdOffset = 196;
 constexpr std::ptrdiff_t kRobBankAwardDropIdOffset = 3072;
 constexpr std::ptrdiff_t kRobBankCloneDataAssetItemOffset = 104;
-constexpr std::ptrdiff_t kPlayerStateKeyDoorsOffset = 36928;
+// AHTPlayerState::ClientRobBankKeyDoorDataArray in UE5-HT 1.3.
+constexpr std::ptrdiff_t kPlayerStateKeyDoorsOffset = 0x95F0;
 constexpr std::int32_t kMaximumKeyDoors = 4096;
 
 constexpr std::ptrdiff_t kDataTableRowMapOffset = 48;
@@ -1234,8 +1235,8 @@ struct RobBankRuntime::Impl final {
                 kRobBankCanInteractMask, can_interact)) {
             return false;
         }
-        // OutInteractEntries is populated by the player's nearby-interaction query. It cannot
-        // participate in map-wide pickability or distant BankBoxes remain falsely blocked.
+        // Preserve the verified pre-update path. These two actor bytes are the new-layout
+        // equivalents of the previously validated CanInteract and DelayInteract fields.
         blocked = root == 0 || !delay_interact || !can_interact;
         if (blocked) return true;
         if (!point_table.available || !key_door_context_available) return false;
