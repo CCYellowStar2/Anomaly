@@ -3,7 +3,6 @@
 #include "anomaly/launcher/proxy_installation.hpp"
 #include "anomaly/i18n.hpp"
 #include "anomaly/platform_ui_theme.hpp"
-#include "anomaly/platform_settings.hpp"
 #include "anomaly/runtime_launch.hpp"
 #include "anomaly/runtime_recovery.hpp"
 #include "anomaly/ui_resource_decoder.hpp"
@@ -474,14 +473,13 @@ public:
 
     void SetToggleKey(const std::uint32_t key) {
         Queue(anomaly::MessageId::LauncherStatusSavingSettings, [this, key] {
-            const auto result = SaveToggleKeyImpl(key);
-            if (!result.Applied()) {
+            if (!SaveToggleKeyImpl(key)) {
                 PublishMessage(anomaly::MessageId::LauncherStatusUnexpectedFailure,
-                    MessageKind::Error, result.message);
+                    MessageKind::Error, "menu toggle preference could not be written");
                 return;
             }
             std::scoped_lock lock(state_mutex_);
-            state_.toggle_key = result.snapshot.values.input_menu_toggle;
+            state_.toggle_key = key;
             state_.message = MakeLauncherMessage(
                 anomaly::MessageId::LauncherStatusSettingsSaved);
             state_.message_kind = MessageKind::Success;
@@ -539,39 +537,16 @@ private:
 
     void RefreshHotkeyImpl() {
         const auto root = RuntimeSettingsRoot();
-        anomaly::PlatformSettingsStore settings(root);
-        if (settings.Start()) {
-            const auto snapshot = settings.Snapshot();
-            if (snapshot.ready) {
-                std::scoped_lock lock(state_mutex_);
-                state_.toggle_key = snapshot.values.input_menu_toggle;
-                return;
-            }
-        }
         const auto config = ue5mem::AnalyzerConfig::Load(root / L"anomaly.ini");
         std::scoped_lock lock(state_mutex_);
         state_.toggle_key = config.platform_toggle_key;
     }
 
-    [[nodiscard]] anomaly::PlatformSettingsApplyResult SaveToggleKeyImpl(
-        const std::uint32_t key) const {
-        anomaly::PlatformSettingsStore settings(RuntimeSettingsRoot());
-        if (!settings.Start()) {
-            anomaly::PlatformSettingsApplyResult result;
-            result.message = "startup settings are unavailable";
-            return result;
-        }
-        const auto snapshot = settings.Snapshot();
-        if (!snapshot.ready) {
-            anomaly::PlatformSettingsApplyResult result;
-            result.message = snapshot.reason;
-            return result;
-        }
-        anomaly::PlatformSettingsApplyRequest request;
-        request.expected_revision = snapshot.revision;
-        request.values = snapshot.values;
-        request.values.input_menu_toggle = key;
-        return settings.Apply(request);
+    [[nodiscard]] bool SaveToggleKeyImpl(const std::uint32_t key) const {
+        const std::wstring value = std::to_wstring(key);
+        return WritePrivateProfileStringW(
+            L"Platform", L"ToggleKey", value.c_str(),
+            (RuntimeSettingsRoot() / L"anomaly.ini").c_str()) != FALSE;
     }
 
     bool Queue(anomaly::MessageId activity, Work work) {

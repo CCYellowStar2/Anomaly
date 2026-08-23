@@ -939,7 +939,7 @@ target_compile_options(anomaly_launcher PRIVATE /W4 /permissive- /EHsc)
 target_link_options(anomaly_launcher PRIVATE /MANIFESTUAC:NO /DELAYLOAD:dwmapi.dll)
 target_link_libraries(anomaly_launcher PRIVATE
     anomaly_config anomaly_imgui anomaly_launcher_configuration anomaly_launcher_proxy
-    anomaly_manual_map anomaly_runtime_recovery anomaly_platform_settings
+    anomaly_manual_map anomaly_runtime_recovery
     anomaly_runtime_launch anomaly_ui_resources
     ole32 shell32 delayimp)
 add_dependencies(anomaly_launcher dwmapi anomaly_core)
