@@ -318,17 +318,29 @@ ProxyInstallationStatus InspectProxyInstallation(
     const auto installed_core = game_directory / kRuntimeDirectoryName / kCoreName;
     const auto installed_runtime = game_directory / kRuntimeDirectoryName;
     std::error_code runtime_error;
-    if (!std::filesystem::is_directory(installed_runtime, runtime_error) || runtime_error ||
-        IsReparsePoint(installed_runtime) || !IsRegularFile(installed_core)) {
+    const bool has_runtime = std::filesystem::exists(installed_runtime, runtime_error) &&
+        !runtime_error;
+    if (runtime_error) {
         return Failure(
-            game_directory, ProxyInstallationState::Conflict,
-            ProxyInstallationError::RuntimeUnavailable,
-            "Anomaly.Core.dll is missing from the game directory");
+            game_directory, ProxyInstallationState::Unavailable,
+            ProxyInstallationError::IoFailure, "runtime state could not be read");
     }
-    if (!Matches(installed_core, expected_core)) {
+    const bool runtime_directory = has_runtime &&
+        std::filesystem::is_directory(installed_runtime, runtime_error);
+    if (runtime_error) {
+        return Failure(
+            game_directory, ProxyInstallationState::Unavailable,
+            ProxyInstallationError::IoFailure, "runtime state could not be read");
+    }
+    const bool runtime_current = runtime_directory &&
+        !IsReparsePoint(installed_runtime) && IsRegularFile(installed_core) &&
+        Matches(installed_core, expected_core);
+    const bool proxy_current = (has_enabled || has_disabled) &&
+        Matches(has_enabled ? enabled : disabled, expected_proxy);
+    if (!runtime_current || !proxy_current) {
         return {ProxyInstallationState::UpdateAvailable,
                 ProxyInstallationError::None, game_directory,
-                "installed Anomaly Core differs from this launcher and can be updated"};
+                "Anomaly installation is incomplete or out of date and can be repaired"};
     }
     return {has_enabled ? ProxyInstallationState::Enabled
                         : ProxyInstallationState::Disabled,
@@ -376,43 +388,39 @@ ProxyInstallationStatus InstallProxyRuntime(
             "proxy state changed while installation was starting");
     }
 
-    const bool updating = current.state == ProxyInstallationState::UpdateAvailable;
-    if (updating != (has_enabled || has_disabled)) {
-        return Failure(
-            game_directory, ProxyInstallationState::Conflict,
-            ProxyInstallationError::Conflict,
-            "proxy state changed while installation was starting");
-    }
-
+    const bool has_proxy = has_enabled || has_disabled;
     const bool has_runtime = std::filesystem::exists(runtime_target, error) && !error;
     if (error) {
         return Failure(
             game_directory, ProxyInstallationState::Unavailable,
             ProxyInstallationError::IoFailure, "runtime state could not be read");
     }
-    if (has_runtime && !updating) {
-        if (!std::filesystem::is_directory(runtime_target, error) || error ||
-            IsReparsePoint(runtime_target) || !IsRegularFile(runtime_target / kCoreName)) {
-            return Failure(
-                game_directory, ProxyInstallationState::Conflict,
-                ProxyInstallationError::RuntimeUnavailable,
-                "existing Anomaly runtime directory is incomplete");
-        }
-        if (!Matches(runtime_target / kCoreName, expected_core)) {
-            return Failure(
-                game_directory, ProxyInstallationState::Conflict,
-                ProxyInstallationError::Conflict,
-                "existing Anomaly.Core.dll does not match the launcher payload");
-        }
+    const bool runtime_directory = has_runtime &&
+        std::filesystem::is_directory(runtime_target, error);
+    if (error) {
+        return Failure(
+            game_directory, ProxyInstallationState::Unavailable,
+            ProxyInstallationError::IoFailure, "runtime state could not be read");
+    }
+    const bool runtime_is_current = runtime_directory &&
+        !IsReparsePoint(runtime_target) &&
+        IsRegularFile(runtime_target / kCoreName) &&
+        Matches(runtime_target / kCoreName, expected_core);
+    const auto installed_proxy = has_enabled ? proxy_target : disabled_target;
+    const bool proxy_is_current = has_proxy && Matches(installed_proxy, expected);
+    const bool replace_runtime = !runtime_is_current;
+    const bool replace_proxy = !proxy_is_current;
+    if (!replace_runtime && !replace_proxy) {
+        return InspectProxyInstallation(game_directory, source);
     }
 
-    const bool replace_runtime = updating || !has_runtime;
     const auto runtime_staging = UniqueSibling(game_directory, L".Anomaly.installing");
     const auto runtime_backup = UniqueSibling(game_directory, L".Anomaly.backup");
     if (replace_runtime) {
         std::string copy_error;
         if (!CopyRuntimeTree(source.runtime_directory, runtime_staging, copy_error) ||
-            (updating && !MergeInstalledRuntime(
+            (has_runtime && std::filesystem::is_directory(runtime_target, error) &&
+             !error && !IsReparsePoint(runtime_target) && !MergeInstalledRuntime(
                 runtime_target, runtime_staging, copy_error))) {
             std::filesystem::remove_all(runtime_staging, error);
             return Failure(
@@ -422,18 +430,20 @@ ProxyInstallationStatus InstallProxyRuntime(
     }
 
     const auto proxy_staging = UniqueSibling(game_directory, L".dwmapi.dll.installing");
-    std::filesystem::copy_file(
-        source.proxy, proxy_staging, std::filesystem::copy_options::none, error);
-    const bool copied = !error;
-    const bool verified = copied && Matches(proxy_staging, expected);
-    if (!verified) {
-        std::filesystem::remove(proxy_staging, error);
-        std::filesystem::remove_all(runtime_staging, error);
-        return Failure(
-            game_directory, ProxyInstallationState::Unavailable,
-            copied && !verified ? ProxyInstallationError::IntegrityFailure
-                                : ProxyInstallationError::IoFailure,
-            "proxy staging failed");
+    if (replace_proxy) {
+        std::filesystem::copy_file(
+            source.proxy, proxy_staging, std::filesystem::copy_options::none, error);
+        const bool copied = !error;
+        const bool verified = copied && Matches(proxy_staging, expected);
+        if (!verified) {
+            std::filesystem::remove(proxy_staging, error);
+            std::filesystem::remove_all(runtime_staging, error);
+            return Failure(
+                game_directory, ProxyInstallationState::Unavailable,
+                copied && !verified ? ProxyInstallationError::IntegrityFailure
+                                    : ProxyInstallationError::IoFailure,
+                "proxy staging failed");
+        }
     }
 
     bool runtime_backed_up{};
@@ -475,7 +485,7 @@ ProxyInstallationStatus InstallProxyRuntime(
     const auto proxy_destination = has_disabled ? disabled_target : proxy_target;
     const auto proxy_backup = UniqueSibling(game_directory, L".dwmapi.dll.backup");
     bool proxy_backed_up{};
-    const DWORD backup_proxy_error = updating
+    const DWORD backup_proxy_error = replace_proxy && has_proxy
         ? MovePath(proxy_destination, proxy_backup) : ERROR_SUCCESS;
     if (backup_proxy_error != ERROR_SUCCESS) {
         rollback_runtime();
@@ -486,9 +496,10 @@ ProxyInstallationStatus InstallProxyRuntime(
             Win32Failure(
                 "installed proxy could not be prepared for update", backup_proxy_error));
     } else {
-        proxy_backed_up = updating;
+        proxy_backed_up = replace_proxy && has_proxy;
     }
-    const DWORD publish_proxy_error = MovePath(proxy_staging, proxy_destination);
+    const DWORD publish_proxy_error = replace_proxy
+        ? MovePath(proxy_staging, proxy_destination) : ERROR_SUCCESS;
     if (publish_proxy_error != ERROR_SUCCESS) {
         if (proxy_backed_up) {
             static_cast<void>(MovePath(proxy_backup, proxy_destination));
