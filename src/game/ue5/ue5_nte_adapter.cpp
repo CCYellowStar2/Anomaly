@@ -9,6 +9,7 @@
 #include <cstring>
 #include <deque>
 #include <initializer_list>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <new>
@@ -17,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -612,6 +614,108 @@ struct Ue5NteAdapter::State {
         std::uint8_t field_mask{};
         std::uint8_t byte_mask{};
     };
+    enum class NteFunctionKind : std::size_t {
+        GetAbilitySystemComponent,
+        GetHp,
+        GetHpMax,
+        GetIsDead,
+        GetAttackTarget,
+        GetShieldHealth,
+        GetActiveEffectTimeRemainingAndDuration,
+        ActivateAbilityByClass,
+        Count,
+    };
+    static constexpr std::size_t kNteFunctionCount =
+        static_cast<std::size_t>(NteFunctionKind::Count);
+    static constexpr std::size_t kMaximumNteFunctionParameters = 3;
+    struct NteFunctionParameterSpec {
+        std::string_view name;
+        std::string_view type;
+        std::int32_t element_size{};
+        bool return_value{};
+    };
+    struct NteFunctionSpec {
+        NteFunctionKind kind{};
+        std::string_view name;
+        std::string_view outer;
+        std::uint16_t parms_size{};
+        std::span<const NteFunctionParameterSpec> parameters;
+    };
+    struct NteFunctionBinding {
+        std::uintptr_t function{};
+        std::uintptr_t outer_class{};
+        std::uintptr_t meta_class{};
+        std::uint16_t parms_size{};
+        std::array<std::uint16_t, kMaximumNteFunctionParameters> offsets{};
+        std::array<ReflectedBoolParameter, kMaximumNteFunctionParameters> bool_parameters{};
+    };
+    struct CombatSkillDiscovery {
+        std::array<std::optional<NteFunctionBinding>, kNteFunctionCount> functions{};
+        std::uintptr_t ability_system_class{};
+        std::uintptr_t gameplay_ability_class{};
+        std::uint64_t object_generation{};
+        std::uint32_t next_object_index{};
+        bool damage_event_layout_valid{};
+        bool skill_layout_valid{};
+        bool cooldown_layout_valid{};
+    } combat_skill_discovery;
+    static constexpr std::size_t kDamageEventCapacity = 512;
+    static constexpr std::uint64_t kDamageSourceBase = 0x8000000000000000ULL;
+    struct DamageRecord {
+        AnomalyNteDamageEventV1 event{};
+    };
+    std::array<DamageRecord, kDamageEventCapacity> damage_events{};
+    std::size_t damage_event_start{};
+    std::size_t damage_event_count{};
+    std::uint64_t damage_event_sequence{};
+    std::uint64_t damage_world_sequence_base{};
+    std::uint64_t damage_dropped_count{};
+    std::uint64_t damage_native_call_count{};
+    std::uint64_t damage_captured_event_count{};
+    std::uint64_t damage_capture_drop_count{};
+    std::uint64_t damage_attacker_resolution_failure_count{};
+    std::uint64_t damage_victim_resolution_failure_count{};
+    std::uint64_t damage_source_resolution_failure_count{};
+    std::uint64_t damage_next_source_id{kDamageSourceBase};
+    std::unordered_map<std::uint64_t, std::uint64_t> damage_source_object_ids;
+    std::unordered_map<std::uint64_t, std::string> damage_source_names;
+    std::unordered_map<std::uint64_t, std::string> damage_participant_paths;
+    std::atomic_bool combat_demand{};
+    std::uint64_t combat_attempt_sequence{};
+    std::uint64_t combat_sample_sequence{};
+    AnomalyGenerationHandleV1 combat_character{};
+    AnomalyGenerationHandleV1 combat_target{};
+    double combat_hp{};
+    double combat_max_hp{};
+    double combat_shield{};
+    bool combat_dead{};
+    bool combat_available{};
+    bool combat_partial{};
+    struct SkillRecord {
+        AnomalyGenerationHandleV1 handle{};
+        AnomalyGenerationHandleV1 character{};
+        AnomalyGenerationHandleV1 ability_class{};
+        std::uint64_t sequence{};
+        std::uint32_t flags{};
+        std::int32_t level{};
+        std::int32_t input_id{};
+        std::int32_t spec_handle{};
+        float cooldown_remaining_seconds{};
+        float cooldown_duration_seconds{};
+        std::uintptr_t ability{};
+        std::uintptr_t ability_class_pointer{};
+        std::string ability_path;
+    };
+    std::vector<SkillRecord> skills;
+    std::atomic_bool skill_demand{};
+    std::uint64_t skill_generation{};
+    std::uint64_t skill_next_id{1};
+    std::uint64_t skill_attempt_sequence{};
+    std::uint64_t skill_sample_sequence{};
+    std::uintptr_t skill_ability_system{};
+    AnomalyGenerationHandleV1 skill_character{};
+    bool skills_available{};
+    bool skills_partial{};
     struct TeleportBinding {
         std::uintptr_t function{};
         std::uint16_t parms_size{};
@@ -836,6 +940,58 @@ struct Ue5NteAdapter::State {
         return static_cast<std::size_t>(kind);
     }
 
+    [[nodiscard]] static constexpr std::size_t NteIndex(
+        const NteFunctionKind kind) noexcept {
+        return static_cast<std::size_t>(kind);
+    }
+
+    [[nodiscard]] static NteFunctionSpec NteSpec(
+        const NteFunctionKind kind) noexcept {
+        static constexpr std::array get_ability_system{
+            NteFunctionParameterSpec{"ReturnValue", "ObjectProperty", 8, true}};
+        static constexpr std::array get_float{
+            NteFunctionParameterSpec{"ReturnValue", "FloatProperty", 4, true}};
+        static constexpr std::array get_hp_max{
+            NteFunctionParameterSpec{"bIsFixHPMax", "BoolProperty", 1, false},
+            NteFunctionParameterSpec{"ReturnValue", "FloatProperty", 4, true}};
+        static constexpr std::array get_bool{
+            NteFunctionParameterSpec{"ReturnValue", "BoolProperty", 1, true}};
+        static constexpr std::array get_object{
+            NteFunctionParameterSpec{"ReturnValue", "ObjectProperty", 8, true}};
+        static constexpr std::array activate{
+            NteFunctionParameterSpec{
+                "InAbilityToActivate", "ClassProperty", 8, false},
+            NteFunctionParameterSpec{"ReturnValue", "BoolProperty", 1, true}};
+        static constexpr std::array cooldown{
+            NteFunctionParameterSpec{
+                "GameplayEffect", "ClassProperty", 8, false},
+            NteFunctionParameterSpec{"TimeRemaining", "FloatProperty", 4, false},
+            NteFunctionParameterSpec{"CooldownDuration", "FloatProperty", 4, false}};
+        switch (kind) {
+        case NteFunctionKind::GetAbilitySystemComponent:
+            return {kind, "K2_GetAbilitySystemComponent", "HTAbilityCharacter", 8,
+                get_ability_system};
+        case NteFunctionKind::GetHp:
+            return {kind, "GetHP", "HTAbilityCharacter", 4, get_float};
+        case NteFunctionKind::GetHpMax:
+            return {kind, "GetHPMax", "HTAbilityCharacter", 8, get_hp_max};
+        case NteFunctionKind::GetIsDead:
+            return {kind, "GetIsDead", "HTAbilityCharacter", 1, get_bool};
+        case NteFunctionKind::GetAttackTarget:
+            return {kind, "GetAttackTarget", "HTAbilityCharacter", 8, get_object};
+        case NteFunctionKind::GetShieldHealth:
+            return {kind, "GetShieldHealth", "HTAttributeComponent", 4, get_float};
+        case NteFunctionKind::GetActiveEffectTimeRemainingAndDuration:
+            return {kind, "GetActiveEffectTimeRemainingAndDuration",
+                "HTAbilitySystemComponent", 16, cooldown};
+        case NteFunctionKind::ActivateAbilityByClass:
+            return {kind, "HTTryActivateAbilityByClass", "HTAbilitySystemComponent", 9,
+                activate};
+        case NteFunctionKind::Count: break;
+        }
+        return {};
+    }
+
     [[nodiscard]] static AhudFunctionSpec AhudSpec(
         const AhudFunctionKind kind) noexcept {
         static constexpr std::array receive{
@@ -1008,6 +1164,104 @@ struct Ue5NteAdapter::State {
             "cameraManager.location",
             "cameraManager.rotation",
             "cameraManager.fov"});
+    }
+
+    [[nodiscard]] bool NteCombatProfileAvailable() const noexcept {
+        return static_cast<bool>(process_event_invoker) && framework_hook_ready &&
+            resolution.FeatureAvailable("nte.combat") &&
+            resolution.FeatureAvailable("nte.player") &&
+            resolution.FeatureAvailable("ue5.names") &&
+            resolution.FeatureAvailable("ue5.objects") &&
+            resolution.FeatureAvailable(kUe5ProcessEventFeature) &&
+            NtePlayerLayoutAvailable() && LayoutKeysAvailable(profile, {
+                "object.internalIndex", "object.class", "object.outer",
+                "ustruct.superStruct", "ustruct.propertyLink", "ufunction.numParms",
+                "ufunction.parmsSize", "ufunction.returnValueOffset",
+                "ffield.class",
+                "ffield.name", "ffieldClass.name", "fproperty.arrayDim",
+                "fproperty.elementSize", "fproperty.offsetInternal",
+                "fproperty.propertyLinkNext", "fstructProperty.struct",
+                "fobjectProperty.propertyClass", "farrayProperty.inner",
+                "fboolProperty.fieldSize",
+                "fboolProperty.byteOffset", "fboolProperty.byteMask",
+                "fboolProperty.fieldMask", "damageEvent.size", "damageEvent.damage",
+                "damageEvent.damageGEDef", "weakObject.index", "weakObject.serial"}) &&
+            FeatureDeclaresDependency(profile, "nte.combat", "nte.player") &&
+            FeatureDeclaresDependency(profile, "nte.combat", "ue5.names") &&
+            FeatureDeclaresDependency(profile, "nte.combat", "ue5.objects") &&
+            FeatureDeclaresDependency(
+                profile, "nte.combat", kUe5ProcessEventFeature) &&
+            FeatureDeclaresLayoutValidator(
+                profile, "nte.combat", "nte-combat-reflection-v1");
+    }
+
+    [[nodiscard]] bool NteSkillsProfileAvailable() const noexcept {
+        return static_cast<bool>(process_event_invoker) && framework_hook_ready &&
+            resolution.FeatureAvailable("nte.skills") &&
+            resolution.FeatureAvailable("nte.player") &&
+            resolution.FeatureAvailable("ue5.names") &&
+            resolution.FeatureAvailable("ue5.objects") &&
+            resolution.FeatureAvailable(kUe5ProcessEventFeature) &&
+            NtePlayerLayoutAvailable() && LayoutKeysAvailable(profile, {
+                "object.internalIndex", "object.class", "object.outer",
+                "ustruct.superStruct", "ustruct.propertyLink", "ufunction.numParms",
+                "ufunction.parmsSize", "ufunction.returnValueOffset", "ffield.class",
+                "ffield.name", "ffieldClass.name", "fproperty.arrayDim",
+                "fproperty.elementSize", "fproperty.offsetInternal",
+                "fproperty.propertyLinkNext", "fstructProperty.struct",
+                "fobjectProperty.propertyClass", "farrayProperty.inner",
+                "fclassProperty.metaClass",
+                "fboolProperty.fieldSize", "fboolProperty.byteOffset",
+                "fboolProperty.byteMask", "fboolProperty.fieldMask", "tarray.data",
+                "tarray.num", "tarray.max", "abilitySystem.activatableAbilities",
+                "abilitySpecContainer.items", "abilitySpec.stride",
+                "abilitySpec.handle", "abilitySpec.ability", "abilitySpec.level",
+                "abilitySpec.inputId", "abilitySpec.activeCount",
+                "abilitySpec.stateBits", "ability.cooldownGameplayEffectClass",
+                "skills.maxCount"}) &&
+            FeatureDeclaresDependency(profile, "nte.skills", "nte.player") &&
+            FeatureDeclaresDependency(profile, "nte.skills", "ue5.names") &&
+            FeatureDeclaresDependency(profile, "nte.skills", "ue5.objects") &&
+            FeatureDeclaresDependency(profile, "nte.skills", kUe5ProcessEventFeature) &&
+            FeatureDeclaresLayoutValidator(
+                profile, "nte.skills", "nte-skills-layout-v1");
+    }
+
+    [[nodiscard]] bool NteSkillInvocationProfileAvailable() const noexcept {
+        return NteSkillsProfileAvailable() &&
+            resolution.FeatureAvailable("nte.skill-invocation") &&
+            FeatureDeclaresDependency(
+                profile, "nte.skill-invocation", "nte.skills") &&
+            FeatureDeclaresDependency(
+                profile, "nte.skill-invocation", kUe5ProcessEventFeature) &&
+            FeatureDeclaresLayoutValidator(
+                profile, "nte.skill-invocation", "nte-skill-invocation-v1");
+    }
+
+    [[nodiscard]] bool NteFunctionReady(const NteFunctionKind kind) const noexcept {
+        return combat_skill_discovery.functions[NteIndex(kind)].has_value();
+    }
+
+    [[nodiscard]] bool NteCombatReflectionReady() const noexcept {
+        return combat_skill_discovery.damage_event_layout_valid &&
+            NteFunctionReady(NteFunctionKind::GetAbilitySystemComponent) &&
+            NteFunctionReady(NteFunctionKind::GetHp) &&
+            NteFunctionReady(NteFunctionKind::GetHpMax) &&
+            NteFunctionReady(NteFunctionKind::GetIsDead) &&
+            NteFunctionReady(NteFunctionKind::GetAttackTarget) &&
+            NteFunctionReady(NteFunctionKind::GetShieldHealth);
+    }
+
+    [[nodiscard]] bool NteSkillsReflectionReady() const noexcept {
+        return combat_skill_discovery.skill_layout_valid &&
+            NteFunctionReady(NteFunctionKind::GetAbilitySystemComponent) &&
+            combat_skill_discovery.gameplay_ability_class != 0;
+    }
+
+    [[nodiscard]] bool NteSkillInvocationReflectionReady() const noexcept {
+        return NteSkillsReflectionReady() &&
+            NteFunctionReady(NteFunctionKind::ActivateAbilityByClass) &&
+            combat_skill_discovery.gameplay_ability_class != 0;
     }
 
     [[nodiscard]] bool NtePlayerTeleportAvailable() const noexcept {
@@ -1325,13 +1579,25 @@ struct Ue5NteAdapter::State {
         if (feature == "nte.entities") {
             return NteEntitiesLayoutAvailable();
         }
+        if (feature == "nte.combat") {
+            return NteCombatProfileAvailable() && NteCombatReflectionReady();
+        }
+        if (feature == "nte.skills") {
+            return NteSkillsProfileAvailable() && NteSkillsReflectionReady();
+        }
+        if (feature == "nte.skill-invocation") {
+            return NteSkillInvocationProfileAvailable() &&
+                NteSkillInvocationReflectionReady();
+        }
         return feature == "nte.session";
     }
 
     [[nodiscard]] bool MetricsFeatureAvailable() const noexcept {
         return SemanticFeatureAvailable("nte.session") ||
             SemanticFeatureAvailable("nte.player") ||
-            SemanticFeatureAvailable("nte.entities");
+            SemanticFeatureAvailable("nte.entities") ||
+            SemanticFeatureAvailable("nte.combat") ||
+            SemanticFeatureAvailable("nte.skills");
     }
 
     bool PublishAvailableServices(const std::weak_ptr<State>& self);
@@ -1455,6 +1721,16 @@ struct Ue5NteAdapter::State {
         if (id == ANOMALY_NTE_ACTORS_SERVICE_V1_ID) {
             return framework_hook_ready && NteActorsLayoutAvailable();
         }
+        if (id == ANOMALY_NTE_COMBAT_SERVICE_V1_ID) {
+            return framework_hook_ready && SemanticFeatureAvailable("nte.combat");
+        }
+        if (id == ANOMALY_NTE_SKILLS_SERVICE_V1_ID) {
+            return framework_hook_ready && SemanticFeatureAvailable("nte.skills");
+        }
+        if (id == ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID) {
+            return framework_hook_ready &&
+                SemanticFeatureAvailable("nte.skill-invocation");
+        }
         return false;
     }
 
@@ -1528,7 +1804,9 @@ struct Ue5NteAdapter::State {
             feature == "nte.player-esp" ||
             feature == "nte.player-teleport" || feature == "nte.navigation" ||
             feature == "nte.pickup" ||
-            feature == "nte.entities") {
+            feature == "nte.entities" ||
+            feature == "nte.combat" || feature == "nte.skills" ||
+            feature == "nte.skill-invocation") {
             return SemanticFeatureAvailable(feature)
                 ? ANOMALY_FEATURE_V1_AVAILABLE
                 : ANOMALY_FEATURE_V1_UNAVAILABLE;
@@ -1555,6 +1833,48 @@ struct Ue5NteAdapter::State {
         if (actor_frame_cache) ++actor_generation;
         actor_frame_cache.reset();
         actor_world_generation = 0;
+    }
+
+    void InvalidateCombatSnapshot() noexcept {
+        combat_sample_sequence = 0;
+        combat_character = {};
+        combat_target = {};
+        combat_hp = 0.0;
+        combat_max_hp = 0.0;
+        combat_shield = 0.0;
+        combat_dead = false;
+        combat_available = false;
+        combat_partial = false;
+    }
+
+    void ResetDamageEvents() noexcept {
+        if (damage_event_sequence != 0) ++damage_event_sequence;
+        damage_world_sequence_base = damage_event_sequence;
+        damage_event_start = 0;
+        damage_event_count = 0;
+        damage_events = {};
+        damage_dropped_count = 0;
+        damage_next_source_id = kDamageSourceBase;
+        damage_source_object_ids.clear();
+        damage_source_names.clear();
+        damage_participant_paths.clear();
+    }
+
+    void InvalidateSkills() noexcept {
+        if (skills_available || !skills.empty()) ++skill_generation;
+        skills.clear();
+        skill_sample_sequence = 0;
+        skill_ability_system = 0;
+        skill_character = {};
+        skills_available = false;
+        skills_partial = false;
+    }
+
+    void InvalidateCombatSkillDiscoveryLocked() noexcept {
+        combat_skill_discovery = {};
+        combat_skill_discovery.object_generation = object_generation;
+        InvalidateCombatSnapshot();
+        InvalidateSkills();
     }
 
     void InvalidatePlayer() noexcept {
@@ -1618,16 +1938,28 @@ struct Ue5NteAdapter::State {
         pickup_sequence = 0;
         InvalidatePickupLocked(ANOMALY_STATUS_V1_UNAVAILABLE);
         InvalidateAhudBindingLocked();
+        InvalidateCombatSkillDiscoveryLocked();
+        ResetDamageEvents();
+        damage_native_call_count = 0;
+        damage_captured_event_count = 0;
+        damage_capture_drop_count = 0;
+        damage_attacker_resolution_failure_count = 0;
+        damage_victim_resolution_failure_count = 0;
+        damage_source_resolution_failure_count = 0;
         InvalidatePlayer();
         InvalidateEntities();
         InvalidateActors();
         entity_attempt_sequence = 0;
         player_attempt_sequence = 0;
+        combat_attempt_sequence = 0;
+        skill_attempt_sequence = 0;
         player_demand.store(false, std::memory_order_release);
         entity_demand.store(false, std::memory_order_release);
         navigation_demand.store(false, std::memory_order_release);
         pickup_demand.store(false, std::memory_order_release);
         ahud_demand.store(false, std::memory_order_release);
+        combat_demand.store(false, std::memory_order_release);
+        skill_demand.store(false, std::memory_order_release);
         ahud_frame_count.store(0, std::memory_order_release);
         ahud_process_event_call_count.store(0, std::memory_order_release);
         game_thread_id.store(0, std::memory_order_release);
@@ -1654,6 +1986,9 @@ struct Ue5NteAdapter::State {
         InvalidatePlayer();
         InvalidateEntities();
         InvalidateActors();
+        InvalidateCombatSnapshot();
+        InvalidateSkills();
+        ResetDamageEvents();
         if (world_pointer != 0) {
             world_pointer = 0;
             ++world_generation;
@@ -1670,6 +2005,7 @@ struct Ue5NteAdapter::State {
         framework_hook_ready = false;
         ahud_hook_ready = false;
         InvalidateAhudBindingLocked();
+        InvalidateCombatSkillDiscoveryLocked();
     }
 
     void RecordSessionEvent(
@@ -1703,6 +2039,9 @@ struct Ue5NteAdapter::State {
             InvalidateEntities();
             InvalidateActors();
             InvalidatePickupLocked(ANOMALY_STATUS_V1_UNAVAILABLE);
+            InvalidateCombatSnapshot();
+            InvalidateSkills();
+            ResetDamageEvents();
             world_pointer = next;
             ++world_generation;
             ++world_change_sequence;
@@ -1745,6 +2084,8 @@ struct Ue5NteAdapter::State {
             InvalidatePickupLocked(ANOMALY_STATUS_V1_UNAVAILABLE);
             if (object_generation != previous_generation) {
                 InvalidateAhudBindingLocked();
+                InvalidateCombatSkillDiscoveryLocked();
+                ResetDamageEvents();
             }
             return;
         }
@@ -1765,6 +2106,8 @@ struct Ue5NteAdapter::State {
         if (object_generation != previous_generation) {
             InvalidateAhudBindingLocked();
             InvalidatePickupLocked(ANOMALY_STATUS_V1_UNAVAILABLE);
+            InvalidateCombatSkillDiscoveryLocked();
+            ResetDamageEvents();
         }
     }
 
@@ -1880,6 +2223,547 @@ struct Ue5NteAdapter::State {
         camera_rotation = next_camera_rotation;
         camera_horizontal_fov = horizontal_fov;
         player_esp_available = true;
+    }
+
+    [[nodiscard]] bool InvokeNteFunctionLocked(
+        const NteFunctionKind kind,
+        const std::uintptr_t object,
+        std::span<std::uint8_t> parameters) const noexcept {
+        const auto& binding = combat_skill_discovery.functions[NteIndex(kind)];
+        return binding && object != 0 && process_event_invoker &&
+            parameters.size() >= binding->parms_size &&
+            process_event_invoker(
+                object, binding->function, parameters.data(), binding->parms_size);
+    }
+
+    template <typename Value>
+    [[nodiscard]] bool InvokeNteReturnLocked(
+        const NteFunctionKind kind,
+        const std::uintptr_t object,
+        Value& value) const noexcept {
+        const auto& binding = combat_skill_discovery.functions[NteIndex(kind)];
+        if (!binding || binding->parms_size > 64U) return false;
+        alignas(std::uint64_t) std::array<std::uint8_t, 64> parameters{};
+        if (!InvokeNteFunctionLocked(kind, object, parameters)) return false;
+        const std::size_t return_index = NteSpec(kind).parameters.size() - 1U;
+        const std::size_t offset = binding->offsets[return_index];
+        if (offset > binding->parms_size || sizeof(Value) > binding->parms_size - offset) {
+            return false;
+        }
+        std::memcpy(&value, parameters.data() + offset, sizeof(Value));
+        return true;
+    }
+
+    [[nodiscard]] bool InvokeNteBoolReturnLocked(
+        const NteFunctionKind kind,
+        const std::uintptr_t object,
+        bool& value) const noexcept {
+        const auto& binding = combat_skill_discovery.functions[NteIndex(kind)];
+        if (!binding || binding->parms_size > 64U) return false;
+        alignas(std::uint64_t) std::array<std::uint8_t, 64> parameters{};
+        if (!InvokeNteFunctionLocked(kind, object, parameters)) return false;
+        const std::size_t index = NteSpec(kind).parameters.size() - 1U;
+        const ReflectedBoolParameter& reflected = binding->bool_parameters[index];
+        if (reflected.byte_offset >= binding->parms_size) return false;
+        value = (parameters[reflected.byte_offset] & reflected.field_mask) != 0;
+        return true;
+    }
+
+    [[nodiscard]] bool CurrentAbilitySystemLocked(
+        const std::uintptr_t pawn,
+        std::uintptr_t& ability_system) const noexcept {
+        ability_system = 0;
+        if (!InvokeNteReturnLocked(
+                NteFunctionKind::GetAbilitySystemComponent, pawn, ability_system) ||
+            ability_system == 0 ||
+            combat_skill_discovery.ability_system_class == 0) {
+            return false;
+        }
+        std::uintptr_t ability_system_class{};
+        return ReadPointerAt(
+                   *memory, ability_system, Layout(profile, "object.class"),
+                   ability_system_class) &&
+            IsClassDerivedFromLocked(
+                ability_system_class,
+                combat_skill_discovery.ability_system_class);
+    }
+
+    void RefreshCombat(std::uint64_t sequence) noexcept {
+        combat_attempt_sequence = sequence;
+        if (!SemanticFeatureAvailable("nte.combat") || !player_available ||
+            player_pawn == 0 || world_pointer == 0) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+        AnomalyGenerationHandleV1 character{};
+        if (!ObjectHandleLocked(player_pawn, character)) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+        std::uintptr_t pawn_class{};
+        const auto& get_hp = combat_skill_discovery.functions[
+            NteIndex(NteFunctionKind::GetHp)];
+        if (!get_hp ||
+            !ReadPointerAt(
+                *memory, player_pawn, Layout(profile, "object.class"), pawn_class) ||
+            !IsClassDerivedFromLocked(pawn_class, get_hp->outer_class)) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+
+        float hp{};
+        float max_hp{};
+        float shield{};
+        bool dead{};
+        std::uintptr_t target{};
+        std::uintptr_t ability_system{};
+        const auto& hp_max_binding = combat_skill_discovery.functions[
+            NteIndex(NteFunctionKind::GetHpMax)];
+        alignas(std::uint64_t) std::array<std::uint8_t, 8> hp_max_parameters{};
+        if (!InvokeNteReturnLocked(NteFunctionKind::GetHp, player_pawn, hp) ||
+            !hp_max_binding ||
+            !InvokeNteFunctionLocked(
+                NteFunctionKind::GetHpMax, player_pawn, hp_max_parameters) ||
+            !InvokeNteBoolReturnLocked(
+                NteFunctionKind::GetIsDead, player_pawn, dead) ||
+            !InvokeNteReturnLocked(
+                NteFunctionKind::GetAttackTarget, player_pawn, target) ||
+            !CurrentAbilitySystemLocked(player_pawn, ability_system) ||
+            !InvokeNteReturnLocked(
+                NteFunctionKind::GetShieldHealth, ability_system, shield)) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+        const std::size_t max_hp_return = hp_max_binding->offsets[1];
+        if (max_hp_return > hp_max_parameters.size() ||
+            sizeof(max_hp) > hp_max_parameters.size() - max_hp_return) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+        std::memcpy(&max_hp, hp_max_parameters.data() + max_hp_return, sizeof(max_hp));
+        if (!std::isfinite(hp) || !std::isfinite(max_hp) ||
+            !std::isfinite(shield) || max_hp < 0.0F) {
+            InvalidateCombatSnapshot();
+            return;
+        }
+        AnomalyGenerationHandleV1 target_handle{};
+        const bool partial = target != 0 && !ObjectHandleLocked(target, target_handle);
+        combat_character = character;
+        combat_target = target_handle;
+        combat_hp = hp;
+        combat_max_hp = max_hp;
+        combat_shield = shield;
+        combat_dead = dead;
+        combat_partial = partial;
+        combat_available = true;
+        combat_sample_sequence = sequence;
+    }
+
+    struct NativeArrayHeader {
+        std::uintptr_t data{};
+        std::int32_t count{};
+        std::int32_t capacity{};
+    };
+
+    [[nodiscard]] bool ReadNativeArrayHeaderLocked(
+        const std::uintptr_t address,
+        NativeArrayHeader& header,
+        const std::int32_t maximum) const noexcept {
+        NativeArrayHeader next;
+        if (address == 0 || maximum <= 0 ||
+            !ReadValue(
+                *memory, address + Layout(profile, "tarray.data"), next.data) ||
+            !ReadValue(
+                *memory, address + Layout(profile, "tarray.num"), next.count) ||
+            !ReadValue(
+                *memory, address + Layout(profile, "tarray.max"), next.capacity) ||
+            next.count < 0 || next.capacity < next.count || next.capacity > maximum ||
+            (next.count != 0 && next.data == 0)) {
+            return false;
+        }
+        header = next;
+        return true;
+    }
+
+    [[nodiscard]] bool ReadSkillArrayLocked(
+        const std::uintptr_t ability_system,
+        NativeArrayHeader& header) const noexcept {
+        std::uintptr_t container{};
+        std::uintptr_t items{};
+        return AddAddress(
+                   ability_system,
+                   Layout(profile, "abilitySystem.activatableAbilities"),
+                   container) &&
+            AddAddress(
+                container, Layout(profile, "abilitySpecContainer.items"), items) &&
+            ReadNativeArrayHeaderLocked(
+                items, header,
+                static_cast<std::int32_t>(Layout(profile, "skills.maxCount")));
+    }
+
+    [[nodiscard]] bool ReadSkillIdentityLocked(
+        const NativeArrayHeader& array,
+        const std::int32_t index,
+        SkillRecord& record) const {
+        if (index < 0 || index >= array.count) return false;
+        const auto stride = static_cast<std::uint64_t>(Layout(profile, "abilitySpec.stride"));
+        if (static_cast<std::uint64_t>(index) >
+            (std::numeric_limits<std::uint64_t>::max)() / stride) {
+            return false;
+        }
+        std::uintptr_t spec{};
+        if (!AddUnsignedAddress(
+                array.data, static_cast<std::uint64_t>(index) * stride, spec)) {
+            return false;
+        }
+        std::uint8_t active_count{};
+        std::uint8_t state_bits{};
+        if (!ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.handle"),
+                record.spec_handle) ||
+            !ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.ability"), record.ability) ||
+            !ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.level"), record.level) ||
+            !ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.inputId"), record.input_id) ||
+            !ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.activeCount"), active_count) ||
+            !ReadValue(
+                *memory, spec + Layout(profile, "abilitySpec.stateBits"), state_bits) ||
+            record.spec_handle == 0 || record.ability == 0 ||
+            !ReadPointerAt(
+                *memory, record.ability, Layout(profile, "object.class"),
+                record.ability_class_pointer) ||
+            combat_skill_discovery.gameplay_ability_class == 0 ||
+            !IsClassDerivedFromLocked(
+                record.ability_class_pointer,
+                combat_skill_discovery.gameplay_ability_class) ||
+            !ObjectHandleLocked(record.ability_class_pointer, record.ability_class)) {
+            return false;
+        }
+        record.flags = ANOMALY_NTE_SKILL_V1_VALID |
+            ANOMALY_NTE_SKILL_V1_PARTIAL;
+        if (active_count != 0) record.flags |= ANOMALY_NTE_SKILL_V1_ACTIVE;
+        if ((state_bits & 0x01U) != 0) record.flags |= ANOMALY_NTE_SKILL_V1_INPUT_PRESSED;
+        if ((state_bits & 0x02U) != 0) {
+            record.flags |= ANOMALY_NTE_SKILL_V1_REMOVE_AFTER_ACTIVATION;
+        }
+        if ((state_bits & 0x04U) != 0) record.flags |= ANOMALY_NTE_SKILL_V1_PENDING_REMOVE;
+        record.ability_path = ObjectPathLocked(record.ability_class_pointer);
+        return !record.ability_path.empty();
+    }
+
+    [[nodiscard]] static bool SameSkillIdentity(
+        const SkillRecord& left,
+        const SkillRecord& right) noexcept {
+        return left.spec_handle == right.spec_handle &&
+            left.ability == right.ability &&
+            left.ability_class_pointer == right.ability_class_pointer;
+    }
+
+    [[nodiscard]] bool RefreshSkillCooldownLocked(
+        const std::uintptr_t ability_system,
+        SkillRecord& record) const noexcept {
+        const auto& binding = combat_skill_discovery.functions[NteIndex(
+            NteFunctionKind::GetActiveEffectTimeRemainingAndDuration)];
+        if (!combat_skill_discovery.cooldown_layout_valid || !binding ||
+            binding->parms_size > 64U) {
+            return false;
+        }
+
+        std::uintptr_t effect_address{};
+        std::uintptr_t effect_class{};
+        if (!AddAddress(
+                record.ability,
+                Layout(profile, "ability.cooldownGameplayEffectClass"),
+                effect_address) ||
+            !ReadValue(*memory, effect_address, effect_class)) {
+            return false;
+        }
+        if (effect_class == 0) {
+            record.flags &= ~ANOMALY_NTE_SKILL_V1_PARTIAL;
+            record.flags |= ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID;
+            return true;
+        }
+        AnomalyGenerationHandleV1 effect_handle{};
+        if (!ObjectHandleLocked(effect_class, effect_handle) ||
+            binding->meta_class == 0 ||
+            !IsClassDerivedFromLocked(effect_class, binding->meta_class)) {
+            return false;
+        }
+
+        alignas(std::uint64_t) std::array<std::uint8_t, 64> parameters{};
+        const std::size_t class_offset = binding->offsets[0];
+        if (class_offset > binding->parms_size ||
+            sizeof(effect_class) > binding->parms_size - class_offset) {
+            return false;
+        }
+        std::memcpy(
+            parameters.data() + class_offset, &effect_class, sizeof(effect_class));
+        if (!InvokeNteFunctionLocked(
+                NteFunctionKind::GetActiveEffectTimeRemainingAndDuration,
+                ability_system,
+                parameters)) {
+            return false;
+        }
+
+        const std::size_t remaining_offset = binding->offsets[1];
+        const std::size_t duration_offset = binding->offsets[2];
+        float remaining{};
+        float duration{};
+        if (remaining_offset > binding->parms_size ||
+            sizeof(remaining) > binding->parms_size - remaining_offset ||
+            duration_offset > binding->parms_size ||
+            sizeof(duration) > binding->parms_size - duration_offset) {
+            return false;
+        }
+        std::memcpy(
+            &remaining, parameters.data() + remaining_offset, sizeof(remaining));
+        std::memcpy(
+            &duration, parameters.data() + duration_offset, sizeof(duration));
+        if (!std::isfinite(remaining) || !std::isfinite(duration)) return false;
+        record.cooldown_remaining_seconds = (std::max)(0.0F, remaining);
+        record.cooldown_duration_seconds = (std::max)(0.0F, duration);
+        record.flags &= ~ANOMALY_NTE_SKILL_V1_PARTIAL;
+        record.flags |= ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID;
+        return true;
+    }
+
+    void RefreshSkills(std::uint64_t sequence) noexcept {
+        skill_attempt_sequence = sequence;
+        if (!SemanticFeatureAvailable("nte.skills") || !player_available ||
+            player_pawn == 0 || world_pointer == 0) {
+            InvalidateSkills();
+            return;
+        }
+        std::uintptr_t ability_system{};
+        AnomalyGenerationHandleV1 character{};
+        NativeArrayHeader array;
+        if (!CurrentAbilitySystemLocked(player_pawn, ability_system) ||
+            !ObjectHandleLocked(player_pawn, character) ||
+            !ReadSkillArrayLocked(ability_system, array)) {
+            InvalidateSkills();
+            return;
+        }
+        try {
+            std::vector<SkillRecord> next;
+            next.reserve(static_cast<std::size_t>(array.count));
+            bool partial{};
+            for (std::int32_t index{}; index < array.count; ++index) {
+                SkillRecord record;
+                if (!ReadSkillIdentityLocked(array, index, record)) {
+                    InvalidateSkills();
+                    return;
+                }
+                if (!RefreshSkillCooldownLocked(ability_system, record)) {
+                    partial = true;
+                }
+                record.character = character;
+                record.sequence = sequence;
+                next.push_back(std::move(record));
+            }
+
+            bool same_identity = skills_available && skill_ability_system == ability_system &&
+                skill_character.id == character.id &&
+                skill_character.generation == character.generation &&
+                skills.size() == next.size();
+            if (same_identity) {
+                std::vector<bool> matched(skills.size());
+                for (SkillRecord& candidate : next) {
+                    const auto found = std::find_if(
+                        skills.begin(), skills.end(), [&](const SkillRecord& current) {
+                            const std::size_t old_index = static_cast<std::size_t>(
+                                &current - skills.data());
+                            return !matched[old_index] &&
+                                SameSkillIdentity(current, candidate);
+                        });
+                    if (found == skills.end()) {
+                        same_identity = false;
+                        break;
+                    }
+                    const std::size_t old_index = static_cast<std::size_t>(found - skills.begin());
+                    matched[old_index] = true;
+                    candidate.handle = found->handle;
+                }
+            }
+            if (!same_identity) {
+                ++skill_generation;
+                for (SkillRecord& candidate : next) {
+                    if (skill_next_id == 0) ++skill_next_id;
+                    candidate.handle = {skill_next_id++, skill_generation};
+                }
+            }
+            skills = std::move(next);
+            skill_ability_system = ability_system;
+            skill_character = character;
+            skill_sample_sequence = sequence;
+            skills_available = true;
+            skills_partial = partial;
+        } catch (...) {
+            InvalidateSkills();
+        }
+    }
+
+    [[nodiscard]] bool WeakObjectHandleLocked(
+        const std::int32_t index,
+        const std::int32_t serial,
+        AnomalyGenerationHandleV1& handle) const noexcept {
+        handle = {};
+        if (index < 0 || serial <= 0 ||
+            static_cast<std::uint64_t>(index) >= object_registry.count) {
+            return false;
+        }
+        std::uintptr_t object{};
+        std::uint32_t observed_serial{};
+        if (!ReadObjectSlot(
+                *memory, object_registry, static_cast<std::uint32_t>(index),
+                object, observed_serial) || object == 0 ||
+            observed_serial != static_cast<std::uint32_t>(serial)) {
+            return false;
+        }
+        handle = {
+            EncodeObjectHandle(
+                static_cast<std::uint32_t>(index), observed_serial),
+            object_generation};
+        return true;
+    }
+
+    void RecordDamageEventLocked(AnomalyNteDamageEventV1 event) noexcept {
+        event.struct_size = sizeof(event);
+        event.sequence = ++damage_event_sequence;
+        if (damage_event_count == kDamageEventCapacity) {
+            damage_events[damage_event_start].event = event;
+            damage_event_start = (damage_event_start + 1U) % kDamageEventCapacity;
+            return;
+        }
+        const std::size_t slot =
+            (damage_event_start + damage_event_count) % kDamageEventCapacity;
+        damage_events[slot].event = event;
+        ++damage_event_count;
+    }
+
+    void CacheDamageParticipantPathLocked(
+        const AnomalyGenerationHandleV1 participant) noexcept {
+        if (participant.id == 0 || participant.generation != object_generation ||
+            damage_participant_paths.contains(participant.id)) {
+            return;
+        }
+        try {
+            std::uintptr_t object{};
+            if (!ResolveObjectHandleLocked(participant, object)) return;
+            std::string path = ObjectPathLocked(object);
+            if (!path.empty()) {
+                damage_participant_paths.emplace(participant.id, std::move(path));
+            }
+        } catch (...) {
+        }
+    }
+
+    [[nodiscard]] std::uint64_t ResolveDamageEventSourceLocked(
+        const std::uintptr_t damage_event) noexcept {
+        std::uintptr_t weak_source{};
+        if (!AddUnsignedAddress(
+                damage_event, Layout(profile, "damageEvent.damageGEDef"), weak_source)) {
+            return 0;
+        }
+        std::int32_t source_index{-1};
+        std::int32_t source_serial{};
+        if (!ReadValue(
+                *memory, weak_source + Layout(profile, "weakObject.index"),
+                source_index) ||
+            !ReadValue(
+                *memory, weak_source + Layout(profile, "weakObject.serial"),
+                source_serial)) {
+            return 0;
+        }
+        AnomalyGenerationHandleV1 source_handle{};
+        if (!WeakObjectHandleLocked(source_index, source_serial, source_handle)) {
+            return 0;
+        }
+        const auto existing = damage_source_object_ids.find(source_handle.id);
+        if (existing != damage_source_object_ids.end()) return existing->second;
+
+        std::uintptr_t source_object{};
+        if (!ResolveObjectHandleLocked(source_handle, source_object)) return 0;
+        std::string source_path = ObjectPathLocked(source_object);
+        if (source_path.empty()) return 0;
+        const std::uint64_t source_id = damage_next_source_id++;
+        damage_source_object_ids.emplace(source_handle.id, source_id);
+        damage_source_names.emplace(source_id, std::move(source_path));
+        return source_id;
+    }
+
+    void CaptureCharacterDamageLocked(
+        const std::uintptr_t damage_event,
+        const std::uintptr_t victim,
+        const std::uintptr_t attacker) noexcept {
+        ++damage_native_call_count;
+        const auto drop = [this]() noexcept {
+            ++damage_dropped_count;
+            ++damage_capture_drop_count;
+        };
+        if (!started.load(std::memory_order_acquire) || damage_event == 0 ||
+            victim == 0 || !SemanticFeatureAvailable("nte.combat") ||
+            world_pointer == 0) {
+            drop();
+            return;
+        }
+        const DWORD expected_thread = game_thread_id.load(std::memory_order_acquire);
+        if (expected_thread == 0 || expected_thread != GetCurrentThreadId()) {
+            drop();
+            return;
+        }
+        try {
+            float damage{};
+            if (!ReadValue(
+                    *memory, damage_event + Layout(profile, "damageEvent.damage"),
+                    damage) ||
+                !std::isfinite(damage) || damage < 0.0F ||
+                damage > static_cast<float>((std::numeric_limits<std::int64_t>::max)())) {
+                drop();
+                return;
+            }
+
+            AnomalyNteDamageEventV1 event{};
+            event.flags = ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT;
+            event.tick_sequence = tick_sequence.load(std::memory_order_acquire);
+            event.world = {1, world_generation};
+            if (attacker != 0 && !ObjectHandleLocked(attacker, event.attacker)) {
+                ++damage_attacker_resolution_failure_count;
+            }
+            if (!ObjectHandleLocked(victim, event.victim)) {
+                ++damage_victim_resolution_failure_count;
+                drop();
+                return;
+            }
+            event.source_id = ResolveDamageEventSourceLocked(damage_event);
+            if (event.source_id == 0) ++damage_source_resolution_failure_count;
+            CacheDamageParticipantPathLocked(event.attacker);
+            CacheDamageParticipantPathLocked(event.victim);
+            event.final_damage = static_cast<std::int64_t>(std::llround(damage));
+            RecordDamageEventLocked(event);
+            ++damage_captured_event_count;
+        } catch (...) {
+            drop();
+        }
+    }
+
+    void RefreshDamageSourceNamesLocked() {
+        for (std::size_t index{}; index < damage_event_count; ++index) {
+            const auto& event = damage_events[
+                (damage_event_start + index) % kDamageEventCapacity].event;
+            if (damage_source_names.contains(event.source_id)) continue;
+            const auto name_id = static_cast<std::uint32_t>(event.source_id);
+            const auto number = static_cast<std::uint32_t>(event.source_id >> 32U);
+            std::string name = ResolveNameSnapshotLocked(name_id);
+            if (name.empty()) continue;
+            if (number != 0) {
+                name.push_back('_');
+                name.append(std::to_string(number - 1U));
+            }
+            damage_source_names.emplace(event.source_id, std::move(name));
+        }
     }
 
     void RefreshEntityCache(
@@ -2617,6 +3501,536 @@ struct Ue5NteAdapter::State {
             !(name = ResolveNameSnapshotLocked(name_id)).empty();
     }
 
+    struct ReflectedPropertyInfo {
+        std::uintptr_t property{};
+        std::uintptr_t next{};
+        std::string name;
+        std::string type;
+        std::int32_t array_dim{};
+        std::int32_t element_size{};
+        std::int32_t offset{};
+    };
+
+    [[nodiscard]] bool ReadReflectedPropertyLocked(
+        const std::uintptr_t property,
+        ReflectedPropertyInfo& info) const {
+        std::uintptr_t name_address{};
+        std::uintptr_t next_address{};
+        std::uint32_t name_id{};
+        ReflectedPropertyInfo candidate;
+        candidate.property = property;
+        if (property == 0 ||
+            !AddAddress(property, Layout(profile, "ffield.name"), name_address) ||
+            !AddAddress(
+                property, Layout(profile, "fproperty.propertyLinkNext"), next_address) ||
+            !ReadValue(*memory, name_address, name_id) ||
+            !ReadValue(
+                *memory, property + Layout(profile, "fproperty.arrayDim"),
+                candidate.array_dim) ||
+            !ReadValue(
+                *memory, property + Layout(profile, "fproperty.elementSize"),
+                candidate.element_size) ||
+            !ReadValue(
+                *memory, property + Layout(profile, "fproperty.offsetInternal"),
+                candidate.offset) ||
+            !ReadValue(*memory, next_address, candidate.next) ||
+            !(candidate.name = ResolveNameSnapshotLocked(name_id)).size() ||
+            !ReadReflectedFieldClassNameLocked(property, candidate.type)) {
+            return false;
+        }
+        info = std::move(candidate);
+        return true;
+    }
+
+    [[nodiscard]] bool ObjectHandleLocked(
+        const std::uintptr_t object,
+        AnomalyGenerationHandleV1& handle) const noexcept {
+        handle = {};
+        std::uintptr_t index_address{};
+        std::int32_t index{-1};
+        if (object == 0 || object_registry.items == 0 ||
+            !AddAddress(object, Layout(profile, "object.internalIndex"), index_address) ||
+            !ReadValue(*memory, index_address, index) || index < 0 ||
+            static_cast<std::uint64_t>(index) >= object_registry.count) {
+            return false;
+        }
+        std::uintptr_t registered{};
+        std::uint32_t serial{};
+        if (!ReadObjectSlot(
+                *memory, object_registry, static_cast<std::uint32_t>(index),
+                registered, serial) || registered != object) {
+            return false;
+        }
+        handle = {
+            EncodeObjectHandle(static_cast<std::uint32_t>(index), serial),
+            object_generation};
+        return true;
+    }
+
+    [[nodiscard]] bool ResolveObjectHandleLocked(
+        const AnomalyGenerationHandleV1 handle,
+        std::uintptr_t& object) const noexcept {
+        object = 0;
+        if (handle.generation != object_generation || handle.id == 0) return false;
+        const std::uint32_t encoded_index = static_cast<std::uint32_t>(handle.id);
+        if (encoded_index == 0) return false;
+        const std::uint32_t index = encoded_index - 1U;
+        const std::uint32_t serial = static_cast<std::uint32_t>(handle.id >> 32U);
+        std::uint32_t observed_serial{};
+        return ReadObjectSlot(*memory, object_registry, index, object, observed_serial) &&
+            object != 0 && observed_serial == serial;
+    }
+
+    [[nodiscard]] bool IsClassDerivedFromLocked(
+        std::uintptr_t candidate,
+        const std::uintptr_t expected_base) const noexcept {
+        constexpr std::size_t kMaximumDepth = 128;
+        for (std::size_t depth{};
+             candidate != 0 && depth < kMaximumDepth;
+             ++depth) {
+            if (candidate == expected_base) return true;
+            std::uintptr_t next{};
+            if (!ReadValue(
+                    *memory,
+                    candidate + Layout(profile, "ustruct.superStruct"),
+                    next) || next == candidate) {
+                return false;
+            }
+            candidate = next;
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::string ObjectPathLocked(
+        std::uintptr_t object) const {
+        constexpr std::size_t kMaximumDepth = 64;
+        std::vector<std::string> names;
+        names.reserve(8);
+        for (std::size_t depth{}; object != 0 && depth < kMaximumDepth; ++depth) {
+            std::string name;
+            if (!ReadReflectedObjectNameLocked(object, name)) return {};
+            names.push_back(std::move(name));
+            std::uintptr_t outer{};
+            if (!ReadValue(
+                    *memory, object + Layout(profile, "object.outer"), outer) ||
+                outer == object) {
+                return {};
+            }
+            object = outer;
+        }
+        if (object != 0 || names.empty()) return {};
+        std::string path;
+        for (auto iterator = names.rbegin(); iterator != names.rend(); ++iterator) {
+            if (!path.empty()) path.push_back('.');
+            path.append(*iterator);
+        }
+        return path;
+    }
+
+    [[nodiscard]] bool ReadReflectedBoolParameterLocked(
+        const ReflectedPropertyInfo& property,
+        const std::uint16_t parms_size,
+        ReflectedBoolParameter& parameter) const noexcept {
+        std::uint8_t field_size{};
+        std::uint8_t byte_offset{};
+        std::uint8_t byte_mask{};
+        std::uint8_t field_mask{};
+        if (property.type != "BoolProperty" || property.array_dim != 1 ||
+            property.element_size != 1 || property.offset < 0 ||
+            !ReadValue(
+                *memory,
+                property.property + Layout(profile, "fboolProperty.fieldSize"),
+                field_size) ||
+            !ReadValue(
+                *memory,
+                property.property + Layout(profile, "fboolProperty.byteOffset"),
+                byte_offset) ||
+            !ReadValue(
+                *memory,
+                property.property + Layout(profile, "fboolProperty.byteMask"),
+                byte_mask) ||
+            !ReadValue(
+                *memory,
+                property.property + Layout(profile, "fboolProperty.fieldMask"),
+                field_mask) ||
+            field_size == 0 || byte_offset >= field_size || byte_mask == 0 ||
+            field_mask == 0 || (byte_mask & field_mask) != byte_mask ||
+            static_cast<std::uint64_t>(property.offset) + byte_offset >= parms_size ||
+            static_cast<std::uint64_t>(property.offset) + byte_offset >
+                (std::numeric_limits<std::uint16_t>::max)()) {
+            return false;
+        }
+        parameter = {
+            static_cast<std::uint16_t>(
+                static_cast<std::uint32_t>(property.offset) + byte_offset),
+            field_mask,
+            byte_mask};
+        return true;
+    }
+
+    [[nodiscard]] bool BuildNteFunctionBindingLocked(
+        const std::uintptr_t function,
+        const NteFunctionKind kind,
+        NteFunctionBinding& binding) const {
+        try {
+            const NteFunctionSpec spec = NteSpec(kind);
+            if (spec.name.empty() || spec.parameters.empty() ||
+                spec.parameters.size() > kMaximumNteFunctionParameters) {
+                return false;
+            }
+            std::string function_name;
+            if (!ReadReflectedObjectNameLocked(function, function_name) ||
+                function_name != spec.name) {
+                return false;
+            }
+            std::uintptr_t function_class{};
+            std::uintptr_t outer{};
+            std::string function_class_name;
+            std::string outer_name;
+            if (!ReadPointerAt(
+                    *memory, function, Layout(profile, "object.class"), function_class) ||
+                !ReadPointerAt(*memory, function, Layout(profile, "object.outer"), outer) ||
+                !ReadReflectedObjectNameLocked(function_class, function_class_name) ||
+                !ReadReflectedObjectNameLocked(outer, outer_name) ||
+                function_class_name != "Function" || outer_name != spec.outer) {
+                return false;
+            }
+
+            std::uintptr_t property{};
+            std::uint8_t num_parms{};
+            std::uint16_t parms_size{};
+            std::uint16_t return_offset{};
+            if (!ReadPointerAt(
+                    *memory, function, Layout(profile, "ustruct.propertyLink"), property) ||
+                !ReadValue(
+                    *memory, function + Layout(profile, "ufunction.numParms"), num_parms) ||
+                !ReadValue(
+                    *memory, function + Layout(profile, "ufunction.parmsSize"), parms_size) ||
+                !ReadValue(
+                    *memory,
+                    function + Layout(profile, "ufunction.returnValueOffset"),
+                    return_offset) ||
+                num_parms != spec.parameters.size() || parms_size != spec.parms_size) {
+                return false;
+            }
+            const bool has_return = std::ranges::any_of(
+                spec.parameters,
+                [](const NteFunctionParameterSpec& parameter) {
+                    return parameter.return_value;
+                });
+            if (!has_return &&
+                return_offset != (std::numeric_limits<std::uint16_t>::max)()) {
+                return false;
+            }
+
+            NteFunctionBinding candidate;
+            candidate.function = function;
+            candidate.outer_class = outer;
+            candidate.parms_size = parms_size;
+            std::array<bool, kMaximumNteFunctionParameters> found{};
+            std::size_t property_count{};
+            while (property != 0 && property_count < kMaximumNteFunctionParameters) {
+                ReflectedPropertyInfo info;
+                if (!ReadReflectedPropertyLocked(property, info) || info.array_dim != 1 ||
+                    info.element_size <= 0 || info.offset < 0 ||
+                    static_cast<std::uint64_t>(info.offset) +
+                            static_cast<std::uint64_t>(info.element_size) >
+                        parms_size) {
+                    return false;
+                }
+                std::size_t parameter_index = spec.parameters.size();
+                for (std::size_t index{}; index < spec.parameters.size(); ++index) {
+                    if (spec.parameters[index].name == info.name) {
+                        parameter_index = index;
+                        break;
+                    }
+                }
+                if (parameter_index == spec.parameters.size() || found[parameter_index]) {
+                    return false;
+                }
+                const NteFunctionParameterSpec& expected = spec.parameters[parameter_index];
+                if (expected.type != info.type ||
+                    expected.element_size != info.element_size ||
+                    static_cast<std::uint64_t>(info.offset) >
+                        (std::numeric_limits<std::uint16_t>::max)()) {
+                    return false;
+                }
+                candidate.offsets[parameter_index] =
+                    static_cast<std::uint16_t>(info.offset);
+                if (info.type == "BoolProperty" &&
+                    !ReadReflectedBoolParameterLocked(
+                        info, parms_size, candidate.bool_parameters[parameter_index])) {
+                    return false;
+                }
+                if (info.type == "ClassProperty") {
+                    std::uintptr_t meta_class{};
+                    std::string meta_class_name;
+                    const std::string_view expected_meta_class =
+                        kind == NteFunctionKind::ActivateAbilityByClass
+                        ? std::string_view{"HTGameplayAbility"}
+                        : kind == NteFunctionKind::GetActiveEffectTimeRemainingAndDuration
+                            ? std::string_view{"GameplayEffect"}
+                            : std::string_view{};
+                    if (!ReadPointerAt(
+                            *memory, info.property,
+                            Layout(profile, "fclassProperty.metaClass"), meta_class) ||
+                        !ReadReflectedObjectNameLocked(meta_class, meta_class_name) ||
+                        expected_meta_class.empty() ||
+                        meta_class_name != expected_meta_class) {
+                        return false;
+                    }
+                    candidate.meta_class = meta_class;
+                }
+                if (info.type == "ObjectProperty" && expected.return_value) {
+                    std::uintptr_t property_class{};
+                    std::string property_class_name;
+                    const std::string_view expected_class =
+                        kind == NteFunctionKind::GetAbilitySystemComponent
+                        ? std::string_view{"HTAbilitySystemComponent"}
+                        : kind == NteFunctionKind::GetAttackTarget
+                            ? std::string_view{"HTAbilityCharacter"}
+                            : std::string_view{};
+                    if (expected_class.empty() ||
+                        !ReadPointerAt(
+                            *memory, info.property,
+                            Layout(profile, "fobjectProperty.propertyClass"),
+                            property_class) ||
+                        !ReadReflectedObjectNameLocked(
+                            property_class, property_class_name) ||
+                        property_class_name != expected_class) {
+                        return false;
+                    }
+                    candidate.meta_class = property_class;
+                }
+                if (expected.return_value &&
+                    return_offset != static_cast<std::uint16_t>(info.offset)) {
+                    return false;
+                }
+                found[parameter_index] = true;
+                ++property_count;
+                property = info.next;
+            }
+            if (property != 0 || property_count != spec.parameters.size() ||
+                !std::ranges::all_of(
+                    std::span(found).first(spec.parameters.size()),
+                    [](const bool value) { return value; })) {
+                return false;
+            }
+            binding = candidate;
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    struct NteStructFieldSpec {
+        std::string_view name;
+        std::string_view type;
+        std::string_view structure;
+        std::int32_t offset{};
+        std::int32_t element_size{};
+        std::uint8_t bool_mask{};
+    };
+
+    [[nodiscard]] bool FindReflectedPropertyLocked(
+        std::uintptr_t structure,
+        const std::string_view name,
+        ReflectedPropertyInfo& result,
+        const bool include_super) const {
+        constexpr std::size_t kMaximumClassDepth = 128;
+        constexpr std::size_t kMaximumProperties = 512;
+        for (std::size_t depth{};
+             structure != 0 && depth < kMaximumClassDepth;
+             ++depth) {
+            std::uintptr_t property{};
+            if (!ReadValue(
+                    *memory,
+                    structure + Layout(profile, "ustruct.propertyLink"),
+                    property)) {
+                return false;
+            }
+            for (std::size_t count{}; property != 0 && count < kMaximumProperties; ++count) {
+                ReflectedPropertyInfo info;
+                if (!ReadReflectedPropertyLocked(property, info)) return false;
+                if (info.name == name) {
+                    result = std::move(info);
+                    return true;
+                }
+                if (info.next == property) return false;
+                property = info.next;
+            }
+            if (property != 0 || !include_super) return false;
+            std::uintptr_t next{};
+            if (!ReadValue(
+                    *memory,
+                    structure + Layout(profile, "ustruct.superStruct"),
+                    next) || next == structure) {
+                return false;
+            }
+            structure = next;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool ValidateStructFieldLocked(
+        const std::uintptr_t structure,
+        const NteStructFieldSpec& expected,
+        const bool include_super = false) const {
+        ReflectedPropertyInfo property;
+        if (!FindReflectedPropertyLocked(
+                structure, expected.name, property, include_super) ||
+            property.array_dim != 1 || property.offset != expected.offset ||
+            property.element_size != expected.element_size) {
+            return false;
+        }
+        const bool byte_like = expected.type == "ByteLike" &&
+            (property.type == "ByteProperty" || property.type == "EnumProperty" ||
+                property.type == "UInt8Property");
+        if (!byte_like && property.type != expected.type) return false;
+        if (!expected.structure.empty()) {
+            std::uintptr_t nested{};
+            std::string name;
+            if (!ReadPointerAt(
+                    *memory, property.property,
+                    Layout(profile, "fstructProperty.struct"), nested) ||
+                !ReadReflectedObjectNameLocked(nested, name) ||
+                name != expected.structure) {
+                return false;
+            }
+        }
+        if (expected.bool_mask != 0) {
+            ReflectedBoolParameter reflected;
+            const auto extent = static_cast<std::uint16_t>(
+                static_cast<std::uint32_t>(expected.offset) + 1U);
+            if (!ReadReflectedBoolParameterLocked(property, extent, reflected) ||
+                reflected.byte_offset != expected.offset ||
+                reflected.field_mask != expected.bool_mask) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    [[nodiscard]] bool ValidateDamageEventLayoutLocked(
+        const std::uintptr_t damage_event_structure) const {
+        try {
+            return ValidateStructFieldLocked(
+                       damage_event_structure,
+                       NteStructFieldSpec{
+                           "Damage", "FloatProperty", {},
+                           static_cast<std::int32_t>(
+                               Layout(profile, "damageEvent.damage")),
+                           4},
+                       true) &&
+                ValidateStructFieldLocked(
+                    damage_event_structure,
+                    NteStructFieldSpec{
+                        "DamageGEDef", "WeakObjectProperty", {},
+                        static_cast<std::int32_t>(
+                            Layout(profile, "damageEvent.damageGEDef")),
+                        8});
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool ValidateSkillLayoutLocked(
+        const std::uintptr_t ability_system_class) const {
+        try {
+            ReflectedPropertyInfo activatable;
+            std::uintptr_t container_structure{};
+            std::string container_name;
+            if (!FindReflectedPropertyLocked(
+                    ability_system_class, "ActivatableAbilities", activatable, true) ||
+                activatable.type != "StructProperty" || activatable.array_dim != 1 ||
+                activatable.offset != Layout(profile, "abilitySystem.activatableAbilities") ||
+                activatable.element_size <
+                    Layout(profile, "abilitySpecContainer.items") + 16 ||
+                !ReadPointerAt(
+                    *memory, activatable.property,
+                    Layout(profile, "fstructProperty.struct"), container_structure) ||
+                !ReadReflectedObjectNameLocked(container_structure, container_name) ||
+                container_name != "GameplayAbilitySpecContainer") {
+                return false;
+            }
+            ReflectedPropertyInfo items;
+            std::uintptr_t inner{};
+            std::string inner_type;
+            std::uintptr_t spec_structure{};
+            std::string spec_name;
+            std::int32_t spec_size{};
+            if (!FindReflectedPropertyLocked(
+                    container_structure, "Items", items, false) ||
+                items.type != "ArrayProperty" || items.array_dim != 1 ||
+                items.element_size != 16 ||
+                items.offset != Layout(profile, "abilitySpecContainer.items") ||
+                !ReadPointerAt(
+                    *memory, items.property, Layout(profile, "farrayProperty.inner"), inner) ||
+                !ReadReflectedFieldClassNameLocked(inner, inner_type) ||
+                inner_type != "StructProperty" ||
+                !ReadValue(
+                    *memory, inner + Layout(profile, "fproperty.elementSize"), spec_size) ||
+                spec_size != Layout(profile, "abilitySpec.stride") ||
+                !ReadPointerAt(
+                    *memory, inner, Layout(profile, "fstructProperty.struct"), spec_structure) ||
+                !ReadReflectedObjectNameLocked(spec_structure, spec_name) ||
+                spec_name != "GameplayAbilitySpec") {
+                return false;
+            }
+            const std::array fields{
+                NteStructFieldSpec{"Handle", "StructProperty", "GameplayAbilitySpecHandle",
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.handle")), 4},
+                NteStructFieldSpec{"Ability", "ObjectProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.ability")), 8},
+                NteStructFieldSpec{"Level", "IntProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.level")), 4},
+                NteStructFieldSpec{"InputID", "IntProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.inputId")), 4},
+                NteStructFieldSpec{"ActiveCount", "ByteLike", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.activeCount")), 1},
+                NteStructFieldSpec{"InputPressed", "BoolProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.stateBits")), 1, 0x01},
+                NteStructFieldSpec{"RemoveAfterActivation", "BoolProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.stateBits")), 1, 0x02},
+                NteStructFieldSpec{"PendingRemove", "BoolProperty", {},
+                    static_cast<std::int32_t>(Layout(profile, "abilitySpec.stateBits")), 1, 0x04}};
+            return std::ranges::all_of(fields, [&](const auto& expected) {
+                return ValidateStructFieldLocked(spec_structure, expected, true);
+            });
+        } catch (...) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] bool ValidateSkillCooldownLayoutLocked(
+        const std::uintptr_t gameplay_ability_class) const {
+        try {
+            ReflectedPropertyInfo cooldown_effect;
+            std::uintptr_t meta_class{};
+            std::string meta_class_name;
+            return FindReflectedPropertyLocked(
+                    gameplay_ability_class,
+                    "CooldownGameplayEffectClass",
+                    cooldown_effect,
+                    true) &&
+                cooldown_effect.type == "ClassProperty" &&
+                cooldown_effect.array_dim == 1 &&
+                cooldown_effect.element_size ==
+                    static_cast<std::int32_t>(sizeof(std::uintptr_t)) &&
+                cooldown_effect.offset ==
+                    Layout(profile, "ability.cooldownGameplayEffectClass") &&
+                ReadPointerAt(
+                    *memory,
+                    cooldown_effect.property,
+                    Layout(profile, "fclassProperty.metaClass"),
+                    meta_class) &&
+                ReadReflectedObjectNameLocked(meta_class, meta_class_name) &&
+                meta_class_name == "GameplayEffect";
+        } catch (...) {
+            return false;
+        }
+    }
+
     [[nodiscard]] bool BuildAhudFunctionBindingLocked(
         const std::uintptr_t function,
         const AhudFunctionKind kind,
@@ -2874,6 +4288,86 @@ struct Ue5NteAdapter::State {
             }
         } catch (...) {
             ahud_discovery.discovery_complete = true;
+        }
+    }
+
+    void RefreshCombatSkillBindingsLocked() noexcept {
+        try {
+            const bool combat_profile = NteCombatProfileAvailable();
+            const bool skills_profile = NteSkillsProfileAvailable();
+            if ((!combat_profile && !skills_profile) || object_registry.items == 0 ||
+                object_registry.count == 0) {
+                InvalidateCombatSkillDiscoveryLocked();
+                return;
+            }
+            if (combat_skill_discovery.object_generation != object_generation) {
+                InvalidateCombatSkillDiscoveryLocked();
+            }
+
+            constexpr std::uint32_t kDiscoveryBatch = 4096;
+            const std::uint32_t end = (std::min)(
+                object_registry.count,
+                combat_skill_discovery.next_object_index + kDiscoveryBatch);
+            for (std::uint32_t index = combat_skill_discovery.next_object_index;
+                 index < end;
+                 ++index) {
+                std::uintptr_t object{};
+                std::uint32_t serial{};
+                if (!ReadObjectSlot(
+                        *memory, object_registry, index, object, serial) ||
+                    object == 0) {
+                    continue;
+                }
+                std::string name;
+                if (!ReadReflectedObjectNameLocked(object, name)) continue;
+                if (combat_profile &&
+                    !combat_skill_discovery.damage_event_layout_valid &&
+                    name == "HTDamageEvent") {
+                    combat_skill_discovery.damage_event_layout_valid =
+                        ValidateDamageEventLayoutLocked(object);
+                }
+                for (std::size_t function_index{};
+                     function_index < kNteFunctionCount;
+                     ++function_index) {
+                    if (combat_skill_discovery.functions[function_index]) continue;
+                    const auto kind = static_cast<NteFunctionKind>(function_index);
+                    const NteFunctionSpec spec = NteSpec(kind);
+                    if (spec.name != name) continue;
+                    const bool skill_function =
+                        kind == NteFunctionKind::ActivateAbilityByClass ||
+                        kind == NteFunctionKind::GetActiveEffectTimeRemainingAndDuration;
+                    if ((!combat_profile &&
+                            kind != NteFunctionKind::GetAbilitySystemComponent &&
+                            !skill_function) ||
+                        (!skills_profile && skill_function)) {
+                        continue;
+                    }
+                    NteFunctionBinding binding;
+                    if (!BuildNteFunctionBindingLocked(object, kind, binding)) continue;
+                    combat_skill_discovery.functions[function_index] = binding;
+                    if (kind == NteFunctionKind::GetAbilitySystemComponent) {
+                        combat_skill_discovery.ability_system_class = binding.meta_class;
+                    }
+                    if (kind == NteFunctionKind::ActivateAbilityByClass) {
+                        combat_skill_discovery.ability_system_class = binding.outer_class;
+                        combat_skill_discovery.gameplay_ability_class = binding.meta_class;
+                    }
+                    break;
+                }
+            }
+            combat_skill_discovery.next_object_index = end;
+            if (skills_profile && !combat_skill_discovery.skill_layout_valid &&
+                combat_skill_discovery.ability_system_class != 0) {
+                combat_skill_discovery.skill_layout_valid = ValidateSkillLayoutLocked(
+                    combat_skill_discovery.ability_system_class);
+            }
+            if (skills_profile && !combat_skill_discovery.cooldown_layout_valid &&
+                combat_skill_discovery.gameplay_ability_class != 0) {
+                combat_skill_discovery.cooldown_layout_valid =
+                    ValidateSkillCooldownLayoutLocked(
+                        combat_skill_discovery.gameplay_ability_class);
+            }
+        } catch (...) {
         }
     }
 
@@ -5794,6 +7288,487 @@ struct Ue5NteAdapter::State {
         return Status(ANOMALY_STATUS_V1_OK);
     }
 
+    static AnomalyStatusV1 ANOMALY_CALL CombatantSnapshot(
+        void* user, AnomalyNteCombatantSnapshotV1* snapshot) noexcept {
+        if (snapshot == nullptr || snapshot->struct_size < sizeof(*snapshot)) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.combat")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE combat service is unavailable");
+        }
+        if (!state.combat_available || state.world_pointer == 0) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "combatant snapshot is unavailable");
+        }
+        const auto current_sequence = state.tick_sequence.load(std::memory_order_acquire);
+        snapshot->flags = SnapshotFlags(
+            state.combat_partial, state.combat_sample_sequence, current_sequence);
+        if (state.combat_dead) snapshot->flags |= ANOMALY_NTE_COMBATANT_V1_DEAD;
+        snapshot->sequence = state.combat_sample_sequence;
+        snapshot->world = {1, state.world_generation};
+        snapshot->character = state.combat_character;
+        snapshot->target = state.combat_target;
+        snapshot->hp = state.combat_hp;
+        snapshot->max_hp = state.combat_max_hp;
+        snapshot->shield = state.combat_shield;
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    static std::uint64_t ANOMALY_CALL LatestDamageSequence(void* user) noexcept {
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        return state.SemanticFeatureRunning("nte.combat")
+            ? state.damage_event_sequence
+            : 0;
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL NextDamageEvent(
+        void* user,
+        const std::uint64_t after_sequence,
+        AnomalyNteDamageEventV1* event) noexcept {
+        if (event == nullptr || event->struct_size < sizeof(*event)) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.combat")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE combat service is unavailable");
+        }
+        if (state.damage_event_count == 0 || after_sequence >= state.damage_event_sequence) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "no newer damage event");
+        }
+        const auto& first = state.damage_events[state.damage_event_start].event;
+        if (after_sequence != 0 && after_sequence < first.sequence - 1U) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "damage event cursor has expired");
+        }
+        for (std::size_t index{}; index < state.damage_event_count; ++index) {
+            const auto& candidate = state.damage_events[
+                (state.damage_event_start + index) % kDamageEventCapacity].event;
+            if (candidate.sequence <= after_sequence) continue;
+            *event = candidate;
+            return Status(ANOMALY_STATUS_V1_OK);
+        }
+        return Status(ANOMALY_STATUS_V1_NOT_FOUND, "no newer damage event");
+    }
+
+    [[nodiscard]] static bool SameHandle(
+        const AnomalyGenerationHandleV1 left,
+        const AnomalyGenerationHandleV1 right) noexcept {
+        return left.id == right.id && left.generation == right.generation;
+    }
+
+    template <typename Value>
+    static void SaturatingAdd(
+        Value& destination,
+        const Value value,
+        std::uint32_t& flags) noexcept {
+        if constexpr (std::is_unsigned_v<Value>) {
+            if (value > (std::numeric_limits<Value>::max)() - destination) {
+                destination = (std::numeric_limits<Value>::max)();
+                flags |= ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW;
+            } else {
+                destination += value;
+            }
+        } else {
+            if ((value > 0 && destination > (std::numeric_limits<Value>::max)() - value) ||
+                (value < 0 && destination < (std::numeric_limits<Value>::min)() - value)) {
+                destination = value > 0
+                    ? (std::numeric_limits<Value>::max)()
+                    : (std::numeric_limits<Value>::min)();
+                flags |= ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW;
+            } else {
+                destination += value;
+            }
+        }
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL CombatStatistics(
+        void* user,
+        const AnomalyNteCombatStatisticsRequestV1* request,
+        AnomalyNteCombatStatisticsV1* statistics) noexcept {
+        if (request == nullptr || request->struct_size < sizeof(*request) ||
+            statistics == nullptr || statistics->struct_size < sizeof(*statistics) ||
+            request->flags != 0 || request->reserved != 0 ||
+            request->direction > ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_VICTIM) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.combat")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE combat service is unavailable");
+        }
+        if (state.world_pointer == 0 || request->world.id != 1 ||
+            request->world.generation != state.world_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale combat world handle");
+        }
+        AnomalyNteCombatStatisticsV1 result{sizeof(result)};
+        result.through_sequence = state.damage_event_sequence;
+        if (state.damage_dropped_count != 0) {
+            result.flags |= ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL;
+        }
+        if (state.damage_event_count != 0 &&
+            state.damage_events[state.damage_event_start].event.sequence >
+                state.damage_world_sequence_base + 1U) {
+            result.flags |= ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL;
+        }
+        for (std::size_t index{}; index < state.damage_event_count; ++index) {
+            const auto& event = state.damage_events[
+                (state.damage_event_start + index) % kDamageEventCapacity].event;
+            if (request->source_id != 0 && event.source_id != request->source_id) continue;
+            if (request->character.id != 0) {
+                const bool attacker = SameHandle(request->character, event.attacker);
+                const bool victim = SameHandle(request->character, event.victim);
+                if ((request->direction == ANOMALY_NTE_COMBAT_DIRECTION_V1_ANY &&
+                        !attacker && !victim) ||
+                    (request->direction == ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_ATTACKER &&
+                        !attacker) ||
+                    (request->direction == ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_VICTIM &&
+                        !victim)) {
+                    continue;
+                }
+            }
+            SaturatingAdd(result.hit_count, std::uint64_t{1}, result.flags);
+            if ((event.flags & ANOMALY_NTE_DAMAGE_V1_CRITICAL) != 0) {
+                SaturatingAdd(result.critical_count, std::uint64_t{1}, result.flags);
+            }
+            if ((event.flags & ANOMALY_NTE_DAMAGE_V1_HEAD_HIT) != 0) {
+                SaturatingAdd(result.head_hit_count, std::uint64_t{1}, result.flags);
+            }
+            SaturatingAdd(result.display_damage_total, event.display_damage, result.flags);
+            SaturatingAdd(result.basic_damage_total, event.basic_damage, result.flags);
+            SaturatingAdd(result.final_damage_total, event.final_damage, result.flags);
+        }
+        *statistics = result;
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL DamageSourceName(
+        void* user,
+        const std::uint64_t source_id,
+        char* destination,
+        std::size_t* size) noexcept {
+        if (size == nullptr || source_id == 0) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.combat")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE combat service is unavailable");
+        }
+        const auto found = state.damage_source_names.find(source_id);
+        return found == state.damage_source_names.end()
+            ? Status(ANOMALY_STATUS_V1_NOT_FOUND, "damage source name is unavailable")
+            : CopyString(found->second, destination, size);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL DamageParticipantPath(
+        void* user,
+        const AnomalyGenerationHandleV1 participant,
+        char* destination,
+        std::size_t* size) noexcept {
+        if (size == nullptr || participant.id == 0) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.combat_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.combat")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE combat service is unavailable");
+        }
+        if (participant.generation != state.object_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale damage participant handle");
+        }
+        const auto found = state.damage_participant_paths.find(participant.id);
+        return found == state.damage_participant_paths.end()
+            ? Status(ANOMALY_STATUS_V1_NOT_FOUND, "damage participant path is unavailable")
+            : CopyString(found->second, destination, size);
+    }
+
+    static void FillSkillSnapshot(
+        const State& state,
+        const SkillRecord& record,
+        AnomalyNteSkillSnapshotV1& snapshot) noexcept {
+        snapshot.flags = record.flags;
+        if (record.sequence < state.tick_sequence.load(std::memory_order_acquire)) {
+            snapshot.flags |= ANOMALY_NTE_SKILL_V1_STALE;
+        }
+        snapshot.handle = record.handle;
+        snapshot.character = record.character;
+        snapshot.ability_class = record.ability_class;
+        snapshot.sequence = record.sequence;
+        snapshot.level = record.level;
+        snapshot.input_id = record.input_id;
+        snapshot.cooldown_remaining_seconds = record.cooldown_remaining_seconds;
+        snapshot.cooldown_duration_seconds = record.cooldown_duration_seconds;
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillFrame(
+        void* user, AnomalyNteSkillFrameV1* frame) noexcept {
+        if (frame == nullptr || frame->struct_size < sizeof(*frame)) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.skills")) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "NTE skills service is unavailable");
+        }
+        if (!state.skills_available) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill frame is unavailable");
+        }
+        frame->flags = SnapshotFlags(
+            state.skills_partial, state.skill_sample_sequence,
+            state.tick_sequence.load(std::memory_order_acquire));
+        frame->generation = state.skill_generation;
+        frame->sequence = state.skill_sample_sequence;
+        frame->character = state.skill_character;
+        frame->skill_count = static_cast<std::uint32_t>(state.skills.size());
+        frame->reserved = 0;
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    static AnomalyStatusV1 SkillSnapshotAtLocked(
+        State& state,
+        const std::uint64_t generation,
+        const std::uint32_t index,
+        AnomalyNteSkillSnapshotV1* snapshot) noexcept {
+        if (!state.SemanticFeatureRunning("nte.skills") || !state.skills_available) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill frame is unavailable");
+        }
+        if (generation != 0 && generation != state.skill_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill frame generation");
+        }
+        if (index >= state.skills.size()) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "skill index is not found");
+        }
+        FillSkillSnapshot(state, state.skills[index], *snapshot);
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillSnapshotAt(
+        void* user,
+        const std::uint64_t generation,
+        const std::uint32_t index,
+        AnomalyNteSkillSnapshotV1* snapshot) noexcept {
+        if (snapshot == nullptr || snapshot->struct_size < sizeof(*snapshot)) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        return SkillSnapshotAtLocked(state, generation, index, snapshot);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillPage(
+        void* user,
+        const AnomalyNteSkillPageRequestV1* request,
+        AnomalyNteSkillSnapshotV1* destination,
+        AnomalyNteSkillPageResultV1* result) noexcept {
+        if (request == nullptr || request->struct_size < sizeof(*request) ||
+            result == nullptr || result->struct_size < sizeof(*result) ||
+            request->flags != 0 ||
+            request->capacity > ANOMALY_NTE_SKILL_PAGE_V1_MAX_CAPACITY ||
+            (request->capacity != 0 && destination == nullptr)) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        for (std::uint32_t index{}; index < request->capacity; ++index) {
+            if (destination[index].struct_size < sizeof(AnomalyNteSkillSnapshotV1)) {
+                return Status(
+                    ANOMALY_STATUS_V1_INVALID_ARGUMENT,
+                    "every skill destination must advertise its struct size");
+            }
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.skills") || !state.skills_available) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill frame is unavailable");
+        }
+        const std::uint64_t generation = request->generation == 0
+            ? state.skill_generation
+            : request->generation;
+        if (generation != state.skill_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill frame generation");
+        }
+        const std::uint32_t total = static_cast<std::uint32_t>(state.skills.size());
+        const std::uint32_t offset = (std::min)(request->offset, total);
+        const std::uint32_t returned = (std::min)(request->capacity, total - offset);
+        for (std::uint32_t index{}; index < returned; ++index) {
+            FillSkillSnapshot(state, state.skills[offset + index], destination[index]);
+        }
+        AnomalyNteSkillPageResultV1 page{sizeof(page)};
+        page.flags = SnapshotFlags(
+            state.skills_partial, state.skill_sample_sequence,
+            state.tick_sequence.load(std::memory_order_acquire));
+        page.generation = state.skill_generation;
+        page.sequence = state.skill_sample_sequence;
+        page.total_skills = total;
+        page.returned = returned;
+        page.next_offset = offset + returned;
+        *result = page;
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL AbilityPath(
+        void* user,
+        const AnomalyGenerationHandleV1 ability_class,
+        char* destination,
+        std::size_t* size) noexcept {
+        if (size == nullptr || ability_class.id == 0) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.skills") || !state.skills_available) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill frame is unavailable");
+        }
+        const auto found = std::ranges::find_if(state.skills, [&](const SkillRecord& skill) {
+            return SameHandle(skill.ability_class, ability_class);
+        });
+        return found == state.skills.end()
+            ? Status(ANOMALY_STATUS_V1_NOT_FOUND, "ability class handle is stale")
+            : CopyString(found->ability_path, destination, size);
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillSnapshotByHandle(
+        void* user,
+        const AnomalyGenerationHandleV1 skill,
+        AnomalyNteSkillSnapshotV1* snapshot) noexcept {
+        if (snapshot == nullptr || snapshot->struct_size < sizeof(*snapshot) ||
+            skill.id == 0) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        std::scoped_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.skills") || !state.skills_available) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill frame is unavailable");
+        }
+        if (skill.generation != state.skill_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill handle generation");
+        }
+        const auto found = std::ranges::find_if(state.skills, [&](const SkillRecord& record) {
+            return SameHandle(record.handle, skill);
+        });
+        if (found == state.skills.end()) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "skill handle is not found");
+        }
+        FillSkillSnapshot(state, *found, *snapshot);
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
+    [[nodiscard]] bool LiveSkillIdentityLocked(
+        const SkillRecord& expected,
+        const std::uintptr_t ability_system) const noexcept {
+        NativeArrayHeader array;
+        if (!ReadSkillArrayLocked(ability_system, array)) return false;
+        for (std::int32_t index{}; index < array.count; ++index) {
+            SkillRecord observed;
+            if (!ReadSkillIdentityLocked(array, index, observed)) return false;
+            if (observed.spec_handle == expected.spec_handle) {
+                return SameSkillIdentity(observed, expected);
+            }
+        }
+        return false;
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL ActivateSkill(
+        void* user,
+        const AnomalyNteSkillInvocationRequestV1* request,
+        AnomalyNteSkillInvocationResultV1* result) noexcept {
+        if (request == nullptr || request->struct_size < sizeof(*request) ||
+            result == nullptr || result->struct_size < sizeof(*result) ||
+            request->flags != 0) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
+        }
+        auto& state = *static_cast<State*>(user);
+        state.skill_demand.store(true, std::memory_order_release);
+        const DWORD expected_thread = state.game_thread_id.load(std::memory_order_acquire);
+        if (expected_thread == 0 || expected_thread != GetCurrentThreadId()) {
+            return Status(
+                ANOMALY_STATUS_V1_CONFLICT,
+                "skill activation requires the Game thread");
+        }
+        std::unique_lock lock(state.mutex);
+        if (!state.SemanticFeatureRunning("nte.skill-invocation") ||
+            !state.skills_available) {
+            return Status(
+                ANOMALY_STATUS_V1_UNAVAILABLE,
+                "skill invocation is unavailable for the active Profile");
+        }
+        if (state.world_pointer == 0 || request->world.id != 1 ||
+            request->world.generation != state.world_generation) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill world handle");
+        }
+        if (!SameHandle(request->character, state.skill_character)) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill character handle");
+        }
+        if (request->skill.generation != state.skill_generation || request->skill.id == 0) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "stale skill handle generation");
+        }
+        const auto found = std::ranges::find_if(state.skills, [&](const SkillRecord& record) {
+            return SameHandle(record.handle, request->skill);
+        });
+        if (found == state.skills.end()) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "skill handle is not found");
+        }
+        std::uintptr_t ability_system{};
+        std::uintptr_t ability_class{};
+        if (!state.CurrentAbilitySystemLocked(state.player_pawn, ability_system) ||
+            ability_system != state.skill_ability_system ||
+            !state.ResolveObjectHandleLocked(found->ability_class, ability_class) ||
+            ability_class != found->ability_class_pointer ||
+            !state.IsClassDerivedFromLocked(
+                ability_class,
+                state.combat_skill_discovery.gameplay_ability_class) ||
+            !state.LiveSkillIdentityLocked(*found, ability_system)) {
+            return Status(ANOMALY_STATUS_V1_NOT_FOUND, "live skill identity changed");
+        }
+        const auto& binding = state.combat_skill_discovery.functions[
+            NteIndex(NteFunctionKind::ActivateAbilityByClass)];
+        if (!binding || binding->parms_size > 64U) {
+            return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "skill activation binding is unavailable");
+        }
+        const NteFunctionBinding activation = *binding;
+        const ProcessEventInvoker invoker = state.process_event_invoker;
+        alignas(std::uint64_t) std::array<std::uint8_t, 64> parameters{};
+        const std::size_t class_offset = activation.offsets[0];
+        if (class_offset > activation.parms_size ||
+            sizeof(ability_class) > activation.parms_size - class_offset) {
+            return Status(ANOMALY_STATUS_V1_FAILED, "skill activation parameters are invalid");
+        }
+        std::memcpy(parameters.data() + class_offset, &ability_class, sizeof(ability_class));
+
+        // Ability activation can synchronously enter the Actor ProcessEvent hook.
+        // Release the state lock so that reentrant event observation can proceed.
+        lock.unlock();
+        if (!invoker ||
+            !invoker(
+                ability_system,
+                activation.function,
+                parameters.data(),
+                activation.parms_size)) {
+            return Status(ANOMALY_STATUS_V1_FAILED, "skill activation invocation failed");
+        }
+        const ReflectedBoolParameter& returned = activation.bool_parameters[1];
+        if (returned.byte_offset >= activation.parms_size) {
+            return Status(ANOMALY_STATUS_V1_FAILED, "skill activation result is invalid");
+        }
+        AnomalyNteSkillInvocationResultV1 response{sizeof(response)};
+        response.tick_sequence = state.tick_sequence.load(std::memory_order_acquire);
+        response.accepted =
+            (parameters[returned.byte_offset] & returned.field_mask) != 0 ? 1U : 0U;
+        *result = response;
+        return Status(ANOMALY_STATUS_V1_OK);
+    }
+
     static AnomalyStatusV1 ANOMALY_CALL MetricsSnapshot(
         void* user, AnomalyNteSnapshotMetricsV1* metrics) noexcept {
         if (metrics == nullptr || metrics->struct_size < sizeof(*metrics)) {
@@ -5908,6 +7883,19 @@ struct Ue5NteAdapter::State::SemanticServiceEndpoint final {
             this, ActorFrameThunk, ActorSnapshotAtThunk, ActorClassNameThunk,
             ActorNameThunk, ActorPageThunk, ActorComponentBoundsThunk,
             ActorBoolPropertyThunk, ActorFNamePropertyThunk};
+        combat_service = {
+            sizeof(AnomalyNteCombatServiceV1), ANOMALY_NTE_COMBAT_SERVICE_V1_VERSION,
+            this, CombatantSnapshotThunk, LatestDamageSequenceThunk,
+            NextDamageEventThunk, CombatStatisticsThunk, DamageSourceNameThunk,
+            DamageParticipantPathThunk};
+        skills_service = {
+            sizeof(AnomalyNteSkillsServiceV1), ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION,
+            this, SkillFrameThunk, SkillSnapshotAtThunk, SkillPageThunk,
+            AbilityPathThunk, SkillSnapshotByHandleThunk};
+        skill_invocation_service = {
+            sizeof(AnomalyNteSkillInvocationServiceV1),
+            ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_VERSION,
+            this, ActivateSkillThunk};
         metrics_service = {
             sizeof(AnomalyNteMetricsServiceV1), ANOMALY_NTE_METRICS_SERVICE_V1_VERSION,
             this, MetricsSnapshotThunk};
@@ -5945,6 +7933,9 @@ struct Ue5NteAdapter::State::SemanticServiceEndpoint final {
     AnomalyNtePickupServiceV1 pickup_service{};
     AnomalyNteEntitiesServiceV1 entities_service{};
     AnomalyNteActorsServiceV1 actors_service{};
+    AnomalyNteCombatServiceV1 combat_service{};
+    AnomalyNteSkillsServiceV1 skills_service{};
+    AnomalyNteSkillInvocationServiceV1 skill_invocation_service{};
     AnomalyNteMetricsServiceV1 metrics_service{};
 
 private:
@@ -6272,6 +8263,108 @@ private:
         void* user, AnomalyNteSnapshotMetricsV1* metrics) noexcept {
         auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
         return lease ? State::MetricsSnapshot(lease.User(), metrics) : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL CombatantSnapshotThunk(
+        void* user, AnomalyNteCombatantSnapshotV1* snapshot) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease ? State::CombatantSnapshot(lease.User(), snapshot) : StoppedStatus();
+    }
+
+    static std::uint64_t ANOMALY_CALL LatestDamageSequenceThunk(void* user) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease ? State::LatestDamageSequence(lease.User()) : 0;
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL NextDamageEventThunk(
+        void* user, std::uint64_t after_sequence,
+        AnomalyNteDamageEventV1* event) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::NextDamageEvent(lease.User(), after_sequence, event)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL CombatStatisticsThunk(
+        void* user,
+        const AnomalyNteCombatStatisticsRequestV1* request,
+        AnomalyNteCombatStatisticsV1* statistics) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::CombatStatistics(lease.User(), request, statistics)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL DamageSourceNameThunk(
+        void* user, std::uint64_t source_id,
+        char* destination, std::size_t* size) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::DamageSourceName(lease.User(), source_id, destination, size)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL DamageParticipantPathThunk(
+        void* user, AnomalyGenerationHandleV1 participant,
+        char* destination, std::size_t* size) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::DamageParticipantPath(
+                  lease.User(), participant, destination, size)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillFrameThunk(
+        void* user, AnomalyNteSkillFrameV1* frame) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease ? State::SkillFrame(lease.User(), frame) : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillSnapshotAtThunk(
+        void* user, std::uint64_t generation, std::uint32_t index,
+        AnomalyNteSkillSnapshotV1* snapshot) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::SkillSnapshotAt(lease.User(), generation, index, snapshot)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillPageThunk(
+        void* user, const AnomalyNteSkillPageRequestV1* request,
+        AnomalyNteSkillSnapshotV1* destination,
+        AnomalyNteSkillPageResultV1* result) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::SkillPage(lease.User(), request, destination, result)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL AbilityPathThunk(
+        void* user, AnomalyGenerationHandleV1 ability_class,
+        char* destination, std::size_t* size) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::AbilityPath(lease.User(), ability_class, destination, size)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SkillSnapshotByHandleThunk(
+        void* user, AnomalyGenerationHandleV1 skill,
+        AnomalyNteSkillSnapshotV1* snapshot) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::SkillSnapshotByHandle(lease.User(), skill, snapshot)
+            : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL ActivateSkillThunk(
+        void* user,
+        const AnomalyNteSkillInvocationRequestV1* request,
+        AnomalyNteSkillInvocationResultV1* result) noexcept {
+        auto lease = static_cast<SemanticServiceEndpoint*>(user)->Acquire();
+        return lease
+            ? State::ActivateSkill(lease.User(), request, result)
+            : StoppedStatus();
     }
 
     std::weak_ptr<State> state_;
@@ -6904,6 +8997,60 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             {}, semantic_lifetime)) {
         return false;
     }
+    if (framework_hook_ready && SemanticFeatureAvailable("nte.combat") &&
+        !PublishIfMissing(
+            ANOMALY_NTE_COMBAT_SERVICE_V1_ID,
+            ANOMALY_NTE_COMBAT_SERVICE_V1_VERSION,
+            &endpoint->combat_service,
+            [self, observer_endpoint] {
+                const auto locked = self.lock();
+                const auto observed = observer_endpoint.lock();
+                if (!locked || !observed ||
+                    locked->semantic_endpoint.load(std::memory_order_acquire) != observed) {
+                    return;
+                }
+                locked->player_demand.store(true, std::memory_order_release);
+                locked->combat_demand.store(true, std::memory_order_release);
+            },
+            semantic_lifetime)) {
+        return false;
+    }
+    if (framework_hook_ready && SemanticFeatureAvailable("nte.skills") &&
+        !PublishIfMissing(
+            ANOMALY_NTE_SKILLS_SERVICE_V1_ID,
+            ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION,
+            &endpoint->skills_service,
+            [self, observer_endpoint] {
+                const auto locked = self.lock();
+                const auto observed = observer_endpoint.lock();
+                if (!locked || !observed ||
+                    locked->semantic_endpoint.load(std::memory_order_acquire) != observed) {
+                    return;
+                }
+                locked->player_demand.store(true, std::memory_order_release);
+                locked->skill_demand.store(true, std::memory_order_release);
+            },
+            semantic_lifetime)) {
+        return false;
+    }
+    if (framework_hook_ready && SemanticFeatureAvailable("nte.skill-invocation") &&
+        !PublishIfMissing(
+            ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID,
+            ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_VERSION,
+            &endpoint->skill_invocation_service,
+            [self, observer_endpoint] {
+                const auto locked = self.lock();
+                const auto observed = observer_endpoint.lock();
+                if (!locked || !observed ||
+                    locked->semantic_endpoint.load(std::memory_order_acquire) != observed) {
+                    return;
+                }
+                locked->player_demand.store(true, std::memory_order_release);
+                locked->skill_demand.store(true, std::memory_order_release);
+            },
+            semantic_lifetime)) {
+        return false;
+    }
     return true;
 }
 
@@ -7203,17 +9350,36 @@ void Ue5NteAdapter::OnGameTick(double delta_seconds) noexcept {
             state->RefreshNavigationBindingLocked();
         }
         state->RefreshAhudBindingLocked();
+        state->RefreshCombatSkillBindingsLocked();
+        const bool combat_service_ready =
+            state->SemanticFeatureAvailable("nte.combat") &&
+            !state->IsPublished(ANOMALY_NTE_COMBAT_SERVICE_V1_ID);
+        const bool skills_service_ready =
+            state->SemanticFeatureAvailable("nte.skills") &&
+            !state->IsPublished(ANOMALY_NTE_SKILLS_SERVICE_V1_ID);
+        const bool invocation_service_ready =
+            state->SemanticFeatureAvailable("nte.skill-invocation") &&
+            !state->IsPublished(ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID);
+        if (combat_service_ready || skills_service_ready || invocation_service_ready) {
+            static_cast<void>(state->PublishAvailableServices(state));
+        }
         state->RefreshPickupConfirmationLocked();
         const bool pickup_requested = state->pickup_demand.exchange(
             false, std::memory_order_acq_rel);
         const bool entity_requested = state->entity_demand.load(std::memory_order_acquire);
         const bool player_requested = state->player_demand.load(std::memory_order_acquire);
+        const bool combat_requested = state->combat_demand.load(std::memory_order_acquire);
+        const bool skill_requested = state->skill_demand.load(std::memory_order_acquire);
         const bool entity_due = pickup_requested ||
             (entity_requested && State::SamplingDue(
                 sequence, state->entity_attempt_sequence, state->sampling.entity_tick_interval));
         const bool player_due = pickup_requested || (player_requested && State::SamplingDue(
             sequence, state->player_attempt_sequence, state->sampling.player_tick_interval));
-        if (entity_due || player_due) {
+        const bool combat_due = combat_requested && State::SamplingDue(
+            sequence, state->combat_attempt_sequence, state->sampling.player_tick_interval);
+        const bool skill_due = skill_requested && State::SamplingDue(
+            sequence, state->skill_attempt_sequence, state->sampling.player_tick_interval);
+        if (entity_due || player_due || combat_due || skill_due) {
             state->RefreshPlayer(sequence);
             ++state->player_refresh_count;
         } else if (player_requested) {
@@ -7229,6 +9395,21 @@ void Ue5NteAdapter::OnGameTick(double delta_seconds) noexcept {
             ++state->entity_cache_hit_count;
         }
         if (pickup_requested) state->PerformPickupLocked();
+        if (combat_due) {
+            static_cast<void>(state->combat_demand.exchange(false, std::memory_order_acq_rel));
+            state->RefreshCombat(sequence);
+        }
+        if (skill_due) {
+            static_cast<void>(state->skill_demand.exchange(false, std::memory_order_acq_rel));
+            state->RefreshSkills(sequence);
+        }
+        if (state->SemanticFeatureAvailable("nte.combat") &&
+            state->damage_event_count != 0) {
+            try {
+                state->RefreshDamageSourceNamesLocked();
+            } catch (...) {
+            }
+        }
         const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - sampling_started).count();
         const auto elapsed_micros = static_cast<std::uint64_t>(
@@ -7251,6 +9432,17 @@ void Ue5NteAdapter::OnGameTick(double delta_seconds) noexcept {
         callback.Invoke(delta_seconds);
     } catch (...) {
     }
+}
+
+void Ue5NteAdapter::OnDamageEvent(
+    const std::uintptr_t damage_event,
+    const std::uintptr_t victim,
+    const std::uintptr_t attacker,
+    const std::uintptr_t damage_causer) noexcept {
+    static_cast<void>(damage_causer);
+    const auto state = state_;
+    std::scoped_lock lock(state->mutex);
+    state->CaptureCharacterDamageLocked(damage_event, victim, attacker);
 }
 
 void Ue5NteAdapter::OnProcessEvent(
@@ -7295,6 +9487,19 @@ std::uint64_t Ue5NteAdapter::AhudFrameCount() const noexcept {
 std::uint64_t Ue5NteAdapter::AhudProcessEventCallCount() const noexcept {
     const auto state = state_;
     return state->ahud_process_event_call_count.load(std::memory_order_acquire);
+}
+
+NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {
+    const auto state = state_;
+    std::scoped_lock lock(state->mutex);
+    return {
+        state->combat_skill_discovery.damage_event_layout_valid,
+        state->damage_native_call_count,
+        state->damage_captured_event_count,
+        state->damage_capture_drop_count,
+        state->damage_attacker_resolution_failure_count,
+        state->damage_victim_resolution_failure_count,
+        state->damage_source_resolution_failure_count};
 }
 
 ProfileResolutionSnapshot Ue5NteAdapter::Resolution() const {

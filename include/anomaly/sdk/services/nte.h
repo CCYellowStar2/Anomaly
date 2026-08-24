@@ -18,7 +18,14 @@
 #define ANOMALY_NTE_ENTITIES_SERVICE_V1_VERSION 1u
 #define ANOMALY_NTE_ACTORS_SERVICE_V1_ID "anomaly.nte.actors"
 #define ANOMALY_NTE_ACTORS_SERVICE_V1_VERSION 1u
+#define ANOMALY_NTE_COMBAT_SERVICE_V1_ID "anomaly.nte.combat"
+#define ANOMALY_NTE_COMBAT_SERVICE_V1_VERSION 1u
+#define ANOMALY_NTE_SKILLS_SERVICE_V1_ID "anomaly.nte.skills"
+#define ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION 1u
+#define ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID "anomaly.nte.skill-invocation"
+#define ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_VERSION 1u
 #define ANOMALY_NTE_ENTITY_PAGE_V1_MAX_CAPACITY 256u
+#define ANOMALY_NTE_SKILL_PAGE_V1_MAX_CAPACITY 128u
 #define ANOMALY_NTE_METRICS_SERVICE_V1_ID "anomaly.nte.metrics"
 #define ANOMALY_NTE_METRICS_SERVICE_V1_VERSION 1u
 #define ANOMALY_NTE_ESC_MENU_BUTTON_SERVICE_V1_ID "anomaly.nte.esc-menu-button"
@@ -361,6 +368,156 @@ typedef struct AnomalyNteActorsServiceV1 {
         AnomalyGenerationHandleV1 actor, AnomalyStringViewV1 property_name,
         char* destination, size_t* inout_size);
 } AnomalyNteActorsServiceV1;
+
+// Combat snapshots are Host-cached. CHARACTER_EVENT damage is captured from
+// AHTAbilityCharacter::CharacterOnDamaged with participants and DamageGEDef.
+typedef uint32_t AnomalyNteCombatantFlagsV1;
+#define ANOMALY_NTE_COMBATANT_V1_DEAD (1u << 0u)
+#define ANOMALY_NTE_COMBATANT_V1_VALID ANOMALY_NTE_SNAPSHOT_V1_VALID
+#define ANOMALY_NTE_COMBATANT_V1_STALE ANOMALY_NTE_SNAPSHOT_V1_STALE
+#define ANOMALY_NTE_COMBATANT_V1_PARTIAL ANOMALY_NTE_SNAPSHOT_V1_PARTIAL
+typedef struct AnomalyNteCombatantSnapshotV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t sequence;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 target;
+    double hp; double max_hp; double shield;
+} AnomalyNteCombatantSnapshotV1;
+
+typedef uint32_t AnomalyNteDamageFlagsV1;
+#define ANOMALY_NTE_DAMAGE_V1_CLIENT_PRESENTED (1u << 0u)
+#define ANOMALY_NTE_DAMAGE_V1_CRITICAL (1u << 1u)
+#define ANOMALY_NTE_DAMAGE_V1_HEAD_HIT (1u << 2u)
+#define ANOMALY_NTE_DAMAGE_V1_WEAK_UNBALANCE (1u << 3u)
+// final_damage is the rounded FHTDamageEvent::Damage value. Display-only
+// metadata is unavailable unless a separate flag says otherwise.
+#define ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT (1u << 4u)
+typedef struct AnomalyNteDamageEventV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t sequence; uint64_t tick_sequence;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 attacker;
+    AnomalyGenerationHandleV1 victim;
+    uint64_t source_id;
+    int64_t display_damage; int64_t basic_damage; int64_t final_damage;
+    double hit_location[3];
+    uint32_t damage_type; uint32_t display_type;
+    uint32_t reaction_type; uint32_t reaction_display_type;
+} AnomalyNteDamageEventV1;
+
+typedef enum AnomalyNteCombatDirectionV1 {
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_ANY = 0,
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_ATTACKER = 1,
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_VICTIM = 2
+} AnomalyNteCombatDirectionV1;
+typedef struct AnomalyNteCombatStatisticsRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    uint64_t source_id;
+    uint32_t direction; uint32_t reserved;
+} AnomalyNteCombatStatisticsRequestV1;
+typedef uint32_t AnomalyNteCombatStatisticsFlagsV1;
+#define ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL (1u << 0u)
+#define ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW (1u << 1u)
+typedef struct AnomalyNteCombatStatisticsV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t through_sequence;
+    uint64_t hit_count; uint64_t critical_count; uint64_t head_hit_count;
+    int64_t display_damage_total;
+    int64_t basic_damage_total;
+    int64_t final_damage_total;
+} AnomalyNteCombatStatisticsV1;
+typedef struct AnomalyNteCombatServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *current_combatant)(
+        void* user, AnomalyNteCombatantSnapshotV1* snapshot);
+    uint64_t (ANOMALY_CALL *latest_damage_sequence)(void* user);
+    AnomalyStatusV1 (ANOMALY_CALL *next_damage_event)(
+        void* user, uint64_t after_sequence, AnomalyNteDamageEventV1* event);
+    AnomalyStatusV1 (ANOMALY_CALL *statistics)(
+        void* user, const AnomalyNteCombatStatisticsRequestV1* request,
+        AnomalyNteCombatStatisticsV1* statistics);
+    AnomalyStatusV1 (ANOMALY_CALL *source_name_utf8)(
+        void* user, uint64_t source_id, char* destination, size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *participant_path_utf8)(void* user,
+        AnomalyGenerationHandleV1 participant, char* destination,
+        size_t* inout_size);
+} AnomalyNteCombatServiceV1;
+
+typedef struct AnomalyNteSkillFrameV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation; uint64_t sequence;
+    AnomalyGenerationHandleV1 character;
+    uint32_t skill_count; uint32_t reserved;
+} AnomalyNteSkillFrameV1;
+typedef uint32_t AnomalyNteSkillFlagsV1;
+#define ANOMALY_NTE_SKILL_V1_ACTIVE (1u << 0u)
+#define ANOMALY_NTE_SKILL_V1_INPUT_PRESSED (1u << 1u)
+#define ANOMALY_NTE_SKILL_V1_PENDING_REMOVE (1u << 2u)
+#define ANOMALY_NTE_SKILL_V1_REMOVE_AFTER_ACTIVATION (1u << 3u)
+#define ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID (1u << 4u)
+#define ANOMALY_NTE_SKILL_V1_VALID ANOMALY_NTE_SNAPSHOT_V1_VALID
+#define ANOMALY_NTE_SKILL_V1_STALE ANOMALY_NTE_SNAPSHOT_V1_STALE
+#define ANOMALY_NTE_SKILL_V1_PARTIAL ANOMALY_NTE_SNAPSHOT_V1_PARTIAL
+typedef struct AnomalyNteSkillSnapshotV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 handle;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 ability_class;
+    uint64_t sequence;
+    int32_t level; int32_t input_id;
+    float cooldown_remaining_seconds; float cooldown_duration_seconds;
+} AnomalyNteSkillSnapshotV1;
+typedef struct AnomalyNteSkillPageRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation;
+    uint32_t offset; uint32_t capacity;
+} AnomalyNteSkillPageRequestV1;
+typedef struct AnomalyNteSkillPageResultV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation; uint64_t sequence;
+    uint32_t total_skills; uint32_t returned;
+    uint32_t next_offset; uint32_t reserved;
+} AnomalyNteSkillPageResultV1;
+typedef struct AnomalyNteSkillsServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *frame)(void* user, AnomalyNteSkillFrameV1* frame);
+    AnomalyStatusV1 (ANOMALY_CALL *snapshot_at)(
+        void* user, uint64_t generation, uint32_t index,
+        AnomalyNteSkillSnapshotV1* snapshot);
+    AnomalyStatusV1 (ANOMALY_CALL *page)(
+        void* user, const AnomalyNteSkillPageRequestV1* request,
+        AnomalyNteSkillSnapshotV1* destination,
+        AnomalyNteSkillPageResultV1* result);
+    AnomalyStatusV1 (ANOMALY_CALL *ability_path_utf8)(
+        void* user, AnomalyGenerationHandleV1 ability_class,
+        char* destination, size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *snapshot_by_handle)(
+        void* user, AnomalyGenerationHandleV1 skill,
+        AnomalyNteSkillSnapshotV1* snapshot);
+} AnomalyNteSkillsServiceV1;
+
+typedef struct AnomalyNteSkillInvocationRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 skill;
+} AnomalyNteSkillInvocationRequestV1;
+typedef struct AnomalyNteSkillInvocationResultV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t tick_sequence;
+    uint32_t accepted; uint32_t reserved;
+} AnomalyNteSkillInvocationResultV1;
+typedef struct AnomalyNteSkillInvocationServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    // Valid only from the Host Game callback domain. accepted reports the
+    // game's bool result; an accepted value of zero is still a successful bridge call.
+    AnomalyStatusV1 (ANOMALY_CALL *activate)(
+        void* user, const AnomalyNteSkillInvocationRequestV1* request,
+        AnomalyNteSkillInvocationResultV1* result);
+} AnomalyNteSkillInvocationServiceV1;
 
 // Sampling metrics describe Host work, not a per-plugin traversal. The active Profile's
 // feature matrix remains available through AnomalyNteBuildServiceV1::feature_state. A page

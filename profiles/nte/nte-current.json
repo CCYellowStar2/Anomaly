@@ -18,7 +18,10 @@
         "anomaly.nte.navigation",
         "anomaly.nte.player-esp",
         "anomaly.nte.entities",
-        "anomaly.nte.pickup"
+        "anomaly.nte.pickup",
+        "anomaly.nte.combat",
+        "anomaly.nte.skills",
+        "anomaly.nte.skill-invocation"
       ]
     },
     "ue5.FNamePool": {
@@ -36,7 +39,10 @@
         "anomaly.nte.navigation",
         "anomaly.nte.esc-menu-button",
         "anomaly.nte.entities",
-        "anomaly.nte.pickup"
+        "anomaly.nte.pickup",
+        "anomaly.nte.combat",
+        "anomaly.nte.skills",
+        "anomaly.nte.skill-invocation"
       ]
     },
     "ue5.GObjects": {
@@ -52,7 +58,10 @@
         "anomaly.nte.map-landmarks",
         "anomaly.nte.navigation",
         "anomaly.nte.esc-menu-button",
-        "anomaly.nte.pickup"
+        "anomaly.nte.pickup",
+        "anomaly.nte.combat",
+        "anomaly.nte.skills",
+        "anomaly.nte.skill-invocation"
       ]
     },
     "ue5.StaticFindObject": {
@@ -83,7 +92,10 @@
         "anomaly.nte.player-esp",
         "anomaly.nte.esc-menu-button",
         "anomaly.nte.entities",
-        "anomaly.nte.pickup"
+        "anomaly.nte.pickup",
+        "anomaly.nte.combat",
+        "anomaly.nte.skills",
+        "anomaly.nte.skill-invocation"
       ]
     },
     "ue5.ProcessEvent": {
@@ -92,7 +104,11 @@
       "pattern": "40 55 56 57 41 54 41 55 41 56 41 57 48 81 EC 00 01 00 00 48 8D 6C 24 30 48 89 9D 28 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C5 48 89 85 C0 00 00 00 8B 41 08 4D 8B F0 C1 E8 1E 48 8B FA F6 D0 4C 8B F9 A8 01 0F 84 ?? ?? ?? ?? 33 F6 F7 82 B0 00 00 00 00 04 00 00",
       "resolve": {"kind": "direct"},
       "validators": ["address-in-module", "executable"],
-      "requiredBy": ["anomaly.ue5.framework", "anomaly.ue5.ahud", "anomaly.nte.map-landmarks", "anomaly.nte.navigation", "anomaly.nte.pickup"]
+      "requiredBy": [
+        "anomaly.ue5.framework", "anomaly.ue5.ahud",
+        "anomaly.nte.map-landmarks", "anomaly.nte.navigation", "anomaly.nte.pickup",
+        "anomaly.nte.combat", "anomaly.nte.skills", "anomaly.nte.skill-invocation"
+      ]
     },
     "nte.ClientIgnoreGameAndUiInput": {
       "module": "HTGame.exe",
@@ -109,6 +125,14 @@
       "resolve": {"kind": "direct"},
       "validators": ["address-in-module", "executable"],
       "requiredBy": ["anomaly.ue5.ahud"]
+    },
+    "nte.HTAbilityCharacter.BroadcastCharacterOnDamaged": {
+      "module": "HTGame.exe",
+      "section": ".text",
+      "pattern": "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 57 48 81 EC B0 01 00 00 48 8B E9 49 8B F1 48 8D 4C 24 20 49 8B F8 48 8B DA E8 ?? ?? ?? ??",
+      "resolve": {"kind": "direct"},
+      "validators": ["address-in-module", "executable"],
+      "requiredBy": ["anomaly.nte.combat"]
     },
     "nte.HTUI_MenuExtension.AddMenuPage": {
       "module": "HTGame.exe",
@@ -188,7 +212,17 @@
       "nte.CommonButtonBase.BP_OnClicked"
     ],
     "nte.entities": ["ue5.GWorld", "ue5.GameTick", "ue5.FNamePool"],
-    "nte.pickup": ["ue5.GWorld", "ue5.GameTick", "ue5.FNamePool", "ue5.GObjects", "ue5.ProcessEvent"]
+    "nte.pickup": ["ue5.GWorld", "ue5.GameTick", "ue5.FNamePool", "ue5.GObjects", "ue5.ProcessEvent"],
+    "nte.combat": [
+      "ue5.GWorld", "ue5.GameTick", "ue5.FNamePool", "ue5.GObjects",
+      "nte.HTAbilityCharacter.BroadcastCharacterOnDamaged"
+    ],
+    "nte.skills": [
+      "ue5.GWorld", "ue5.GameTick", "ue5.FNamePool", "ue5.GObjects"
+    ],
+    "nte.skill-invocation": [
+      "ue5.GWorld", "ue5.GameTick", "ue5.FNamePool", "ue5.GObjects"
+    ]
   },
   "optionalFeatures": [
     "ue5.actors",
@@ -202,7 +236,10 @@
     "nte.map-landmarks",
     "nte.navigation",
     "nte.esc-menu-button",
-    "nte.pickup"
+    "nte.pickup",
+    "nte.combat",
+    "nte.skills",
+    "nte.skill-invocation"
   ],
   "featureLayoutValidators": {
     "ue5.actors": ["ue5-actors-reflection-v1"],
@@ -218,7 +255,10 @@
     "nte.navigation": ["nte-navigation-layout-v1", "nte-navigation-input-abi-v1"],
     "nte.esc-menu-button": ["nte-esc-menu-hooks-v1"],
     "nte.entities": ["nte-entities-layout-v2"],
-    "nte.pickup": ["nte-pickup-layout-v1"]
+    "nte.pickup": ["nte-pickup-layout-v1"],
+    "nte.combat": ["nte-combat-reflection-v1"],
+    "nte.skills": ["nte-skills-layout-v1"],
+    "nte.skill-invocation": ["nte-skill-invocation-v1"]
   },
   "featureDependencies": {
     "ue5.actors": ["ue5.world", "ue5.names"],
@@ -248,7 +288,14 @@
     ],
     "nte.esc-menu-button": ["ue5.names", "ue5.objects", "ue5.process-event"],
     "nte.entities": ["ue5.names"],
-    "nte.pickup": ["nte.player", "nte.entities", "ue5.names", "ue5.objects", "ue5.process-event"]
+    "nte.pickup": ["nte.player", "nte.entities", "ue5.names", "ue5.objects", "ue5.process-event"],
+    "nte.combat": [
+      "nte.player", "ue5.names", "ue5.objects", "ue5.process-event"
+    ],
+    "nte.skills": [
+      "nte.player", "ue5.names", "ue5.objects", "ue5.process-event"
+    ],
+    "nte.skill-invocation": ["nte.skills", "ue5.process-event"]
   },
   "layout": {
     "world.gameInstance": 560,
@@ -279,6 +326,8 @@
     "ufunction.nativeFlag": 1024,
     "ustruct.children": 72,
     "ufield.next": 40,
+    "ufunction.execFunction": 216,
+    "fstack.locals": 32,
     "escMenu.buttonClickedVtableOffset": 1392,
     "ffield.class": 8,
     "ffield.name": 32,
@@ -288,12 +337,34 @@
     "fproperty.offsetInternal": 68,
     "fproperty.propertyLinkNext": 72,
     "fstructProperty.struct": 112,
+    "fobjectProperty.propertyClass": 112,
+    "farrayProperty.inner": 120,
+    "fclassProperty.metaClass": 120,
     "fboolProperty.fieldSize": 112,
     "fboolProperty.byteOffset": 113,
     "fboolProperty.byteMask": 114,
     "fboolProperty.fieldMask": 115,
     "character.setCustomIgnoreMoveInputVtableOffset": 4032,
     "character.setCustomLimitInputVtableOffset": 4088,
+    "tarray.data": 0,
+    "tarray.num": 8,
+    "tarray.max": 12,
+    "damageEvent.size": 368,
+    "damageEvent.damage": 16,
+    "damageEvent.damageGEDef": 312,
+    "weakObject.index": 0,
+    "weakObject.serial": 4,
+    "abilitySystem.activatableAbilities": 1032,
+    "abilitySpecContainer.items": 264,
+    "abilitySpec.stride": 240,
+    "abilitySpec.handle": 12,
+    "abilitySpec.ability": 16,
+    "abilitySpec.level": 24,
+    "abilitySpec.inputId": 28,
+    "abilitySpec.activeCount": 40,
+    "abilitySpec.stateBits": 41,
+    "ability.cooldownGameplayEffectClass": 440,
+    "skills.maxCount": 512,
     "dataTable.rowMap": 48,
     "dataTable.rowMapElementStride": 24,
     "dataTable.rowMapRowOffset": 8,

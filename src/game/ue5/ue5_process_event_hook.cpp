@@ -10,7 +10,7 @@
 namespace anomaly {
 namespace {
 
-inline constexpr std::string_view kOwner = "anomaly.ue5.ahud";
+inline constexpr std::string_view kOwner = "anomaly.ue5.actor-process-event";
 inline constexpr std::uint64_t kGeneration = 1;
 
 }  // namespace

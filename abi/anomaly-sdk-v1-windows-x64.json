@@ -52,9 +52,26 @@
     "ANOMALY_NTE_NAVIGATION_SERVICE_V1_VERSION": 1,
     "ANOMALY_NTE_PICKUP_SERVICE_V1_VERSION": 1,
     "ANOMALY_NTE_ENTITIES_SERVICE_V1_VERSION": 1,
+    "ANOMALY_NTE_COMBAT_SERVICE_V1_VERSION": 1,
+    "ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION": 1,
+    "ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_VERSION": 1,
     "ANOMALY_NTE_METRICS_SERVICE_V1_VERSION": 1,
     "ANOMALY_NTE_ESC_MENU_BUTTON_SERVICE_V1_VERSION": 1,
     "ANOMALY_NTE_ENTITY_PAGE_V1_MAX_CAPACITY": 256,
+    "ANOMALY_NTE_SKILL_PAGE_V1_MAX_CAPACITY": 128,
+    "ANOMALY_NTE_COMBATANT_V1_DEAD": 1,
+    "ANOMALY_NTE_DAMAGE_V1_CLIENT_PRESENTED": 1,
+    "ANOMALY_NTE_DAMAGE_V1_CRITICAL": 2,
+    "ANOMALY_NTE_DAMAGE_V1_HEAD_HIT": 4,
+    "ANOMALY_NTE_DAMAGE_V1_WEAK_UNBALANCE": 8,
+    "ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT": 16,
+    "ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL": 1,
+    "ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW": 2,
+    "ANOMALY_NTE_SKILL_V1_ACTIVE": 1,
+    "ANOMALY_NTE_SKILL_V1_INPUT_PRESSED": 2,
+    "ANOMALY_NTE_SKILL_V1_PENDING_REMOVE": 4,
+    "ANOMALY_NTE_SKILL_V1_REMOVE_AFTER_ACTIVATION": 8,
+    "ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID": 16,
     "ANOMALY_NTE_METRICS_V1_VALID": 1,
     "ANOMALY_NTE_PICKUP_V1_NONE": 0,
     "ANOMALY_NTE_PICKUP_V1_VALID": 1,
@@ -178,6 +195,15 @@
         "ANOMALY_NTE_ENTITY_V1_STATIONARY": 2,
         "ANOMALY_NTE_ENTITY_V1_MOVABLE": 4,
         "ANOMALY_NTE_ENTITY_V1_LOCAL_PLAYER": 8
+      }
+    },
+    "AnomalyNteCombatDirectionV1": {
+      "size": 4,
+      "alignment": 4,
+      "values": {
+        "ANOMALY_NTE_COMBAT_DIRECTION_V1_ANY": 0,
+        "ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_ATTACKER": 1,
+        "ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_VICTIM": 2
       }
     },
     "AnomalyNotificationSeverityV1": {
@@ -1422,6 +1448,186 @@
         "fname_property_utf8": 72
       }
     },
+    "AnomalyNteCombatantSnapshotV1": {
+      "size": 88,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "sequence": 8,
+        "world": 16,
+        "character": 32,
+        "target": 48,
+        "hp": 64,
+        "max_hp": 72,
+        "shield": 80
+      }
+    },
+    "AnomalyNteDamageEventV1": {
+      "size": 144,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "sequence": 8,
+        "tick_sequence": 16,
+        "world": 24,
+        "attacker": 40,
+        "victim": 56,
+        "source_id": 72,
+        "display_damage": 80,
+        "basic_damage": 88,
+        "final_damage": 96,
+        "hit_location": 104,
+        "damage_type": 128,
+        "display_type": 132,
+        "reaction_type": 136,
+        "reaction_display_type": 140
+      }
+    },
+    "AnomalyNteCombatStatisticsRequestV1": {
+      "size": 56,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "world": 8,
+        "character": 24,
+        "source_id": 40,
+        "direction": 48,
+        "reserved": 52
+      }
+    },
+    "AnomalyNteCombatStatisticsV1": {
+      "size": 64,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "through_sequence": 8,
+        "hit_count": 16,
+        "critical_count": 24,
+        "head_hit_count": 32,
+        "display_damage_total": 40,
+        "basic_damage_total": 48,
+        "final_damage_total": 56
+      }
+    },
+    "AnomalyNteCombatServiceV1": {
+      "size": 64,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "service_version": 4,
+        "user": 8,
+        "current_combatant": 16,
+        "latest_damage_sequence": 24,
+        "next_damage_event": 32,
+        "statistics": 40,
+        "source_name_utf8": 48,
+        "participant_path_utf8": 56
+      }
+    },
+    "AnomalyNteSkillFrameV1": {
+      "size": 48,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "generation": 8,
+        "sequence": 16,
+        "character": 24,
+        "skill_count": 40,
+        "reserved": 44
+      }
+    },
+    "AnomalyNteSkillSnapshotV1": {
+      "size": 80,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "handle": 8,
+        "character": 24,
+        "ability_class": 40,
+        "sequence": 56,
+        "level": 64,
+        "input_id": 68,
+        "cooldown_remaining_seconds": 72,
+        "cooldown_duration_seconds": 76
+      }
+    },
+    "AnomalyNteSkillPageRequestV1": {
+      "size": 24,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "generation": 8,
+        "offset": 16,
+        "capacity": 20
+      }
+    },
+    "AnomalyNteSkillPageResultV1": {
+      "size": 40,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "generation": 8,
+        "sequence": 16,
+        "total_skills": 24,
+        "returned": 28,
+        "next_offset": 32,
+        "reserved": 36
+      }
+    },
+    "AnomalyNteSkillsServiceV1": {
+      "size": 56,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "service_version": 4,
+        "user": 8,
+        "frame": 16,
+        "snapshot_at": 24,
+        "page": 32,
+        "ability_path_utf8": 40,
+        "snapshot_by_handle": 48
+      }
+    },
+    "AnomalyNteSkillInvocationRequestV1": {
+      "size": 56,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "world": 8,
+        "character": 24,
+        "skill": 40
+      }
+    },
+    "AnomalyNteSkillInvocationResultV1": {
+      "size": 24,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "flags": 4,
+        "tick_sequence": 8,
+        "accepted": 16,
+        "reserved": 20
+      }
+    },
+    "AnomalyNteSkillInvocationServiceV1": {
+      "size": 24,
+      "alignment": 8,
+      "offsets": {
+        "struct_size": 0,
+        "service_version": 4,
+        "user": 8,
+        "activate": 16
+      }
+    },
     "AnomalyNteSnapshotMetricsV1": {
       "size": 104,
       "alignment": 8,
@@ -1513,6 +1719,9 @@
     { "id": "anomaly.nte.pickup", "version": 1, "table": "AnomalyNtePickupServiceV1" },
     { "id": "anomaly.nte.entities", "version": 1, "table": "AnomalyNteEntitiesServiceV1" },
     { "id": "anomaly.nte.actors", "version": 1, "table": "AnomalyNteActorsServiceV1" },
+    { "id": "anomaly.nte.combat", "version": 1, "table": "AnomalyNteCombatServiceV1" },
+    { "id": "anomaly.nte.skills", "version": 1, "table": "AnomalyNteSkillsServiceV1" },
+    { "id": "anomaly.nte.skill-invocation", "version": 1, "table": "AnomalyNteSkillInvocationServiceV1" },
     { "id": "anomaly.nte.metrics", "version": 1, "table": "AnomalyNteMetricsServiceV1" },
     { "id": "anomaly.nte.esc-menu-button", "version": 1, "table": "AnomalyNteEscMenuButtonServiceV1" }
   ]

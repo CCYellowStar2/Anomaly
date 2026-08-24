@@ -25,6 +25,16 @@ struct NteSnapshotSamplingOptions {
     std::uint32_t entity_tick_interval{1};
 };
 
+struct NteCombatDiagnosticsSnapshot {
+    bool damage_event_layout_ready{};
+    std::uint64_t native_call_count{};
+    std::uint64_t captured_event_count{};
+    std::uint64_t dropped_count{};
+    std::uint64_t attacker_resolution_failure_count{};
+    std::uint64_t victim_resolution_failure_count{};
+    std::uint64_t source_resolution_failure_count{};
+};
+
 class Ue5NteAdapter final {
 public:
     using TickCallback = std::function<void(double)>;
@@ -67,9 +77,14 @@ public:
     bool ClearTickCallback(
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) noexcept;
     void OnGameTick(double delta_seconds) noexcept;
+    void OnDamageEvent(
+        std::uintptr_t damage_event,
+        std::uintptr_t victim,
+        std::uintptr_t attacker,
+        std::uintptr_t damage_causer) noexcept;
     // Called only by the separately owned Actor ProcessEvent wrapper detour
-    // after the wrapper has completed. AHUD calls use that wrapper's original
-    // trampoline so native HUD dispatch matches the object's virtual path.
+    // after the wrapper has completed. Damage capture uses the exact native
+    // CharacterOnDamaged broadcast and never enters through this broad wrapper.
     void OnProcessEvent(
         std::uintptr_t object,
         std::uintptr_t function,
@@ -83,6 +98,7 @@ public:
     [[nodiscard]] bool AhudBindingReady() const noexcept;
     [[nodiscard]] std::uint64_t AhudFrameCount() const noexcept;
     [[nodiscard]] std::uint64_t AhudProcessEventCallCount() const noexcept;
+    [[nodiscard]] NteCombatDiagnosticsSnapshot CombatDiagnostics() const noexcept;
     [[nodiscard]] ProfileResolutionSnapshot Resolution() const;
 
 private:

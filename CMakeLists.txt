@@ -399,6 +399,7 @@ add_library(anomaly_adapter_services STATIC
     src/game/ue5/ue5_object_lookup.cpp
     src/game/ue5/ue5_process_event.cpp
     src/game/ue5/ue5_process_event_hook.cpp
+    src/game/ue5/ue5_damage_function_hook.cpp
     src/game/ue5/ue5_nte_adapter.cpp
     src/game/nte/nte_navigation_input_policy.cpp
     src/game/ue5/game_tick_hook.cpp
@@ -1031,19 +1032,27 @@ if(ANOMALY_BUILD_SDK_EXAMPLES)
         MANIFEST examples/nte_inspector/manifest.json
         PACKAGE_NAME NteInspector
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/sdk-examples/NteInspector")
+    anomaly_add_plugin(anomaly_example_nte_combat_demo
+        SOURCES examples/nte_combat_demo/plugin.cpp
+        MANIFEST examples/nte_combat_demo/manifest.json
+        PACKAGE_NAME NteCombatDemo
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/sdk-examples/NteCombatDemo")
     foreach(example_target IN ITEMS anomaly_example_hello_ui anomaly_example_tick_counter
-            anomaly_example_reliable_config anomaly_example_nte_inspector)
+            anomaly_example_reliable_config anomaly_example_nte_inspector
+            anomaly_example_nte_combat_demo)
         target_compile_definitions(${example_target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     endforeach()
     set_target_properties(anomaly_example_hello_ui PROPERTIES PDB_NAME HelloUi)
     set_target_properties(anomaly_example_tick_counter PROPERTIES PDB_NAME TickCounter)
     set_target_properties(anomaly_example_reliable_config PROPERTIES PDB_NAME ReliableConfig)
     set_target_properties(anomaly_example_nte_inspector PROPERTIES PDB_NAME NteInspector)
+    set_target_properties(anomaly_example_nte_combat_demo PROPERTIES PDB_NAME NteCombatDemo)
     add_dependencies(anomaly-platform-preview
         anomaly_example_hello_ui
         anomaly_example_tick_counter
         anomaly_example_reliable_config
-        anomaly_example_nte_inspector)
+        anomaly_example_nte_inspector
+        anomaly_example_nte_combat_demo)
 endif()
 
 if(ANOMALY_BUILD_BUILTIN_PLUGINS)
@@ -1197,6 +1206,7 @@ anomaly_stage_platform_preview_plugin(anomaly_example_hello_ui HelloUi)
 anomaly_stage_platform_preview_plugin(anomaly_example_tick_counter TickCounter)
 anomaly_stage_platform_preview_plugin(anomaly_example_reliable_config ReliableConfig)
 anomaly_stage_platform_preview_plugin(anomaly_example_nte_inspector NteInspector)
+anomaly_stage_platform_preview_plugin(anomaly_example_nte_combat_demo NteCombatDemo)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_position NtePosition)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_teleport NteTeleport)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_navigation NteNavmeshDemo)
@@ -1302,6 +1312,7 @@ set(ANOMALY_RELEASE_PE_TARGETS
 foreach(runtime_plugin_target IN ITEMS
         anomaly_example_hello_ui anomaly_example_tick_counter
         anomaly_example_reliable_config anomaly_example_nte_inspector
+        anomaly_example_nte_combat_demo
         anomaly_builtin_nte_position anomaly_builtin_nte_teleport
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
@@ -1332,6 +1343,13 @@ install(TARGETS anomaly_core
     LIBRARY DESTINATION Anomaly COMPONENT GameRuntime)
 install(TARGETS anomaly_crash_coordinator
     RUNTIME DESTINATION Anomaly COMPONENT GameRuntime)
+if(TARGET anomaly_example_nte_combat_demo)
+    install(TARGETS anomaly_example_nte_combat_demo
+        RUNTIME DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime)
+    install(FILES examples/nte_combat_demo/manifest.json
+        DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime)
+endif()
 if(TARGET anomaly_builtin_nte_position)
     install(TARGETS anomaly_builtin_nte_position
         RUNTIME DESTINATION Anomaly/plugins/NtePosition COMPONENT GameRuntime
@@ -1478,6 +1496,8 @@ install(FILES examples/reliable_config/plugin.cpp examples/reliable_config/manif
     DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/reliable_config COMPONENT SDK)
 install(FILES examples/nte_inspector/plugin.cpp examples/nte_inspector/manifest.json
     DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/nte_inspector COMPONENT SDK)
+install(FILES examples/nte_combat_demo/plugin.cpp examples/nte_combat_demo/manifest.json
+    DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/nte_combat_demo COMPONENT SDK)
 configure_package_config_file(
     cmake/sdk/AnomalySDKConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/AnomalySDKConfig.cmake"
