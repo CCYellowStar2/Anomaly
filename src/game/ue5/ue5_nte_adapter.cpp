@@ -654,7 +654,8 @@ struct Ue5NteAdapter::State {
         std::uintptr_t ability_system_class{};
         std::uintptr_t gameplay_ability_class{};
         std::uint64_t object_generation{};
-        std::uint32_t next_object_index{};
+        bool direct_lookup_succeeded{};
+        std::uint64_t direct_lookup_next_sequence{};
         bool damage_event_layout_valid{};
         bool skill_layout_valid{};
         bool cooldown_layout_valid{};
@@ -1722,10 +1723,10 @@ struct Ue5NteAdapter::State {
             return framework_hook_ready && NteActorsLayoutAvailable();
         }
         if (id == ANOMALY_NTE_COMBAT_SERVICE_V1_ID) {
-            return framework_hook_ready && SemanticFeatureAvailable("nte.combat");
+            return framework_hook_ready && NteCombatProfileAvailable();
         }
         if (id == ANOMALY_NTE_SKILLS_SERVICE_V1_ID) {
-            return framework_hook_ready && SemanticFeatureAvailable("nte.skills");
+            return framework_hook_ready && NteSkillsProfileAvailable();
         }
         if (id == ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID) {
             return framework_hook_ready &&
@@ -3146,7 +3147,14 @@ struct Ue5NteAdapter::State {
             !ReadValue(*memory, name_address, name_id)) {
             return false;
         }
-        name = ResolveNameSnapshotLocked(name_id);
+        std::array<char, 1025> resolved{};
+        std::size_t resolved_size = resolved.size();
+        if (ResolveNameIdLocked(name_id, resolved.data(), &resolved_size).code !=
+                ANOMALY_STATUS_V1_OK ||
+            resolved_size <= 1 || resolved_size > resolved.size()) {
+            return false;
+        }
+        name.assign(resolved.data(), resolved_size - 1U);
         return !name.empty();
     }
 
@@ -4293,6 +4301,12 @@ struct Ue5NteAdapter::State {
 
     void RefreshCombatSkillBindingsLocked() noexcept {
         try {
+            // Reflection discovery is demand driven. Publishing the service does
+            // not justify walking the game's object registry on every tick when
+            // no consumer has requested a combat or skill sample.
+            const bool combat_requested = combat_demand.load(std::memory_order_acquire);
+            const bool skills_requested = skill_demand.load(std::memory_order_acquire);
+            if (!combat_requested && !skills_requested) return;
             const bool combat_profile = NteCombatProfileAvailable();
             const bool skills_profile = NteSkillsProfileAvailable();
             if ((!combat_profile && !skills_profile) || object_registry.items == 0 ||
@@ -4304,58 +4318,75 @@ struct Ue5NteAdapter::State {
                 InvalidateCombatSkillDiscoveryLocked();
             }
 
-            constexpr std::uint32_t kDiscoveryBatch = 4096;
-            const std::uint32_t end = (std::min)(
-                object_registry.count,
-                combat_skill_discovery.next_object_index + kDiscoveryBatch);
-            for (std::uint32_t index = combat_skill_discovery.next_object_index;
-                 index < end;
-                 ++index) {
-                std::uintptr_t object{};
-                std::uint32_t serial{};
-                if (!ReadObjectSlot(
-                        *memory, object_registry, index, object, serial) ||
-                    object == 0) {
-                    continue;
-                }
-                std::string name;
-                if (!ReadReflectedObjectNameLocked(object, name)) continue;
-                if (combat_profile &&
-                    !combat_skill_discovery.damage_event_layout_valid &&
-                    name == "HTDamageEvent") {
-                    combat_skill_discovery.damage_event_layout_valid =
-                        ValidateDamageEventLayoutLocked(object);
-                }
-                for (std::size_t function_index{};
-                     function_index < kNteFunctionCount;
-                     ++function_index) {
-                    if (combat_skill_discovery.functions[function_index]) continue;
-                    const auto kind = static_cast<NteFunctionKind>(function_index);
-                    const NteFunctionSpec spec = NteSpec(kind);
-                    if (spec.name != name) continue;
-                    const bool skill_function =
-                        kind == NteFunctionKind::ActivateAbilityByClass ||
-                        kind == NteFunctionKind::GetActiveEffectTimeRemainingAndDuration;
-                    if ((!combat_profile &&
-                            kind != NteFunctionKind::GetAbilitySystemComponent &&
-                            !skill_function) ||
-                        (!skills_profile && skill_function)) {
-                        continue;
+            // The Dumper SDK supplies stable reflected paths for the native
+            // functions used by combat and skills. Resolve those paths on a
+            // generation-local retry interval, never by walking GObjects. The
+            // binding builder still validates the live UObject metadata, so
+            // this is a lookup optimization rather than a new ABI source.
+            const auto current_sequence = tick_sequence.load(std::memory_order_relaxed);
+            if (!combat_skill_discovery.direct_lookup_succeeded &&
+                current_sequence >= combat_skill_discovery.direct_lookup_next_sequence &&
+                ObjectFindAvailable()) {
+                combat_skill_discovery.direct_lookup_next_sequence = current_sequence + 60U;
+                bool direct_lookup_succeeded = true;
+                const auto make_path = [](const NteFunctionSpec& spec) {
+                    std::wstring path = L"/Script/HTGame.";
+                    path.reserve(path.size() + spec.outer.size() + 1U + spec.name.size());
+                    for (const char value : spec.outer) {
+                        path.push_back(static_cast<wchar_t>(static_cast<unsigned char>(value)));
                     }
+                    path.push_back(L'.');
+                    for (const char value : spec.name) {
+                        path.push_back(static_cast<wchar_t>(static_cast<unsigned char>(value)));
+                    }
+                    return path;
+                };
+                const auto lookup_function = [&](const NteFunctionKind kind) {
+                    const auto spec = NteSpec(kind);
+                    std::uintptr_t function{};
                     NteFunctionBinding binding;
-                    if (!BuildNteFunctionBindingLocked(object, kind, binding)) continue;
-                    combat_skill_discovery.functions[function_index] = binding;
+                    const auto path = make_path(spec);
+                    if (!FindExactObjectLocked(path.c_str(), function) ||
+                        !BuildNteFunctionBindingLocked(function, kind, binding)) {
+                        direct_lookup_succeeded = false;
+                        return;
+                    }
+                    combat_skill_discovery.functions[NteIndex(kind)] = binding;
                     if (kind == NteFunctionKind::GetAbilitySystemComponent) {
                         combat_skill_discovery.ability_system_class = binding.meta_class;
-                    }
-                    if (kind == NteFunctionKind::ActivateAbilityByClass) {
+                    } else if (kind == NteFunctionKind::ActivateAbilityByClass) {
                         combat_skill_discovery.ability_system_class = binding.outer_class;
                         combat_skill_discovery.gameplay_ability_class = binding.meta_class;
                     }
-                    break;
+                };
+                if (combat_profile) {
+                    std::uintptr_t damage_event{};
+                    if (!FindExactObjectLocked(L"/Script/HTGame.HTDamageEvent", damage_event) ||
+                        !ValidateDamageEventLayoutLocked(damage_event)) {
+                        direct_lookup_succeeded = false;
+                    } else {
+                        combat_skill_discovery.damage_event_layout_valid = true;
+                    }
+                    lookup_function(NteFunctionKind::GetAbilitySystemComponent);
+                    lookup_function(NteFunctionKind::GetHp);
+                    lookup_function(NteFunctionKind::GetHpMax);
+                    lookup_function(NteFunctionKind::GetIsDead);
+                    lookup_function(NteFunctionKind::GetAttackTarget);
+                    lookup_function(NteFunctionKind::GetShieldHealth);
+                }
+                if (skills_profile) {
+                    if (!combat_skill_discovery.functions[NteIndex(
+                            NteFunctionKind::GetAbilitySystemComponent)]) {
+                        lookup_function(NteFunctionKind::GetAbilitySystemComponent);
+                    }
+                    lookup_function(NteFunctionKind::GetActiveEffectTimeRemainingAndDuration);
+                    lookup_function(NteFunctionKind::ActivateAbilityByClass);
+                }
+                if (direct_lookup_succeeded) {
+                    combat_skill_discovery.direct_lookup_succeeded = true;
                 }
             }
-            combat_skill_discovery.next_object_index = end;
+            if (!combat_skill_discovery.direct_lookup_succeeded) return;
             if (skills_profile && !combat_skill_discovery.skill_layout_valid &&
                 combat_skill_discovery.ability_system_class != 0) {
                 combat_skill_discovery.skill_layout_valid = ValidateSkillLayoutLocked(
@@ -8997,7 +9028,7 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             {}, semantic_lifetime)) {
         return false;
     }
-    if (framework_hook_ready && SemanticFeatureAvailable("nte.combat") &&
+    if (framework_hook_ready && NteCombatProfileAvailable() &&
         !PublishIfMissing(
             ANOMALY_NTE_COMBAT_SERVICE_V1_ID,
             ANOMALY_NTE_COMBAT_SERVICE_V1_VERSION,
@@ -9015,7 +9046,7 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             semantic_lifetime)) {
         return false;
     }
-    if (framework_hook_ready && SemanticFeatureAvailable("nte.skills") &&
+    if (framework_hook_ready && NteSkillsProfileAvailable() &&
         !PublishIfMissing(
             ANOMALY_NTE_SKILLS_SERVICE_V1_ID,
             ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION,
@@ -9352,10 +9383,10 @@ void Ue5NteAdapter::OnGameTick(double delta_seconds) noexcept {
         state->RefreshAhudBindingLocked();
         state->RefreshCombatSkillBindingsLocked();
         const bool combat_service_ready =
-            state->SemanticFeatureAvailable("nte.combat") &&
+            state->NteCombatProfileAvailable() &&
             !state->IsPublished(ANOMALY_NTE_COMBAT_SERVICE_V1_ID);
         const bool skills_service_ready =
-            state->SemanticFeatureAvailable("nte.skills") &&
+            state->NteSkillsProfileAvailable() &&
             !state->IsPublished(ANOMALY_NTE_SKILLS_SERVICE_V1_ID);
         const bool invocation_service_ready =
             state->SemanticFeatureAvailable("nte.skill-invocation") &&
@@ -9487,6 +9518,12 @@ std::uint64_t Ue5NteAdapter::AhudFrameCount() const noexcept {
 std::uint64_t Ue5NteAdapter::AhudProcessEventCallCount() const noexcept {
     const auto state = state_;
     return state->ahud_process_event_call_count.load(std::memory_order_acquire);
+}
+
+bool Ue5NteAdapter::CombatFeatureAvailable() const noexcept {
+    const auto state = state_;
+    std::scoped_lock lock(state->mutex);
+    return state->SemanticFeatureAvailable("nte.combat");
 }
 
 NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {

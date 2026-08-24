@@ -98,6 +98,9 @@ public:
     [[nodiscard]] bool AhudBindingReady() const noexcept;
     [[nodiscard]] std::uint64_t AhudFrameCount() const noexcept;
     [[nodiscard]] std::uint64_t AhudProcessEventCallCount() const noexcept;
+    // Native combat capture stays dormant until the combat reflection gate
+    // has completed on the game thread.
+    [[nodiscard]] bool CombatFeatureAvailable() const noexcept;
     [[nodiscard]] NteCombatDiagnosticsSnapshot CombatDiagnostics() const noexcept;
     [[nodiscard]] ProfileResolutionSnapshot Resolution() const;
 

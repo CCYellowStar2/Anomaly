@@ -688,7 +688,7 @@ FeatureValidationResult ValidateEscMenuHooks(
 }
 
 FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
-    const bool preserve_actor_process_event_abi) {
+    const bool preserve_hooked_process_event_abi) {
     FeatureLayoutValidatorRegistry validators = Ue5FeatureLayoutValidators();
     validators.Register(
         std::string(kOutgoingTransformAbiValidator), ValidateOutgoingTransformAbi);
@@ -702,7 +702,28 @@ FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
         std::string(kCombatReflectionValidator), ValidateCombatReflectionLayout);
     validators.Register(std::string(kSkillsLayoutValidator), ValidateSkillsLayout);
     validators.Register(std::string(kSkillInvocationValidator), ValidateSkillsLayout);
-    if (preserve_actor_process_event_abi) {
+    if (preserve_hooked_process_event_abi) {
+        validators.Register(
+            std::string(kUe5ProcessEventAbiValidator), [](
+                const BuildProfile&,
+                const std::string_view feature,
+                const ProfileResolutionSnapshot& snapshot,
+                const SymbolMemory&) {
+                if (feature != kUe5ProcessEventFeature) {
+                    return FeatureValidationResult{
+                        false,
+                        "startup ProcessEvent ABI evidence used by another feature"};
+                }
+                const auto* const process_event =
+                    snapshot.FindSymbol(kUe5ProcessEventSymbol);
+                if (process_event == nullptr || !process_event->Available()) {
+                    return FeatureValidationResult{
+                        false, "ue5.ProcessEvent is unavailable"};
+                }
+                // Runtime owns the entry bytes after installing its detour. The
+                // unhooked ABI was validated before the adapter was constructed.
+                return FeatureValidationResult{true, {}};
+            });
         validators.Register(
             std::string(kUe5ActorProcessEventAbiValidator), [](
                 const BuildProfile&,
@@ -1135,7 +1156,7 @@ public:
                     if (adapter) {
                         adapter->OnGameTick(delta);
                         if (damage_hook != nullptr && !damage_hook->Attempted() &&
-                            event_target != nullptr) {
+                            event_target != nullptr && adapter->CombatFeatureAvailable()) {
                             static_cast<void>(damage_hook->Start(
                                 {const_cast<void*>(event_target)}));
                         }
