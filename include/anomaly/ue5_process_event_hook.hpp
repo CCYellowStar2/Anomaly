@@ -21,9 +21,13 @@ public:
         std::uintptr_t function,
         void* parameters,
         const Ue5ProcessEventInvoker& original)>;
+    using PreCallback = std::function<void(
+        std::uintptr_t object, std::uintptr_t function, void* parameters)>;
 
-    explicit Ue5ProcessEventHook(Callback callback);
-    Ue5ProcessEventHook(std::unique_ptr<HookBackend> backend, Callback callback);
+    explicit Ue5ProcessEventHook(Callback callback, PreCallback pre_callback = {});
+    Ue5ProcessEventHook(
+        std::unique_ptr<HookBackend> backend, Callback callback,
+        PreCallback pre_callback = {});
     ~Ue5ProcessEventHook();
 
     Ue5ProcessEventHook(const Ue5ProcessEventHook&) = delete;

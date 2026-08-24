@@ -62,7 +62,10 @@ public:
     Ue5NteAdapter(const Ue5NteAdapter&) = delete;
     Ue5NteAdapter& operator=(const Ue5NteAdapter&) = delete;
 
-    [[nodiscard]] bool Start(bool framework_hook_ready, bool ahud_hook_ready = false);
+    [[nodiscard]] bool Start(
+        bool framework_hook_ready,
+        bool ahud_hook_ready = false,
+        bool process_event_hook_ready = false);
     // Closes cached service tables, detaches callbacks, and revokes registry
     // entries before draining state/callback work. Callback target destruction
     // is deferred off the lifecycle caller. A false result keeps the generation
@@ -82,14 +85,17 @@ public:
         std::uintptr_t victim,
         std::uintptr_t attacker,
         std::uintptr_t damage_causer) noexcept;
-    // Called only by the separately owned Actor ProcessEvent wrapper detour
-    // after the wrapper has completed. Damage capture uses the exact native
-    // CharacterOnDamaged broadcast and never enters through this broad wrapper.
+    // Called by the shared UObject ProcessEvent detour after the original
+    // function completes. Damage capture uses the exact native
+    // CharacterOnDamaged broadcast and never enters through this broad hook.
     void OnProcessEvent(
         std::uintptr_t object,
         std::uintptr_t function,
         void* parameters,
-        const ProcessEventInvoker& actor_process_event) noexcept;
+        const ProcessEventInvoker& process_event) noexcept;
+    void OnProcessEventPre(
+        std::uintptr_t object, std::uintptr_t function,
+        void* parameters) noexcept;
 
     [[nodiscard]] bool Started() const noexcept;
     [[nodiscard]] DWORD GameThreadId() const noexcept;

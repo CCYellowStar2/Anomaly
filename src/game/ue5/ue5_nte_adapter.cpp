@@ -562,6 +562,7 @@ struct Ue5NteAdapter::State {
     struct SemanticServiceEndpoint;
     struct CallbackEndpoint;
     struct AhudServiceEndpoint;
+    struct ProcessEventServiceEndpoint;
 
     BuildFingerprint fingerprint;
     BuildProfile profile;
@@ -919,6 +920,7 @@ struct Ue5NteAdapter::State {
     std::uint64_t entity_page_cache_hit_count{};
     bool framework_hook_ready{};
     bool ahud_hook_ready{};
+    bool process_event_hook_ready{};
     std::shared_ptr<NteNavigationInputPolicy> navigation_input_policy;
     std::uint64_t deferred_resolution_retry_sequence{1};
     std::vector<std::pair<std::string, const void*>> published;
@@ -931,6 +933,8 @@ struct Ue5NteAdapter::State {
     std::shared_ptr<CallbackEndpoint> draining_callback_endpoint;
     std::atomic<std::shared_ptr<AhudServiceEndpoint>> ahud_endpoint;
     std::shared_ptr<AhudServiceEndpoint> draining_ahud_endpoint;
+    std::atomic<std::shared_ptr<ProcessEventServiceEndpoint>> process_event_endpoint;
+    std::shared_ptr<ProcessEventServiceEndpoint> draining_process_event_endpoint;
 
     const ResolvedSymbol* Symbol(std::string_view id) const noexcept {
         return resolution.FindSymbol(id);
@@ -1682,6 +1686,11 @@ struct Ue5NteAdapter::State {
         if (id == ANOMALY_UE5_FRAMEWORK_SERVICE_V1_ID) {
             return framework_hook_ready && resolution.FeatureAvailable("ue5.framework");
         }
+        if (id == ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_ID) {
+            return framework_hook_ready && process_event_hook_ready &&
+                resolution.FeatureAvailable(kUe5ProcessEventFeature) &&
+                process_event_endpoint.load(std::memory_order_acquire) != nullptr;
+        }
         if (id == ANOMALY_UE5_AHUD_SERVICE_V1_ID) {
             return AhudFeatureAvailable();
         }
@@ -2005,6 +2014,7 @@ struct Ue5NteAdapter::State {
         navigation = {};
         framework_hook_ready = false;
         ahud_hook_ready = false;
+        process_event_hook_ready = false;
         InvalidateAhudBindingLocked();
         InvalidateCombatSkillDiscoveryLocked();
     }
@@ -8797,6 +8807,204 @@ private:
     bool closed_{};
 };
 
+struct Ue5NteAdapter::State::ProcessEventServiceEndpoint final {
+    struct Subscription final {
+        Subscription(
+            const std::uint64_t id_value, const std::uint64_t generation_value,
+            const AnomalyUe5ProcessEventCallbackV1 callback_value,
+            void* const callback_user_value) noexcept
+            : id(id_value), generation(generation_value), callback(callback_value),
+              callback_user(callback_user_value) {}
+        const std::uint64_t id{};
+        const std::uint64_t generation{};
+        const AnomalyUe5ProcessEventCallbackV1 callback{};
+        void* const callback_user{};
+        AdmissionGate gate;
+    };
+
+    using SubscriptionList = std::vector<std::shared_ptr<Subscription>>;
+
+    class ServiceLease final {
+    public:
+        ServiceLease() = default;
+        ServiceLease(ProcessEventServiceEndpoint* endpoint,
+                     std::shared_ptr<State> state) noexcept
+            : endpoint_(endpoint), state_(std::move(state)) {}
+        ServiceLease(const ServiceLease&) = delete;
+        ServiceLease(ServiceLease&& other) noexcept
+            : endpoint_(std::exchange(other.endpoint_, nullptr)),
+              state_(std::move(other.state_)) {}
+        ~ServiceLease() { Release(); }
+        [[nodiscard]] explicit operator bool() const noexcept { return state_ != nullptr; }
+        [[nodiscard]] const std::shared_ptr<State>& StateOwner() const noexcept {
+            return state_;
+        }
+    private:
+        void Release() noexcept {
+            if (endpoint_ == nullptr) return;
+            state_.reset();
+            endpoint_->gate_.Leave();
+            endpoint_ = nullptr;
+        }
+        ProcessEventServiceEndpoint* endpoint_{};
+        std::shared_ptr<State> state_;
+    };
+
+    ProcessEventServiceEndpoint(std::weak_ptr<State> state, const std::uint64_t generation) noexcept
+        : state_(std::move(state)), generation_(generation == 0 ? 1 : generation) {
+        service = {sizeof(AnomalyUe5ProcessEventServiceV1),
+                   ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_VERSION, this,
+                   SubscribeThunk, UnsubscribeThunk};
+        subscriptions_snapshot_.store(
+            std::make_shared<const SubscriptionList>(), std::memory_order_release);
+    }
+
+    ServiceLease Acquire() noexcept {
+        if (!gate_.TryEnter()) return {};
+        auto state = state_.lock();
+        if (!state) {
+            gate_.Leave();
+            return {};
+        }
+        return ServiceLease(this, std::move(state));
+    }
+
+    void Close() noexcept {
+        gate_.Close();
+        callback_gate_.Close();
+        std::scoped_lock lock(mutex_);
+        closed_.store(true, std::memory_order_release);
+        for (const auto& [id, subscription] : subscriptions_) {
+            static_cast<void>(id);
+            subscription->gate.Close();
+        }
+    }
+
+    bool DrainUntil(const std::chrono::steady_clock::time_point deadline) noexcept {
+        if (!gate_.DrainUntil(deadline) || !callback_gate_.DrainUntil(deadline)) return false;
+        const auto subscriptions = subscriptions_snapshot_.load(std::memory_order_acquire);
+        return subscriptions != nullptr && std::ranges::all_of(*subscriptions, [deadline](const auto& subscription) {
+            return subscription->gate.DrainUntil(deadline);
+        });
+    }
+
+    void Dispatch(const std::uintptr_t object, const std::uintptr_t function,
+                  void* const parameters) noexcept {
+        if (object == 0 || function == 0) return;
+        try {
+            const auto subscriptions = subscriptions_snapshot_.load(std::memory_order_acquire);
+            if (closed_.load(std::memory_order_acquire) || subscriptions == nullptr) return;
+            for (const auto& subscription : *subscriptions) {
+                if (!callback_gate_.TryEnter()) return;
+                const auto leave = std::unique_ptr<AdmissionGate, void(*)(AdmissionGate*)>(
+                    &callback_gate_, [](AdmissionGate* gate) { gate->Leave(); });
+                if (!subscription->gate.TryEnter()) continue;
+                try {
+                    subscription->callback(subscription->callback_user, object, function,
+                                           parameters);
+                } catch (...) {
+                }
+                subscription->gate.Leave();
+            }
+        } catch (...) {
+        }
+    }
+
+    AnomalyUe5ProcessEventServiceV1 service{};
+
+private:
+    static AnomalyStatusV1 StoppedStatus() noexcept {
+        return Status(ANOMALY_STATUS_V1_UNAVAILABLE, "ProcessEvent service is stopped");
+    }
+
+    AnomalyStatusV1 Subscribe(const std::shared_ptr<State>& state,
+                              const AnomalyUe5ProcessEventCallbackV1 callback,
+                              void* const callback_user,
+                              AnomalyGenerationHandleV1* const handle) noexcept {
+        if (handle == nullptr || callback == nullptr) {
+            return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT,
+                          "ProcessEvent subscription callback and handle are required");
+        }
+        *handle = {};
+        if (!state->started.load(std::memory_order_acquire) ||
+            !state->framework_hook_ready || !state->process_event_hook_ready) {
+            return StoppedStatus();
+        }
+        try {
+            std::scoped_lock lock(mutex_);
+            if (closed_.load(std::memory_order_acquire) ||
+                next_id_ == (std::numeric_limits<std::uint64_t>::max)()) {
+                return StoppedStatus();
+            }
+            const auto id = ++next_id_;
+            auto subscription = std::make_shared<Subscription>(
+                id, generation_, callback, callback_user);
+            subscriptions_.emplace(id, subscription);
+            auto next = std::make_shared<SubscriptionList>();
+            const auto current = subscriptions_snapshot_.load(std::memory_order_acquire);
+            if (current != nullptr) *next = *current;
+            next->push_back(std::move(subscription));
+            subscriptions_snapshot_.store(std::move(next), std::memory_order_release);
+            *handle = {id, generation_};
+            return Status(ANOMALY_STATUS_V1_OK);
+        } catch (...) {
+            return Status(ANOMALY_STATUS_V1_FAILED, "ProcessEvent subscription allocation failed");
+        }
+    }
+
+    AnomalyStatusV1 Unsubscribe(const AnomalyGenerationHandleV1 handle) noexcept {
+        std::shared_ptr<Subscription> subscription;
+        {
+            std::scoped_lock lock(mutex_);
+            const auto found = subscriptions_.find(handle.id);
+            if (handle.id == 0 || handle.generation != generation_ ||
+                found == subscriptions_.end()) {
+                return Status(ANOMALY_STATUS_V1_NOT_FOUND,
+                              "ProcessEvent subscription handle is not found");
+            }
+            subscription = std::move(found->second);
+            subscriptions_.erase(found);
+            auto next = std::make_shared<SubscriptionList>();
+            next->reserve(subscriptions_.size());
+            for (const auto& [id, candidate] : subscriptions_) {
+                static_cast<void>(id);
+                next->push_back(candidate);
+            }
+            subscriptions_snapshot_.store(std::move(next), std::memory_order_release);
+        }
+        subscription->gate.Close();
+        return subscription->gate.DrainUntil(std::chrono::steady_clock::time_point::max())
+            ? Status(ANOMALY_STATUS_V1_OK)
+            : Status(ANOMALY_STATUS_V1_TIMEOUT, "ProcessEvent subscription drain timed out");
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL SubscribeThunk(
+        void* user, const AnomalyUe5ProcessEventCallbackV1 callback,
+        void* callback_user, AnomalyGenerationHandleV1* handle) noexcept {
+        auto* endpoint = static_cast<ProcessEventServiceEndpoint*>(user);
+        auto lease = endpoint->Acquire();
+        return lease ? endpoint->Subscribe(lease.StateOwner(), callback, callback_user, handle)
+                     : StoppedStatus();
+    }
+
+    static AnomalyStatusV1 ANOMALY_CALL UnsubscribeThunk(
+        void* user, const AnomalyGenerationHandleV1 handle) noexcept {
+        auto* endpoint = static_cast<ProcessEventServiceEndpoint*>(user);
+        auto lease = endpoint->Acquire();
+        return lease ? endpoint->Unsubscribe(handle) : StoppedStatus();
+    }
+
+    std::weak_ptr<State> state_;
+    const std::uint64_t generation_{};
+    AdmissionGate gate_;
+    AdmissionGate callback_gate_;
+    mutable std::mutex mutex_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<Subscription>> subscriptions_;
+    std::atomic<std::shared_ptr<const SubscriptionList>> subscriptions_snapshot_;
+    std::uint64_t next_id_{};
+    std::atomic_bool closed_{};
+};
+
 void Ue5NteAdapter::State::DispatchAhudFrame(
     const std::uintptr_t object,
     const std::uintptr_t function,
@@ -8871,6 +9079,22 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             ANOMALY_UE5_FRAMEWORK_SERVICE_V1_VERSION,
             &endpoint->framework_service,
             {}, semantic_lifetime)) {
+        return false;
+    }
+    const auto current_process_event_endpoint =
+        process_event_endpoint.load(std::memory_order_acquire);
+    // ProcessEvent is the shared ingress used by plugins and does not depend
+    // on the optional AHUD reflection binding.  Publishing it only after the
+    // AHUD gate leaves subscribers stuck in waiting-for-service even though
+    // the core ProcessEvent hook is already active.
+    if (framework_hook_ready && process_event_hook_ready &&
+        resolution.FeatureAvailable("ue5.process-event") &&
+        current_process_event_endpoint &&
+        !PublishIfMissing(
+            ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_ID,
+            ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_VERSION,
+            &current_process_event_endpoint->service,
+            {}, std::static_pointer_cast<const void>(current_process_event_endpoint))) {
         return false;
     }
     const auto current_ahud_endpoint = ahud_endpoint.load(std::memory_order_acquire);
@@ -9114,22 +9338,29 @@ Ue5NteAdapter::~Ue5NteAdapter() {
     static_cast<void>(Stop(std::chrono::milliseconds::zero()));
 }
 
-bool Ue5NteAdapter::Start(bool framework_hook_ready, bool ahud_hook_ready) {
+bool Ue5NteAdapter::Start(
+    bool framework_hook_ready, bool ahud_hook_ready,
+    bool process_event_hook_ready) {
     const auto state = state_;
     std::shared_ptr<State::SemanticServiceEndpoint> retired_semantic_endpoint;
     std::shared_ptr<State::CallbackEndpoint> retired_callback_endpoint;
     std::shared_ptr<State::AhudServiceEndpoint> retired_ahud_endpoint;
+    std::shared_ptr<State::ProcessEventServiceEndpoint> retired_process_event_endpoint;
     std::unique_lock<std::timed_mutex> lifecycle_lock(state->lifecycle_mutex);
     if (state->stopping.load(std::memory_order_acquire) ||
         state->semantic_endpoint.load(std::memory_order_acquire) ||
         state->callback_endpoint.load(std::memory_order_acquire) ||
         state->ahud_endpoint.load(std::memory_order_acquire) ||
+        state->process_event_endpoint.load(std::memory_order_acquire) ||
         (state->draining_semantic_endpoint &&
             !state->draining_semantic_endpoint->IsDrained()) ||
         (state->draining_callback_endpoint &&
             !state->draining_callback_endpoint->IsDrained()) ||
         (state->draining_ahud_endpoint &&
-            !state->draining_ahud_endpoint->IsDrained())) {
+            !state->draining_ahud_endpoint->IsDrained()) ||
+        (state->draining_process_event_endpoint &&
+            !state->draining_process_event_endpoint->DrainUntil(
+                std::chrono::steady_clock::now()))) {
         return false;
     }
     std::unique_lock<std::timed_mutex> lock(state->mutex);
@@ -9139,11 +9370,13 @@ bool Ue5NteAdapter::Start(bool framework_hook_ready, bool ahud_hook_ready) {
     retired_semantic_endpoint = std::move(state->draining_semantic_endpoint);
     retired_callback_endpoint = std::move(state->draining_callback_endpoint);
     retired_ahud_endpoint = std::move(state->draining_ahud_endpoint);
+    retired_process_event_endpoint = std::move(state->draining_process_event_endpoint);
     const auto lifecycle_generation =
         state->lifecycle_epoch.fetch_add(1, std::memory_order_acq_rel) + 1U;
     state->ResetForStartLocked();
     state->framework_hook_ready = framework_hook_ready;
     state->ahud_hook_ready = ahud_hook_ready;
+    state->process_event_hook_ready = process_event_hook_ready;
     if (framework_hook_ready) {
         static_cast<void>(state->EnsureNavigationInputPolicyLocked());
     }
@@ -9156,6 +9389,9 @@ bool Ue5NteAdapter::Start(bool framework_hook_ready, bool ahud_hook_ready) {
         std::memory_order_release);
     state->ahud_endpoint.store(
         std::make_shared<State::AhudServiceEndpoint>(state, lifecycle_generation),
+        std::memory_order_release);
+    state->process_event_endpoint.store(
+        std::make_shared<State::ProcessEventServiceEndpoint>(state, lifecycle_generation),
         std::memory_order_release);
     const auto first_service = state->PublishedCount();
     if (state->PublishAvailableServices(state)) {
@@ -9171,6 +9407,9 @@ bool Ue5NteAdapter::Start(bool framework_hook_ready, bool ahud_hook_ready) {
     if (failed_endpoint) failed_endpoint->Close();
     if (failed_callback_endpoint) failed_callback_endpoint->Close();
     if (failed_ahud_endpoint) failed_ahud_endpoint->Close();
+    const auto failed_process_event_endpoint = state->process_event_endpoint.exchange(
+        std::shared_ptr<State::ProcessEventServiceEndpoint>{}, std::memory_order_acq_rel);
+    if (failed_process_event_endpoint) failed_process_event_endpoint->Close();
     state->RevokePublishedFrom(first_service);
     if (state->navigation_input_policy != nullptr) {
         static_cast<void>(state->navigation_input_policy->Stop());
@@ -9194,6 +9433,7 @@ bool Ue5NteAdapter::Stop(std::chrono::milliseconds timeout) noexcept {
     std::shared_ptr<State::SemanticServiceEndpoint> semantic_endpoint;
     std::shared_ptr<State::CallbackEndpoint> callback_endpoint;
     std::shared_ptr<State::AhudServiceEndpoint> ahud_endpoint;
+    std::shared_ptr<State::ProcessEventServiceEndpoint> process_event_endpoint;
     std::shared_ptr<const TickCallback> detached_endpoint_callback;
     std::shared_ptr<const TickCallback> detached_configured_callback;
 
@@ -9248,6 +9488,17 @@ bool Ue5NteAdapter::Stop(std::chrono::milliseconds timeout) noexcept {
         ahud_endpoint = state->draining_ahud_endpoint;
         if (ahud_endpoint) ahud_endpoint->Close();
     }
+    process_event_endpoint = state->process_event_endpoint.exchange(
+        std::shared_ptr<State::ProcessEventServiceEndpoint>{}, std::memory_order_acq_rel);
+    if (process_event_endpoint) {
+        process_event_endpoint->Close();
+        if (!state->draining_process_event_endpoint) {
+            state->draining_process_event_endpoint = process_event_endpoint;
+        }
+    } else {
+        process_event_endpoint = state->draining_process_event_endpoint;
+        if (process_event_endpoint) process_event_endpoint->Close();
+    }
     detached_configured_callback = state->configured_tick_callback.exchange(
         {}, std::memory_order_acq_rel);
     lifecycle_lock.unlock();
@@ -9267,6 +9518,7 @@ bool Ue5NteAdapter::Stop(std::chrono::milliseconds timeout) noexcept {
 
     if (called_by_active_callback) return false;
     if (ahud_endpoint && !ahud_endpoint->DrainUntil(deadline)) return false;
+    if (process_event_endpoint && !process_event_endpoint->DrainUntil(deadline)) return false;
     if (callback_endpoint && !callback_endpoint->DrainUntil(deadline)) return false;
     if (semantic_endpoint && !semantic_endpoint->DrainUntil(deadline)) return false;
 
@@ -9290,6 +9542,7 @@ bool Ue5NteAdapter::Stop(std::chrono::milliseconds timeout) noexcept {
     std::shared_ptr<State::SemanticServiceEndpoint> retired_semantic_endpoint;
     std::shared_ptr<State::CallbackEndpoint> retired_callback_endpoint;
     std::shared_ptr<State::AhudServiceEndpoint> retired_ahud_endpoint;
+    std::shared_ptr<State::ProcessEventServiceEndpoint> retired_process_event_endpoint;
     if (state->draining_semantic_endpoint == semantic_endpoint) {
         retired_semantic_endpoint = std::move(state->draining_semantic_endpoint);
     }
@@ -9299,9 +9552,13 @@ bool Ue5NteAdapter::Stop(std::chrono::milliseconds timeout) noexcept {
     if (state->draining_ahud_endpoint == ahud_endpoint) {
         retired_ahud_endpoint = std::move(state->draining_ahud_endpoint);
     }
+    if (state->draining_process_event_endpoint == process_event_endpoint) {
+        retired_process_event_endpoint = std::move(state->draining_process_event_endpoint);
+    }
     if (!state->semantic_endpoint.load(std::memory_order_acquire) &&
         !state->callback_endpoint.load(std::memory_order_acquire) &&
-        !state->ahud_endpoint.load(std::memory_order_acquire)) {
+        !state->ahud_endpoint.load(std::memory_order_acquire) &&
+        !state->process_event_endpoint.load(std::memory_order_acquire)) {
         state->stopping.store(false, std::memory_order_release);
     }
     final_lifecycle_lock.unlock();
@@ -9483,6 +9740,20 @@ void Ue5NteAdapter::OnProcessEvent(
     const ProcessEventInvoker& actor_process_event) noexcept {
     const auto state = state_;
     state->DispatchAhudFrame(object, function, parameters, actor_process_event);
+}
+
+void Ue5NteAdapter::OnProcessEventPre(
+    const std::uintptr_t object, const std::uintptr_t function,
+    void* const parameters) noexcept {
+    const auto state = state_;
+    // ProcessEvent can be entered from worker threads while UE is booting.
+    // The shared SDK contract is game-thread delivery; dropping pre-taps from
+    // other threads also keeps subscriber code out of loader/worker paths.
+    if (GetCurrentThreadId() != state->game_thread_id.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto endpoint = state->process_event_endpoint.load(std::memory_order_acquire);
+    if (endpoint) endpoint->Dispatch(object, function, parameters);
 }
 
 bool Ue5NteAdapter::Started() const noexcept {

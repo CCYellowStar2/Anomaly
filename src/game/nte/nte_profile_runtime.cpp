@@ -1172,19 +1172,21 @@ public:
             if (!hook_ready) diagnostics_.push_back("game tick hook activation failed");
         }
         bool ahud_hook_ready{};
-        const auto* const actor_process_event =
-            resolution_->FindSymbol(kUe5ActorProcessEventSymbol);
-        const bool needs_actor_process_event = profile_ &&
-            profile_->features.contains(std::string(kAhudFeature));
-        if (needs_actor_process_event) {
+        bool process_event_hook_ready{};
+        const auto* const process_event =
+            resolution_->FindSymbol(kUe5ProcessEventSymbol);
+        // ProcessEvent is a shared framework ingress. It is activated once by
+        // the runtime and fanned out to all SDK subscribers.
+        const bool needs_process_event = profile_ &&
+            profile_->features.contains(std::string(kUe5ProcessEventFeature));
+        if (needs_process_event) {
             if (!hook_ready) {
                 diagnostics_.push_back(
-                    "optional Actor ProcessEvent capabilities unavailable: game tick hook failed");
+                    "optional ProcessEvent capabilities unavailable: game tick hook failed");
             } else if (!resolution_->FeatureAvailable(kUe5ProcessEventFeature) ||
-                !resolution_->FeatureAvailable(kUe5ActorProcessEventFeature) ||
-                actor_process_event == nullptr || !actor_process_event->Available()) {
+                process_event == nullptr || !process_event->Available()) {
                 diagnostics_.push_back(
-                    "optional Actor ProcessEvent capabilities unavailable: gate failed");
+                    "optional ProcessEvent capabilities unavailable: gate failed");
             } else {
                 try {
                     process_event_hook_ = std::make_unique<Ue5ProcessEventHook>(
@@ -1198,16 +1200,26 @@ public:
                                 adapter->OnProcessEvent(
                                     object, function, parameters, original);
                             }
+                        },
+                        [weak = std::weak_ptr<Ue5NteAdapter>(adapter_)](
+                            const std::uintptr_t object,
+                            const std::uintptr_t function,
+                            void* const parameters) {
+                            const auto adapter = weak.lock();
+                            if (adapter) {
+                                adapter->OnProcessEventPre(object, function, parameters);
+                            }
                         });
                     ahud_hook_ready = process_event_hook_->Start(
-                        reinterpret_cast<void*>(actor_process_event->address));
+                        reinterpret_cast<void*>(process_event->address));
+                    process_event_hook_ready = ahud_hook_ready;
                     if (!ahud_hook_ready) {
                         diagnostics_.push_back(
-                            "Actor ProcessEvent hook activation failed");
+                            "ProcessEvent hook activation failed");
                     }
                 } catch (...) {
                     process_event_hook_.reset();
-                    diagnostics_.push_back("Actor ProcessEvent hook allocation failed");
+                    diagnostics_.push_back("ProcessEvent hook allocation failed");
                 }
                 if (ahud_hook_ready && !resolution_->FeatureAvailable(kAhudFeature)) {
                     diagnostics_.push_back(
@@ -1215,7 +1227,7 @@ public:
                 }
             }
         }
-        if (!adapter_->Start(hook_ready, ahud_hook_ready)) {
+        if (!adapter_->Start(hook_ready, ahud_hook_ready, process_event_hook_ready)) {
             diagnostics_.push_back("adapter service publication failed");
             if (tick_evidence_gate_) tick_evidence_gate_->Close();
             const bool process_event_hook_stopped =
