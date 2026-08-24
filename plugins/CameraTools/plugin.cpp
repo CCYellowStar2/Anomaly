@@ -147,8 +147,12 @@ bool ConfigReady(const AnomalyConfigServiceV1 *service) noexcept {
   return HasField<AnomalyConfigServiceV1,
                   decltype(AnomalyConfigServiceV1::write_atomic)>(
              service, offsetof(AnomalyConfigServiceV1, write_atomic)) &&
+         HasField<AnomalyConfigServiceV1,
+                  decltype(AnomalyConfigServiceV1::unregister_schema)>(
+             service, offsetof(AnomalyConfigServiceV1, unregister_schema)) &&
          service->register_schema != nullptr && service->read != nullptr &&
-         service->write_atomic != nullptr;
+         service->write_atomic != nullptr &&
+         service->unregister_schema != nullptr;
 }
 
 bool InputReady(const AnomalyInputServiceV1 *service) noexcept {
@@ -676,6 +680,20 @@ void ReleaseToggleHotkey(Context &context) noexcept {
   context.toggle_hotkey = {};
 }
 
+void ReleaseSettingsSchema(Context &context) noexcept {
+  if (context.settings_schema.id == 0 || context.config == nullptr ||
+      !HasField<AnomalyConfigServiceV1,
+                decltype(AnomalyConfigServiceV1::unregister_schema)>(
+          context.config, offsetof(AnomalyConfigServiceV1, unregister_schema)) ||
+      context.config->unregister_schema == nullptr) {
+    context.settings_schema = {};
+    return;
+  }
+  static_cast<void>(context.config->unregister_schema(
+      context.config->user, context.settings_schema));
+  context.settings_schema = {};
+}
+
 bool ReplaceToggleHotkey(Context &context, const std::uint32_t key) noexcept {
   const auto current = context.toggle_key.load(std::memory_order_acquire);
   if (key == current)
@@ -986,6 +1004,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1 *host,
       &context->settings_schema);
   if (schema_status.code != ANOMALY_STATUS_V1_OK ||
       context->settings_schema.id == 0 || !LoadSettings(*context)) {
+    ReleaseSettingsSchema(*context);
     delete context;
     return Status(ANOMALY_STATUS_V1_FAILED,
                   "camera tools settings are invalid");
@@ -1183,6 +1202,9 @@ void ANOMALY_CALL Unload(void *plugin_context) {
   if (context == nullptr)
     return;
   static_cast<void>(Stop(context, 0));
+  // A deferred start reuses this generation and calls on_load again. Release
+  // the schema explicitly so that retry can register the same stable id.
+  ReleaseSettingsSchema(*context);
   delete context;
 }
 
