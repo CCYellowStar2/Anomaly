@@ -28,6 +28,7 @@ constexpr std::uint64_t kSettingsSaveDelayMilliseconds = 500;
 constexpr double kDegreesToRadians = 3.14159265358979323846 / 180.0;
 constexpr double kDefaultDistance = 0.0;
 constexpr float kDefaultSpeed = 800.0F;
+constexpr std::uint32_t kDefaultTeleportKey = '1';
 constexpr float kMinimumSpeed = 100.0F;
 constexpr float kMaximumSpeed = 5000.0F;
 constexpr double kBoostMultiplier = 4.0;
@@ -49,7 +50,8 @@ constexpr std::string_view kSettingsSchema = R"json(
     "freeCameraEnabled":{"type":"boolean"},
     "lodFollowsCamera":{"type":"boolean","default":false},
     "speed":{"type":"number","minimum":100.0,"maximum":5000.0},
-    "toggle":{"type":"integer","minimum":1,"maximum":255}
+    "toggle":{"type":"integer","minimum":1,"maximum":255},
+    "teleport":{"type":"integer","minimum":1,"maximum":255}
   }
 }
 )json";
@@ -59,6 +61,7 @@ using PlayerInputKeyFn = bool(ANOMALY_CALL *)(void *, const void *);
 using StreamingSourceFn = void(ANOMALY_CALL *)(void *, double *, double *);
 
 struct Context final {
+  const AnomalyHostApiV1 *host{};
   anomaly::plugins::Localizer localizer;
   const AnomalyCoreServiceV1 *core{};
   const AnomalyConfigServiceV1 *config{};
@@ -68,17 +71,24 @@ struct Context final {
   const AnomalyHookServiceV1 *hook{};
   AnomalyGenerationHandleV1 settings_schema{};
   AnomalyGenerationHandleV1 toggle_hotkey{};
+  AnomalyGenerationHandleV1 teleport_hotkey{};
   AnomalyGenerationHandleV1 view_point_hook{};
   AnomalyGenerationHandleV1 input_key_hook{};
   AnomalyGenerationHandleV1 streaming_source_hook{};
   std::atomic<double> distance{kDefaultDistance};
   std::atomic<float> speed{kDefaultSpeed};
   std::atomic<std::uint32_t> toggle_key{VK_F6};
+  std::atomic<std::uint32_t> teleport_key{kDefaultTeleportKey};
   std::atomic_bool capturing_toggle{};
+  std::atomic_bool capturing_teleport{};
   std::atomic_bool enabled{};
   std::atomic_bool configured_enabled{};
   std::atomic_bool active{};
+  std::atomic_bool camera_position_valid{};
   std::atomic_bool streaming_source_follows_camera{};
+  std::atomic_bool developer_mode{};
+  std::atomic_bool teleport_pending{};
+  std::atomic<std::uint32_t> teleport_status{ANOMALY_STATUS_V1_UNAVAILABLE};
   std::atomic<std::uint64_t> settings_revision{};
   std::atomic<std::uint64_t> persisted_settings_revision{};
   std::atomic<std::uint64_t> settings_changed_at{};
@@ -96,6 +106,7 @@ struct Context final {
   std::array<std::atomic<double>, 3> position{};
   std::array<std::atomic<double>, 3> rotation{};
   std::array<std::atomic<double>, 3> observed_rotation{};
+  std::array<std::atomic<double>, 3> teleport_position{};
 };
 
 std::atomic<Context *> g_active{};
@@ -176,6 +187,37 @@ bool UiReady(const AnomalyUiServiceV1 *service) noexcept {
          service->table_next_row != nullptr &&
          service->table_next_column != nullptr &&
          service->end_table != nullptr && service->input_double != nullptr;
+}
+
+bool DeveloperModeEnabled(const AnomalyUiServiceV1 *service) noexcept {
+  return HasField<AnomalyUiServiceV1,
+                  decltype(AnomalyUiServiceV1::developer_mode_enabled)>(
+             service, offsetof(AnomalyUiServiceV1, developer_mode_enabled)) &&
+         service->developer_mode_enabled != nullptr &&
+         service->developer_mode_enabled(service->user) != 0;
+}
+
+bool CurrentWorld(const AnomalyNteSessionSnapshotV1 &snapshot) noexcept {
+  return snapshot.struct_size >= sizeof(snapshot) &&
+         snapshot.state == ANOMALY_NTE_SESSION_V1_WORLD_READY &&
+         snapshot.world.id != 0 && snapshot.world.generation != 0;
+}
+
+bool CurrentPlayer(const AnomalyNtePlayerSnapshotV1 &snapshot) noexcept {
+  return snapshot.struct_size >= sizeof(snapshot) &&
+         (snapshot.flags & ANOMALY_NTE_SNAPSHOT_V1_VALID) != 0 &&
+         (snapshot.flags & (ANOMALY_NTE_SNAPSHOT_V1_STALE |
+                            ANOMALY_NTE_SNAPSHOT_V1_PARTIAL)) == 0 &&
+         snapshot.handle.id != 0 && snapshot.handle.generation != 0;
+}
+
+bool SnapshotPosition(const std::array<std::atomic<double>, 3> &position,
+                      std::array<double, 3> &snapshot) noexcept {
+  for (std::size_t axis{}; axis != snapshot.size(); ++axis) {
+    snapshot[axis] = position[axis].load(std::memory_order_acquire);
+    if (!std::isfinite(snapshot[axis])) return false;
+  }
+  return true;
 }
 
 bool SignatureReady(const AnomalySignatureServiceV1 *service) noexcept {
@@ -372,12 +414,14 @@ void RefreshCameraManager(Context &context) noexcept {
   std::uintptr_t manager{};
   if (!ResolveActiveCameraManager(context, manager)) {
     context.camera_manager.store(0, std::memory_order_release);
+    context.camera_position_valid.store(false, std::memory_order_release);
     context.active.store(false, std::memory_order_release);
     return;
   }
   const auto previous =
       context.camera_manager.exchange(manager, std::memory_order_acq_rel);
   if (previous != manager) {
+    context.camera_position_valid.store(false, std::memory_order_release);
     context.active.store(false, std::memory_order_release);
     Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
         "camera tools active CameraManager validated");
@@ -510,10 +554,11 @@ std::string VirtualKeyName(const Context &context, const std::uint32_t key) {
 }
 
 bool SettingsValid(const double distance, const float speed,
-                   const std::uint32_t toggle) noexcept {
+                   const std::uint32_t toggle,
+                   const std::uint32_t teleport) noexcept {
   return DistanceValid(distance) && std::isfinite(speed) &&
          speed >= kMinimumSpeed && speed <= kMaximumSpeed && toggle > 0 &&
-         toggle < 256U;
+         toggle < 256U && teleport > 0 && teleport < 256U;
 }
 
 void MarkSettingsDirty(Context &context) noexcept {
@@ -526,8 +571,9 @@ bool PersistSettings(Context &context) noexcept {
   const double distance = context.distance.load(std::memory_order_acquire);
   const float speed = context.speed.load(std::memory_order_acquire);
   const auto toggle = context.toggle_key.load(std::memory_order_acquire);
+  const auto teleport = context.teleport_key.load(std::memory_order_acquire);
   if (!ConfigReady(context.config) ||
-      !SettingsValid(distance, speed, toggle)) {
+      !SettingsValid(distance, speed, toggle, teleport)) {
     return false;
   }
   const auto revision =
@@ -542,7 +588,8 @@ bool PersistSettings(Context &context) noexcept {
              context.streaming_source_follows_camera.load(
                  std::memory_order_acquire)},
             {"speed", speed},
-            {"toggle", toggle}}
+            {"toggle", toggle},
+            {"teleport", teleport}}
             .dump();
     if (context.config
             ->write_atomic(context.config->user,
@@ -570,6 +617,8 @@ bool LoadSettings(Context &context) noexcept {
       context.distance.store(kDefaultDistance, std::memory_order_release);
       context.speed.store(kDefaultSpeed, std::memory_order_release);
       context.toggle_key.store(VK_F6, std::memory_order_release);
+      context.teleport_key.store(kDefaultTeleportKey,
+                                 std::memory_order_release);
       context.configured_enabled.store(false, std::memory_order_release);
       context.enabled.store(false, std::memory_order_release);
       context.streaming_source_follows_camera.store(
@@ -595,22 +644,27 @@ bool LoadSettings(Context &context) noexcept {
     }
     const auto json =
         nlohmann::json::parse(document.begin(), document.begin() + copied);
-    if (!json.is_object() || (json.size() != 4 && json.size() != 5) ||
+    const bool has_lod = json.is_object() && json.contains("lodFollowsCamera");
+    const bool has_teleport = json.is_object() && json.contains("teleport");
+    if (!json.is_object() || json.size() < 4 || json.size() > 6 ||
         !json.contains("distance") || !json.contains("freeCameraEnabled") ||
         !json.contains("speed") || !json.contains("toggle") ||
-        (json.size() == 5 && !json.contains("lodFollowsCamera")))
+        json.size() != 4U + static_cast<std::size_t>(has_lod) +
+                           static_cast<std::size_t>(has_teleport))
       return false;
     const double distance = json.at("distance").get<double>();
     const float speed = json.at("speed").get<float>();
     const auto toggle = json.at("toggle").get<std::uint32_t>();
+    const auto teleport = json.value("teleport", kDefaultTeleportKey);
     const bool enabled = json.at("freeCameraEnabled").get<bool>();
     const bool streaming_source_follows_camera =
         json.value("lodFollowsCamera", false);
-    if (!SettingsValid(distance, speed, toggle))
+    if (!SettingsValid(distance, speed, toggle, teleport))
       return false;
     context.distance.store(distance, std::memory_order_release);
     context.speed.store(speed, std::memory_order_release);
     context.toggle_key.store(toggle, std::memory_order_release);
+    context.teleport_key.store(teleport, std::memory_order_release);
     context.configured_enabled.store(enabled, std::memory_order_release);
     context.enabled.store(enabled, std::memory_order_release);
     context.streaming_source_follows_camera.store(
@@ -642,7 +696,8 @@ void ANOMALY_CALL ToggleHotkey(void *user, AnomalyGenerationHandleV1,
                                const AnomalyInputSnapshotV1 *) noexcept {
   auto *context = static_cast<Context *>(user);
   if (context != nullptr &&
-      !context->capturing_toggle.load(std::memory_order_acquire)) {
+      !context->capturing_toggle.load(std::memory_order_acquire) &&
+      !context->capturing_teleport.load(std::memory_order_acquire)) {
     SetFreeCameraEnabled(
         *context, !context->enabled.load(std::memory_order_acquire));
   }
@@ -736,6 +791,107 @@ void CaptureToggleKey(Context &context) noexcept {
   }
 }
 
+void QueueTeleport(Context &context) noexcept {
+  if (!context.camera_position_valid.load(std::memory_order_acquire)) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  std::array<double, 3> position{};
+  if (!SnapshotPosition(context.position, position)) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  for (std::size_t axis{}; axis != position.size(); ++axis) {
+    context.teleport_position[axis].store(position[axis],
+                                          std::memory_order_release);
+  }
+  context.teleport_pending.store(true, std::memory_order_release);
+}
+
+void ANOMALY_CALL TeleportHotkey(void *user, AnomalyGenerationHandleV1,
+                                 const AnomalyInputSnapshotV1 *) noexcept {
+  auto *context = static_cast<Context *>(user);
+  if (context != nullptr &&
+      context->developer_mode.load(std::memory_order_acquire) &&
+      !context->capturing_toggle.load(std::memory_order_acquire) &&
+      !context->capturing_teleport.load(std::memory_order_acquire)) {
+    QueueTeleport(*context);
+  }
+}
+
+bool RegisterTeleportHotkey(Context &context, const std::uint32_t key,
+                            AnomalyGenerationHandleV1 &handle) noexcept {
+  if (!InputReady(context.input) || key == 0 || key >= 256U) return false;
+  try {
+    const std::string id = "camera-tools-teleport-to-camera-" +
+                           std::to_string(key);
+    AnomalyHotkeySpecV1 spec{sizeof(spec)};
+    spec.virtual_key = key;
+    spec.flags = ANOMALY_HOTKEY_V1_ALLOW_EXTRA_MODIFIERS |
+                 ANOMALY_HOTKEY_V1_ALLOW_WHILE_UI_CAPTURED;
+    spec.id = anomaly::sdk::StringView(id);
+    handle = {};
+    return context.input
+                   ->register_hotkey(context.input->user, &spec,
+                                     TeleportHotkey, &context, &handle)
+                   .code == ANOMALY_STATUS_V1_OK &&
+           handle.id != 0;
+  } catch (...) {
+    handle = {};
+    return false;
+  }
+}
+
+void ReleaseTeleportHotkey(Context &context) noexcept {
+  if (context.teleport_hotkey.id != 0 && InputReady(context.input)) {
+    static_cast<void>(context.input->release_hotkey(
+        context.input->user, context.teleport_hotkey));
+  }
+  context.teleport_hotkey = {};
+}
+
+bool ReplaceTeleportHotkey(Context &context, const std::uint32_t key) noexcept {
+  const auto current = context.teleport_key.load(std::memory_order_acquire);
+  if (key == current) return true;
+  AnomalyGenerationHandleV1 replacement{};
+  if (!RegisterTeleportHotkey(context, key, replacement)) return false;
+  const auto previous = context.teleport_hotkey;
+  if (previous.id == 0 ||
+      context.input->release_hotkey(context.input->user, previous).code !=
+          ANOMALY_STATUS_V1_OK) {
+    static_cast<void>(
+        context.input->release_hotkey(context.input->user, replacement));
+    return false;
+  }
+  context.teleport_hotkey = replacement;
+  context.teleport_key.store(key, std::memory_order_release);
+  MarkSettingsDirty(context);
+  return true;
+}
+
+void CaptureTeleportKey(Context &context) noexcept {
+  int pressed{};
+  if (context.input->was_pressed(context.input->user, VK_ESCAPE, &pressed)
+              .code == ANOMALY_STATUS_V1_OK &&
+      pressed != 0) {
+    context.capturing_teleport.store(false, std::memory_order_release);
+    return;
+  }
+  for (std::uint32_t key = 1; key < 256U; ++key) {
+    if (key == VK_ESCAPE || (key >= VK_LBUTTON && key <= VK_XBUTTON2))
+      continue;
+    pressed = 0;
+    if (context.input->was_pressed(context.input->user, key, &pressed).code ==
+            ANOMALY_STATUS_V1_OK &&
+        pressed != 0 && ReplaceTeleportHotkey(context, key)) {
+      context.capturing_teleport.store(false, std::memory_order_release);
+      return;
+    }
+  }
+}
+
 void ApplyViewDistance(double *location, const double *rotation,
                        const double distance) noexcept {
   if (!DistanceValid(distance) || distance == 0.0)
@@ -803,6 +959,13 @@ void ANOMALY_CALL CameraViewPointDetour(void *object, double *location,
         } else {
           ApplyViewDistance(location, rotation, distance);
         }
+        for (std::size_t axis{}; axis != 3; ++axis) {
+          context->position[axis].store(location[axis],
+                                        std::memory_order_release);
+          context->rotation[axis].store(rotation[axis],
+                                        std::memory_order_release);
+        }
+        context->camera_position_valid.store(true, std::memory_order_release);
       }
     }
   } catch (...) {
@@ -908,6 +1071,87 @@ bool ANOMALY_CALL PlayerInputKeyDetour(void *object,
   return handled;
 }
 
+void ProcessTeleport(Context &context) noexcept {
+  if (!context.teleport_pending.exchange(false, std::memory_order_acq_rel))
+    return;
+  if (!DeveloperModeEnabled(context.ui)) {
+    context.developer_mode.store(false, std::memory_order_release);
+    context.teleport_status.store(ANOMALY_STATUS_V1_PERMISSION_DENIED,
+                                  std::memory_order_release);
+    return;
+  }
+  context.developer_mode.store(true, std::memory_order_release);
+  std::array<double, 3> position{};
+  if (!SnapshotPosition(context.teleport_position, position)) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_INVALID_ARGUMENT,
+                                  std::memory_order_release);
+    return;
+  }
+  const auto session = Query<AnomalyNteSessionServiceV1>(
+      context.host, ANOMALY_NTE_SESSION_SERVICE_V1_ID,
+      ANOMALY_NTE_SESSION_SERVICE_V1_VERSION);
+  if (session == nullptr ||
+      !HasField<AnomalyNteSessionServiceV1,
+                decltype(AnomalyNteSessionServiceV1::snapshot)>(
+          session, offsetof(AnomalyNteSessionServiceV1, snapshot)) ||
+      session->snapshot == nullptr) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  AnomalyNteSessionSnapshotV1 session_snapshot{sizeof(session_snapshot)};
+  if (session->snapshot(session->user, &session_snapshot).code !=
+          ANOMALY_STATUS_V1_OK ||
+      !CurrentWorld(session_snapshot)) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  const auto player = Query<AnomalyNtePlayerServiceV1>(
+      context.host, ANOMALY_NTE_PLAYER_SERVICE_V1_ID,
+      ANOMALY_NTE_PLAYER_SERVICE_V1_VERSION);
+  if (player == nullptr ||
+      !HasField<AnomalyNtePlayerServiceV1,
+                decltype(AnomalyNtePlayerServiceV1::snapshot)>(
+          player, offsetof(AnomalyNtePlayerServiceV1, snapshot)) ||
+      player->snapshot == nullptr) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  AnomalyNtePlayerSnapshotV1 player_snapshot{sizeof(player_snapshot)};
+  if (player->snapshot(player->user, &player_snapshot).code !=
+          ANOMALY_STATUS_V1_OK ||
+      !CurrentPlayer(player_snapshot)) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  const auto teleport = Query<AnomalyNtePlayerTeleportServiceV1>(
+      context.host, ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_ID,
+      ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_VERSION);
+  if (teleport == nullptr ||
+      !HasField<AnomalyNtePlayerTeleportServiceV1,
+                decltype(AnomalyNtePlayerTeleportServiceV1::teleport)>(
+          teleport, offsetof(AnomalyNtePlayerTeleportServiceV1, teleport)) ||
+      teleport->teleport == nullptr) {
+    context.teleport_status.store(ANOMALY_STATUS_V1_UNAVAILABLE,
+                                  std::memory_order_release);
+    return;
+  }
+  AnomalyNtePlayerTeleportRequestV1 request{sizeof(request)};
+  request.flags = 0;
+  request.world = session_snapshot.world;
+  request.player = player_snapshot.handle;
+  std::ranges::copy(position, request.position);
+  const auto status = teleport->teleport(teleport->user, &request);
+  context.teleport_status.store(status.code, std::memory_order_release);
+  if (status.code != ANOMALY_STATUS_V1_OK) {
+    Log(context, ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
+        "camera tools teleport to camera position failed");
+  }
+}
+
 void UpdateFreeCamera(Context &context, const double delta_seconds) noexcept {
   if (!InputReady(context.input) ||
       context.camera_manager.load(std::memory_order_acquire) == 0)
@@ -977,6 +1221,7 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1 *host,
   if (context == nullptr)
     return Status(ANOMALY_STATUS_V1_FAILED);
   context->localizer = anomaly::plugins::Localizer(host);
+  context->host = host;
   context->core = Query<AnomalyCoreServiceV1>(host, ANOMALY_CORE_SERVICE_V1_ID,
                                               ANOMALY_CORE_SERVICE_V1_VERSION);
   context->config = Query<AnomalyConfigServiceV1>(
@@ -1135,6 +1380,26 @@ AnomalyStatusV1 ANOMALY_CALL Start(void *plugin_context) {
     return Status(ANOMALY_STATUS_V1_FAILED,
                   "free camera hotkey registration failed");
   }
+  if (!RegisterTeleportHotkey(
+          *context, context->teleport_key.load(std::memory_order_acquire),
+          context->teleport_hotkey)) {
+    ReleaseToggleHotkey(*context);
+    static_cast<void>(context->hook->release(context->hook->user,
+                                              context->streaming_source_hook));
+    static_cast<void>(
+        context->hook->release(context->hook->user, context->input_key_hook));
+    static_cast<void>(
+        context->hook->release(context->hook->user, context->view_point_hook));
+    g_active.store(nullptr, std::memory_order_release);
+    context->input_key_hook = {};
+    context->view_point_hook = {};
+    context->streaming_source_hook = {};
+    context->input_key_original = 0;
+    context->view_point_original = 0;
+    context->streaming_source_original = 0;
+    return Status(ANOMALY_STATUS_V1_FAILED,
+                  "camera teleport hotkey registration failed");
+  }
   Log(*context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
       "camera tools hooks started");
   return anomaly::sdk::Ok();
@@ -1146,8 +1411,13 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void *plugin_context, std::uint32_t) {
     return Status(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
   context->enabled.store(false, std::memory_order_release);
   context->active.store(false, std::memory_order_release);
+  context->camera_position_valid.store(false, std::memory_order_release);
   context->capturing_toggle.store(false, std::memory_order_release);
+  context->capturing_teleport.store(false, std::memory_order_release);
+  context->teleport_pending.store(false, std::memory_order_release);
+  context->developer_mode.store(false, std::memory_order_release);
   ReleaseToggleHotkey(*context);
+  ReleaseTeleportHotkey(*context);
   AnomalyStatusV1 result = anomaly::sdk::Ok();
   if (context->streaming_source_hook.id != 0 && HookReady(context->hook)) {
     result = context->hook->release(context->hook->user,
@@ -1217,6 +1487,9 @@ void ANOMALY_CALL Update(void *plugin_context, const double delta_seconds) {
     RefreshPlayerInput(*context);
     RefreshStreamingSourceController(*context);
     UpdateFreeCamera(*context, delta_seconds);
+    context->developer_mode.store(DeveloperModeEnabled(context->ui),
+                                  std::memory_order_release);
+    ProcessTeleport(*context);
     const auto revision =
         context->settings_revision.load(std::memory_order_acquire);
     if (revision != context->persisted_settings_revision.load(
@@ -1231,6 +1504,7 @@ void ANOMALY_CALL Update(void *plugin_context, const double delta_seconds) {
     }
   } catch (...) {
     context->camera_manager.store(0, std::memory_order_release);
+    context->camera_position_valid.store(false, std::memory_order_release);
     context->streaming_source_controller.store(0, std::memory_order_release);
   }
 }
@@ -1241,6 +1515,8 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
     return;
   bool window_begun = false;
   try {
+    const bool developer_mode = DeveloperModeEnabled(ui);
+    context->developer_mode.store(developer_mode, std::memory_order_release);
     const std::string title =
         context->localizer.Text("window.title", "Camera Tools");
     int open = 1;
@@ -1370,6 +1646,7 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
         if (ui->button(ui->user, anomaly::sdk::StringView(activation_label),
                        0.0F, 0.0F) != 0) {
           context->capturing_toggle.store(true, std::memory_order_release);
+          context->capturing_teleport.store(false, std::memory_order_release);
         }
       }
 
@@ -1377,6 +1654,45 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
           "controls.guide", "W/A/S/D: Forward / Backward / Left / Right\n"
                             "Space: Up\nShift: Down");
       ui->text(ui->user, anomaly::sdk::StringView(guide));
+
+      if (developer_mode) {
+        ui->separator(ui->user);
+        const std::string developer_section = context->localizer.Text(
+            "section.developer", "Developer tools");
+        ui->text(ui->user, anomaly::sdk::StringView(developer_section));
+        const std::string teleport_label = context->localizer.Label(
+            "action.teleport_to_camera", "Teleport to camera position",
+            "teleport-to-camera");
+        if (ui->button(ui->user, anomaly::sdk::StringView(teleport_label),
+                       0.0F, 0.0F) != 0) {
+          QueueTeleport(*context);
+        }
+        if (context->capturing_teleport.load(std::memory_order_acquire)) {
+          const std::string capture_label = context->localizer.Label(
+              "action.capture_teleport_key", "Press a key...",
+              "teleport-hotkey");
+          if (ui->button(ui->user, anomaly::sdk::StringView(capture_label),
+                         0.0F, 0.0F) != 0) {
+            context->capturing_teleport.store(false, std::memory_order_release);
+          } else {
+            CaptureTeleportKey(*context);
+          }
+        } else {
+          const std::string key_name = VirtualKeyName(
+              *context, context->teleport_key.load(std::memory_order_acquire));
+          const std::array<std::string_view, 1> arguments{key_name};
+          std::string activation_label = context->localizer.Format(
+              "setting.teleport_key", "Teleport key: {0}", arguments);
+          activation_label.append("###teleport-hotkey");
+          if (ui->button(ui->user, anomaly::sdk::StringView(activation_label),
+                         0.0F, 0.0F) != 0) {
+            context->capturing_teleport.store(true, std::memory_order_release);
+            context->capturing_toggle.store(false, std::memory_order_release);
+          }
+        }
+      } else {
+        context->capturing_teleport.store(false, std::memory_order_release);
+      }
     }
   } catch (...) {
   }
