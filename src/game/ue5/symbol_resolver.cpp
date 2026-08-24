@@ -188,6 +188,7 @@ bool RuntimeObjectInitializationPending(const std::string_view message) noexcept
         message == "persistent level is not initialized" ||
         message == "object registry is not initialized" ||
         message == "local player chain is incomplete" ||
+        message == "actor bounds shape is implausible" ||
         message.ends_with(" is unreadable");
 }
 
