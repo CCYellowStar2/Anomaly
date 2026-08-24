@@ -6,6 +6,8 @@
 #define ANOMALY_UE5_AHUD_SERVICE_V1_VERSION 1u
 #define ANOMALY_UE5_FRAMEWORK_SERVICE_V1_ID "anomaly.ue5.framework"
 #define ANOMALY_UE5_FRAMEWORK_SERVICE_V1_VERSION 1u
+#define ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_ID "anomaly.ue5.process-event"
+#define ANOMALY_UE5_PROCESS_EVENT_SERVICE_V1_VERSION 1u
 #define ANOMALY_UE5_NAMES_SERVICE_V1_ID "anomaly.ue5.names"
 #define ANOMALY_UE5_NAMES_SERVICE_V1_VERSION 1u
 #define ANOMALY_UE5_OBJECTS_SERVICE_V1_ID "anomaly.ue5.objects"
@@ -65,6 +67,20 @@ typedef struct AnomalyUe5FrameworkServiceV1 {
     uint64_t (ANOMALY_CALL *tick_sequence)(void* user);
     int (ANOMALY_CALL *is_game_thread)(void* user);
 } AnomalyUe5FrameworkServiceV1;
+// One host UObject::ProcessEvent hook fans out to all subscribers. Subscribers
+// run serially on the UE Game thread before the original function. The
+// parameter buffer is valid only for the duration of the callback, may be null
+// for a zero-parameter function, and may be adjusted in place.
+typedef void (ANOMALY_CALL *AnomalyUe5ProcessEventCallbackV1)(
+    void* user, uintptr_t object, uintptr_t function, void* parameters);
+typedef struct AnomalyUe5ProcessEventServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *subscribe)(
+        void* user, AnomalyUe5ProcessEventCallbackV1 callback,
+        void* callback_user, AnomalyGenerationHandleV1* handle);
+    AnomalyStatusV1 (ANOMALY_CALL *unsubscribe)(
+        void* user, AnomalyGenerationHandleV1 handle);
+} AnomalyUe5ProcessEventServiceV1;
 typedef struct AnomalyUe5NamesServiceV1 {
     uint32_t struct_size; uint32_t service_version; void* user;
     AnomalyStatusV1 (ANOMALY_CALL *resolve_utf8)(void* user, uint32_t name_id, char* destination, size_t* inout_size);

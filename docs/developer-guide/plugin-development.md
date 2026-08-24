@@ -98,6 +98,8 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
 | `on_stop(deadline)` | 停止，提交状态 | Lifecycle |
 | `on_unload` | 卸载前清理 | Lifecycle |
 
+Render 回调必须保持为纯绘制路径。游戏语义服务查询、cursor 推进、分页、名称解析和统计应在 Game 域 `on_update` 完成，并转换为插件自有的不可变展示快照；`on_draw` 仅在短锁内复制快照，锁外调用 UI。[`nte_combat_demo`](../../examples/nte_combat_demo/plugin.cpp) 展示了该边界：新伤害到达时才解析来源与参与者，静止帧不会重复调用 NTE 服务。
+
 完整入口 / 描述符定义见 [生命周期与 Core 服务](../api-reference/lifecycle-and-core.md)。
 
 ## 4. 查询服务并优雅降级
@@ -267,6 +269,7 @@ anomaly-test-host --plugin .\dist\anomaly.example.my-plugin --reload 10 --ticks 
 | [`tick_counter`](../../examples/tick_counter/plugin.cpp) | C++ RAII + Game Thread Tick |
 | [`reliable_config`](../../examples/reliable_config/plugin.cpp) | 通过 Config ABI 注册 JSON Schema、读取设置，`on_stop` 原子提交 |
 | [`nte_inspector`](../../examples/nte_inspector/plugin.cpp) | Session lifecycle event、bounded EntityPage、class-name 解析与 Host snapshot metrics |
+| [`nte_combat_demo`](../../examples/nte_combat_demo/plugin.cpp) | Game 域增量消费角色伤害事件，Render 域只绘制本地快照 |
 
 ## 相关
 

@@ -41,8 +41,15 @@ anomaly_add_plugin(anomaly_example_nte_inspector
     PACKAGE_NAME NteInspector
     OUTPUT_DIRECTORY "${ANOMALY_EXAMPLE_OUTPUT_ROOT}/NteInspector")
 
+anomaly_add_plugin(anomaly_example_nte_combat_demo
+    SOURCES nte_combat_demo/plugin.cpp
+    MANIFEST nte_combat_demo/manifest.json
+    PACKAGE_NAME NteCombatDemo
+    OUTPUT_DIRECTORY "${ANOMALY_EXAMPLE_OUTPUT_ROOT}/NteCombatDemo")
+
 foreach(example_target IN ITEMS anomaly_example_hello_ui anomaly_example_tick_counter
-        anomaly_example_reliable_config anomaly_example_nte_inspector)
+        anomaly_example_reliable_config anomaly_example_nte_inspector
+        anomaly_example_nte_combat_demo)
     target_compile_definitions(
         ${example_target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 endforeach()

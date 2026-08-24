@@ -1,6 +1,7 @@
 #include "anomaly/nte_profile_runtime.hpp"
 
 #include "anomaly/nte_navigation_input_policy.hpp"
+#include "anomaly/ue5_damage_function_hook.hpp"
 #include "anomaly/ue5_object_lookup.hpp"
 #include "anomaly/ue5_outbound_bit_count_probe.hpp"
 #include "anomaly/ue5_process_event.hpp"
@@ -58,6 +59,16 @@ inline constexpr std::string_view kNavigationInputAbiValidator =
     "nte-navigation-input-abi-v1";
 inline constexpr std::string_view kPickupFeature = "nte.pickup";
 inline constexpr std::string_view kPickupLayoutValidator = "nte-pickup-layout-v1";
+inline constexpr std::string_view kCombatFeature = "nte.combat";
+inline constexpr std::string_view kDamageEventSymbol =
+    "nte.HTAbilityCharacter.BroadcastCharacterOnDamaged";
+inline constexpr std::string_view kSkillsFeature = "nte.skills";
+inline constexpr std::string_view kSkillInvocationFeature = "nte.skill-invocation";
+inline constexpr std::string_view kCombatReflectionValidator =
+    "nte-combat-reflection-v1";
+inline constexpr std::string_view kSkillsLayoutValidator = "nte-skills-layout-v1";
+inline constexpr std::string_view kSkillInvocationValidator =
+    "nte-skill-invocation-v1";
 
 template <std::size_t Size>
 bool MatchesBytes(
@@ -127,6 +138,102 @@ std::shared_ptr<NteNavigationInputPolicy> CreateNavigationInputPolicy(
     } catch (...) {
         return {};
     }
+}
+
+FeatureValidationResult ValidateBoundedLayoutKeys(
+    const BuildProfile& profile,
+    const std::string_view feature,
+    const std::initializer_list<std::string_view> keys) {
+    constexpr std::uint64_t kMaximumLayoutValue = 64ULL * 1024ULL * 1024ULL;
+    for (const std::string_view key : keys) {
+        std::uint64_t value{};
+        if (!ProfileLayoutValue(profile, key, &value)) {
+            return {false, "profile layout is missing " + std::string(key)};
+        }
+        if (value > kMaximumLayoutValue) {
+            return {false, std::string(feature) + " layout exceeds the supported bound"};
+        }
+    }
+    return {true, {}};
+}
+
+FeatureValidationResult ValidateCombatReflectionLayout(
+    const BuildProfile& profile,
+    const std::string_view feature,
+    const ProfileResolutionSnapshot&,
+    const SymbolMemory&) {
+    if (feature != kCombatFeature) {
+        return {false, "combat validator attached to an unexpected feature"};
+    }
+    const auto required = ValidateBoundedLayoutKeys(profile, feature, {
+        "object.internalIndex", "object.class", "object.outer",
+        "ustruct.superStruct", "ustruct.propertyLink", "ufunction.numParms",
+        "ufunction.parmsSize", "ufunction.returnValueOffset", "ffield.class",
+        "ffield.name", "ffieldClass.name", "fproperty.arrayDim",
+        "fproperty.elementSize", "fproperty.offsetInternal",
+        "fproperty.propertyLinkNext", "fstructProperty.struct",
+        "fobjectProperty.propertyClass",
+        "fboolProperty.fieldSize", "fboolProperty.byteOffset",
+        "fboolProperty.byteMask", "fboolProperty.fieldMask",
+        "damageEvent.size", "damageEvent.damage", "damageEvent.damageGEDef",
+        "weakObject.index", "weakObject.serial"});
+    if (!required.valid) return required;
+
+    const auto value = [&profile](const std::string_view key) {
+        return static_cast<std::uint64_t>(profile.layout.at(std::string(key)));
+    };
+    const std::uint64_t event_size = value("damageEvent.size");
+    if (event_size == 0 || event_size > 4096U ||
+        value("damageEvent.damage") + sizeof(float) > event_size ||
+        value("damageEvent.damageGEDef") + 8U > event_size ||
+        value("weakObject.index") + 4U > 8U || value("weakObject.serial") + 4U > 8U) {
+        return {false, "combat structure layout is internally inconsistent"};
+    }
+    return {true, {}};
+}
+
+FeatureValidationResult ValidateSkillsLayout(
+    const BuildProfile& profile,
+    const std::string_view feature,
+    const ProfileResolutionSnapshot&,
+    const SymbolMemory&) {
+    if (feature != kSkillsFeature && feature != kSkillInvocationFeature) {
+        return {false, "skills validator attached to an unexpected feature"};
+    }
+    const auto required = ValidateBoundedLayoutKeys(profile, feature, {
+        "object.internalIndex", "object.class", "object.outer",
+        "ustruct.superStruct", "ustruct.propertyLink", "ufunction.numParms",
+        "ufunction.parmsSize", "ufunction.returnValueOffset", "ffield.class",
+        "ffield.name", "ffieldClass.name", "fproperty.arrayDim",
+        "fproperty.elementSize", "fproperty.offsetInternal",
+        "fproperty.propertyLinkNext", "fstructProperty.struct",
+        "fobjectProperty.propertyClass", "farrayProperty.inner",
+        "fclassProperty.metaClass",
+        "fboolProperty.fieldSize", "fboolProperty.byteOffset",
+        "fboolProperty.byteMask", "fboolProperty.fieldMask", "tarray.data",
+        "tarray.num", "tarray.max", "abilitySystem.activatableAbilities",
+        "abilitySpecContainer.items", "abilitySpec.stride", "abilitySpec.handle",
+        "abilitySpec.ability", "abilitySpec.level", "abilitySpec.inputId",
+        "abilitySpec.activeCount", "abilitySpec.stateBits",
+        "ability.cooldownGameplayEffectClass", "skills.maxCount"});
+    if (!required.valid) return required;
+
+    const auto value = [&profile](const std::string_view key) {
+        return static_cast<std::uint64_t>(profile.layout.at(std::string(key)));
+    };
+    const std::uint64_t stride = value("abilitySpec.stride");
+    if (stride < 42U || stride > 4096U || value("skills.maxCount") == 0 ||
+        value("skills.maxCount") > 4096U ||
+        value("abilitySpec.handle") + 4U > stride ||
+        value("abilitySpec.ability") + sizeof(std::uintptr_t) > stride ||
+        value("abilitySpec.level") + 4U > stride ||
+        value("abilitySpec.inputId") + 4U > stride ||
+        value("abilitySpec.activeCount") >= stride ||
+        value("abilitySpec.stateBits") >= stride ||
+        value("ability.cooldownGameplayEffectClass") + sizeof(std::uintptr_t) > 4096U) {
+        return {false, "ability spec layout is internally inconsistent"};
+    }
+    return {true, {}};
 }
 
 bool ResolveRel32Target(
@@ -581,7 +688,7 @@ FeatureValidationResult ValidateEscMenuHooks(
 }
 
 FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
-    const bool preserve_actor_process_event_abi) {
+    const bool preserve_hooked_process_event_abi) {
     FeatureLayoutValidatorRegistry validators = Ue5FeatureLayoutValidators();
     validators.Register(
         std::string(kOutgoingTransformAbiValidator), ValidateOutgoingTransformAbi);
@@ -591,7 +698,32 @@ FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
     validators.Register(
         std::string(kNavigationInputAbiValidator), ValidateNavigationInputAbi);
     validators.Register(std::string(kPickupLayoutValidator), ValidatePickupLayout);
-    if (preserve_actor_process_event_abi) {
+    validators.Register(
+        std::string(kCombatReflectionValidator), ValidateCombatReflectionLayout);
+    validators.Register(std::string(kSkillsLayoutValidator), ValidateSkillsLayout);
+    validators.Register(std::string(kSkillInvocationValidator), ValidateSkillsLayout);
+    if (preserve_hooked_process_event_abi) {
+        validators.Register(
+            std::string(kUe5ProcessEventAbiValidator), [](
+                const BuildProfile&,
+                const std::string_view feature,
+                const ProfileResolutionSnapshot& snapshot,
+                const SymbolMemory&) {
+                if (feature != kUe5ProcessEventFeature) {
+                    return FeatureValidationResult{
+                        false,
+                        "startup ProcessEvent ABI evidence used by another feature"};
+                }
+                const auto* const process_event =
+                    snapshot.FindSymbol(kUe5ProcessEventSymbol);
+                if (process_event == nullptr || !process_event->Available()) {
+                    return FeatureValidationResult{
+                        false, "ue5.ProcessEvent is unavailable"};
+                }
+                // Runtime owns the entry bytes after installing its detour. The
+                // unhooked ABI was validated before the adapter was constructed.
+                return FeatureValidationResult{true, {}};
+            });
         validators.Register(
             std::string(kUe5ActorProcessEventAbiValidator), [](
                 const BuildProfile&,
@@ -759,6 +891,7 @@ std::string_view SymbolStateName(SymbolResolutionState state) noexcept {
 struct RetainedNteProfileGeneration final {
     std::unique_ptr<GameTickHook> tick_hook;
     std::unique_ptr<Ue5ProcessEventHook> process_event_hook;
+    std::unique_ptr<Ue5DamageFunctionHook> damage_function_hook;
     std::unique_ptr<Ue5OutboundBitCountProbe> outgoing_transform_probe;
     std::shared_ptr<Ue5NteAdapter> adapter;
     RetainedNteProfileGeneration* next{};
@@ -840,6 +973,7 @@ private:
 void RetainNteProfileGeneration(
     std::unique_ptr<GameTickHook> tick_hook,
     std::unique_ptr<Ue5ProcessEventHook> process_event_hook,
+    std::unique_ptr<Ue5DamageFunctionHook> damage_function_hook,
     std::unique_ptr<Ue5OutboundBitCountProbe> outgoing_transform_probe,
     std::shared_ptr<Ue5NteAdapter> adapter) noexcept {
     auto* registry = ProcessNteProfileQuarantine();
@@ -849,18 +983,21 @@ void RetainNteProfileGeneration(
         // still-running callback without extending the stop call.
         static_cast<void>(tick_hook.release());
         static_cast<void>(process_event_hook.release());
+        static_cast<void>(damage_function_hook.release());
         static_cast<void>(outgoing_transform_probe.release());
         return;
     }
     registry->quarantined.store(true, std::memory_order_release);
     auto* generation = new (std::nothrow) RetainedNteProfileGeneration{
         std::move(tick_hook), std::move(process_event_hook),
-        std::move(outgoing_transform_probe), std::move(adapter), nullptr};
+        std::move(damage_function_hook), std::move(outgoing_transform_probe),
+        std::move(adapter), nullptr};
     if (generation == nullptr) {
         // Both hook types and Ue5NteAdapter independently preserve their live
         // state when a zero-budget drain still reports in-flight.
         static_cast<void>(tick_hook.release());
         static_cast<void>(process_event_hook.release());
+        static_cast<void>(damage_function_hook.release());
         static_cast<void>(outgoing_transform_probe.release());
         return;
     }
@@ -899,6 +1036,7 @@ public:
         tick_evidence_gate_.reset();
         tick_hook_.reset();
         process_event_hook_.reset();
+        damage_function_hook_.reset();
         outgoing_transform_probe_.reset();
         tick_hook_ready_ = false;
         ahud_hook_ready_ = false;
@@ -972,10 +1110,33 @@ public:
             profile_ ? CreateUe5ProcessEventInvoker(*profile_, *resolution_, *memory_)
                      : Ue5NteAdapter::ProcessEventInvoker{},
             profile_ ? CreateUe5ObjectLookup(*profile_, *resolution_, *memory_)
-                     : Ue5NteAdapter::ObjectLookup{},
-            profile_ ? CreateNavigationInputPolicy(*profile_)
-                     : std::shared_ptr<NteNavigationInputPolicy>{});
+                      : Ue5NteAdapter::ObjectLookup{},
+             profile_ ? CreateNavigationInputPolicy(*profile_)
+                      : std::shared_ptr<NteNavigationInputPolicy>{});
+        try {
+            damage_function_hook_ = std::make_unique<Ue5DamageFunctionHook>(
+                [weak = std::weak_ptr<Ue5NteAdapter>(adapter_)](
+                    const std::uintptr_t damage_event,
+                    const std::uintptr_t victim,
+                    const std::uintptr_t attacker,
+                    const std::uintptr_t damage_causer) {
+                    const auto adapter = weak.lock();
+                    if (adapter) {
+                        adapter->OnDamageEvent(
+                            damage_event, victim, attacker, damage_causer);
+                    }
+                });
+        } catch (...) {
+            diagnostics_.push_back("damage native hook allocation failed");
+        }
         bool hook_ready{};
+        const auto* const damage_event_target =
+            resolution_->FindSymbol(kDamageEventSymbol);
+        const void* const event_target =
+            damage_event_target != nullptr && damage_event_target->Available()
+            ? reinterpret_cast<void*>(damage_event_target->address)
+            : nullptr;
+        const auto damage_hook = damage_function_hook_.get();
         const auto* tick = resolution_->FindSymbol("ue5.GameTick");
         if (tick != nullptr && tick->Available() &&
             resolution_->FeatureAvailable("ue5.framework")) {
@@ -985,13 +1146,21 @@ public:
             }
             tick_hook_ = std::make_unique<GameTickHook>(
                 [weak = std::weak_ptr<Ue5NteAdapter>(adapter_),
-                 evidence = tick_evidence_gate_](double delta) {
+                  evidence = tick_evidence_gate_, damage_hook,
+                  event_target](double delta) {
                     const auto started_at = std::chrono::steady_clock::now();
                     // Keep the adapter generation alive through evidence
                     // observation. This also protects the service tables if
                     // process-quarantine bookkeeping allocation ever fails.
                     const auto adapter = weak.lock();
-                    if (adapter) adapter->OnGameTick(delta);
+                    if (adapter) {
+                        adapter->OnGameTick(delta);
+                        if (damage_hook != nullptr && !damage_hook->Attempted() &&
+                            event_target != nullptr && adapter->CombatFeatureAvailable()) {
+                            static_cast<void>(damage_hook->Start(
+                                {const_cast<void*>(event_target)}));
+                        }
+                    }
                     if (evidence) {
                         const double duration_micros =
                             std::chrono::duration<double, std::micro>(
@@ -1003,17 +1172,21 @@ public:
             if (!hook_ready) diagnostics_.push_back("game tick hook activation failed");
         }
         bool ahud_hook_ready{};
-        const auto* const actor_process_event =
-            resolution_->FindSymbol(kUe5ActorProcessEventSymbol);
-        if (profile_ && profile_->features.contains(std::string(kAhudFeature))) {
+        bool process_event_hook_ready{};
+        const auto* const process_event =
+            resolution_->FindSymbol(kUe5ProcessEventSymbol);
+        // ProcessEvent is a shared framework ingress. It is activated once by
+        // the runtime and fanned out to all SDK subscribers.
+        const bool needs_process_event = profile_ &&
+            profile_->features.contains(std::string(kUe5ProcessEventFeature));
+        if (needs_process_event) {
             if (!hook_ready) {
                 diagnostics_.push_back(
-                    "optional AHUD capability unavailable: game tick hook failed");
+                    "optional ProcessEvent capabilities unavailable: game tick hook failed");
             } else if (!resolution_->FeatureAvailable(kUe5ProcessEventFeature) ||
-                !resolution_->FeatureAvailable(kUe5ActorProcessEventFeature) ||
-                actor_process_event == nullptr || !actor_process_event->Available()) {
+                process_event == nullptr || !process_event->Available()) {
                 diagnostics_.push_back(
-                    "optional AHUD capability unavailable: Actor ProcessEvent gate failed");
+                    "optional ProcessEvent capabilities unavailable: gate failed");
             } else {
                 try {
                     process_event_hook_ = std::make_unique<Ue5ProcessEventHook>(
@@ -1027,16 +1200,26 @@ public:
                                 adapter->OnProcessEvent(
                                     object, function, parameters, original);
                             }
+                        },
+                        [weak = std::weak_ptr<Ue5NteAdapter>(adapter_)](
+                            const std::uintptr_t object,
+                            const std::uintptr_t function,
+                            void* const parameters) {
+                            const auto adapter = weak.lock();
+                            if (adapter) {
+                                adapter->OnProcessEventPre(object, function, parameters);
+                            }
                         });
                     ahud_hook_ready = process_event_hook_->Start(
-                        reinterpret_cast<void*>(actor_process_event->address));
+                        reinterpret_cast<void*>(process_event->address));
+                    process_event_hook_ready = ahud_hook_ready;
                     if (!ahud_hook_ready) {
                         diagnostics_.push_back(
-                            "AHUD Actor ProcessEvent hook activation failed");
+                            "ProcessEvent hook activation failed");
                     }
                 } catch (...) {
                     process_event_hook_.reset();
-                    diagnostics_.push_back("AHUD ProcessEvent hook allocation failed");
+                    diagnostics_.push_back("ProcessEvent hook allocation failed");
                 }
                 if (ahud_hook_ready && !resolution_->FeatureAvailable(kAhudFeature)) {
                     diagnostics_.push_back(
@@ -1044,7 +1227,7 @@ public:
                 }
             }
         }
-        if (!adapter_->Start(hook_ready, ahud_hook_ready)) {
+        if (!adapter_->Start(hook_ready, ahud_hook_ready, process_event_hook_ready)) {
             diagnostics_.push_back("adapter service publication failed");
             if (tick_evidence_gate_) tick_evidence_gate_->Close();
             const bool process_event_hook_stopped =
@@ -1052,12 +1235,17 @@ public:
                 process_event_hook_->Stop();
             const bool tick_hook_stopped =
                 !tick_hook_ || tick_hook_->Stop();
+            const bool damage_function_hook_stopped =
+                !damage_function_hook_ || damage_function_hook_->Stop();
             if (process_event_hook_stopped) process_event_hook_.reset();
             if (tick_hook_stopped) tick_hook_.reset();
+            if (damage_function_hook_stopped) damage_function_hook_.reset();
             tick_evidence_gate_.reset();
-            if (!process_event_hook_stopped || !tick_hook_stopped) {
+            if (!process_event_hook_stopped || !tick_hook_stopped ||
+                !damage_function_hook_stopped) {
                 RetainNteProfileGeneration(
-                    std::move(tick_hook_), std::move(process_event_hook_), {},
+                    std::move(tick_hook_), std::move(process_event_hook_),
+                    std::move(damage_function_hook_), {},
                     std::move(adapter_));
                 quarantined_ = true;
                 diagnostics_.push_back(
@@ -1070,6 +1258,10 @@ public:
         } else {
             tick_hook_ready_ = hook_ready;
             ahud_hook_ready_ = ahud_hook_ready;
+            if (damage_hook != nullptr && event_target == nullptr) {
+                diagnostics_.push_back(
+                    "character damage event hook target unavailable");
+            }
         }
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
@@ -1116,6 +1308,7 @@ public:
         if (!started_) return !stopping_;
         auto tick_hook = std::move(tick_hook_);
         auto process_event_hook = std::move(process_event_hook_);
+        auto damage_function_hook = std::move(damage_function_hook_);
         auto outgoing_transform_probe = std::move(outgoing_transform_probe_);
         auto adapter = std::move(adapter_);
         auto tick_evidence_gate = std::move(tick_evidence_gate_);
@@ -1160,14 +1353,18 @@ public:
         const bool tick_hook_drained = tick_hook == nullptr || tick_hook->Stop(remaining());
         const bool process_event_hook_drained = process_event_hook == nullptr ||
             process_event_hook->Stop(remaining());
+        const bool damage_function_hook_drained = damage_function_hook == nullptr ||
+            damage_function_hook->Stop(remaining());
         if (evidence_drained && !adapter_drained && adapter != nullptr) {
             adapter_drained = adapter->Stop(remaining());
         }
         const bool drained = outgoing_transform_probe_drained && evidence_drained &&
-            tick_hook_drained && process_event_hook_drained && adapter_drained;
+            tick_hook_drained && process_event_hook_drained &&
+            damage_function_hook_drained && adapter_drained;
         if (!drained) {
             RetainNteProfileGeneration(
                 std::move(tick_hook), std::move(process_event_hook),
+                std::move(damage_function_hook),
                 std::move(outgoing_transform_probe), std::move(adapter));
         }
 
@@ -1233,6 +1430,13 @@ public:
                 std::make_move_iterator(process_event_hooks.begin()),
                 std::make_move_iterator(process_event_hooks.end()));
         }
+        if (damage_function_hook_) {
+            auto damage_hooks = damage_function_hook_->Snapshot();
+            hooks.insert(
+                hooks.end(),
+                std::make_move_iterator(damage_hooks.begin()),
+                std::make_move_iterator(damage_hooks.end()));
+        }
         return hooks;
     }
 
@@ -1289,6 +1493,33 @@ public:
         json += ",\"ahudProcessEventCallCount\":" +
             std::to_string(
                 adapter_ ? adapter_->AhudProcessEventCallCount() : 0U);
+        const NteCombatDiagnosticsSnapshot combat_diagnostics = adapter_
+            ? adapter_->CombatDiagnostics()
+            : NteCombatDiagnosticsSnapshot{};
+        json += ",\"damageCapture\":{\"eventLayoutReady\":" +
+            std::string(combat_diagnostics.damage_event_layout_ready
+                ? "true"
+                : "false");
+        json += ",\"nativeHookAttempted\":" + std::string(
+            damage_function_hook_ && damage_function_hook_->Attempted()
+                ? "true"
+                : "false");
+        json += ",\"nativeHookReady\":" + std::string(
+            damage_function_hook_ && damage_function_hook_->Started()
+                ? "true"
+                : "false");
+        json += ",\"nativeCalls\":" +
+            std::to_string(combat_diagnostics.native_call_count);
+        json += ",\"capturedEvents\":" +
+            std::to_string(combat_diagnostics.captured_event_count);
+        json += ",\"dropped\":" +
+            std::to_string(combat_diagnostics.dropped_count);
+        json += ",\"attackerResolutionFailures\":" +
+            std::to_string(combat_diagnostics.attacker_resolution_failure_count);
+        json += ",\"victimResolutionFailures\":" +
+            std::to_string(combat_diagnostics.victim_resolution_failure_count);
+        json += ",\"sourceResolutionFailures\":" +
+            std::to_string(combat_diagnostics.source_resolution_failure_count) + "}";
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
                 ANOMALY_NTE_PLAYER_SERVICE_V1_ID,
@@ -1470,6 +1701,7 @@ private:
     std::shared_ptr<TickEvidenceObserverGate> tick_evidence_gate_;
     std::unique_ptr<GameTickHook> tick_hook_;
     std::unique_ptr<Ue5ProcessEventHook> process_event_hook_;
+    std::unique_ptr<Ue5DamageFunctionHook> damage_function_hook_;
     std::unique_ptr<Ue5OutboundBitCountProbe> outgoing_transform_probe_;
     std::vector<std::string> diagnostics_;
 };

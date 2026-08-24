@@ -15,15 +15,19 @@ class Ue5ProcessEventHook final {
 public:
     // The original invoker is valid only for the synchronous callback. It
     // bypasses this detour so callback-owned UE calls cannot recursively enter
-    // the AHUD event ingress.
+    // the Actor event ingress.
     using Callback = std::function<void(
         std::uintptr_t object,
         std::uintptr_t function,
         void* parameters,
         const Ue5ProcessEventInvoker& original)>;
+    using PreCallback = std::function<void(
+        std::uintptr_t object, std::uintptr_t function, void* parameters)>;
 
-    explicit Ue5ProcessEventHook(Callback callback);
-    Ue5ProcessEventHook(std::unique_ptr<HookBackend> backend, Callback callback);
+    explicit Ue5ProcessEventHook(Callback callback, PreCallback pre_callback = {});
+    Ue5ProcessEventHook(
+        std::unique_ptr<HookBackend> backend, Callback callback,
+        PreCallback pre_callback = {});
     ~Ue5ProcessEventHook();
 
     Ue5ProcessEventHook(const Ue5ProcessEventHook&) = delete;

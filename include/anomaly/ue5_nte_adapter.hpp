@@ -25,6 +25,16 @@ struct NteSnapshotSamplingOptions {
     std::uint32_t entity_tick_interval{1};
 };
 
+struct NteCombatDiagnosticsSnapshot {
+    bool damage_event_layout_ready{};
+    std::uint64_t native_call_count{};
+    std::uint64_t captured_event_count{};
+    std::uint64_t dropped_count{};
+    std::uint64_t attacker_resolution_failure_count{};
+    std::uint64_t victim_resolution_failure_count{};
+    std::uint64_t source_resolution_failure_count{};
+};
+
 class Ue5NteAdapter final {
 public:
     using TickCallback = std::function<void(double)>;
@@ -52,7 +62,10 @@ public:
     Ue5NteAdapter(const Ue5NteAdapter&) = delete;
     Ue5NteAdapter& operator=(const Ue5NteAdapter&) = delete;
 
-    [[nodiscard]] bool Start(bool framework_hook_ready, bool ahud_hook_ready = false);
+    [[nodiscard]] bool Start(
+        bool framework_hook_ready,
+        bool ahud_hook_ready = false,
+        bool process_event_hook_ready = false);
     // Closes cached service tables, detaches callbacks, and revokes registry
     // entries before draining state/callback work. Callback target destruction
     // is deferred off the lifecycle caller. A false result keeps the generation
@@ -67,14 +80,22 @@ public:
     bool ClearTickCallback(
         std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) noexcept;
     void OnGameTick(double delta_seconds) noexcept;
-    // Called only by the separately owned Actor ProcessEvent wrapper detour
-    // after the wrapper has completed. AHUD calls use that wrapper's original
-    // trampoline so native HUD dispatch matches the object's virtual path.
+    void OnDamageEvent(
+        std::uintptr_t damage_event,
+        std::uintptr_t victim,
+        std::uintptr_t attacker,
+        std::uintptr_t damage_causer) noexcept;
+    // Called by the shared UObject ProcessEvent detour after the original
+    // function completes. Damage capture uses the exact native
+    // CharacterOnDamaged broadcast and never enters through this broad hook.
     void OnProcessEvent(
         std::uintptr_t object,
         std::uintptr_t function,
         void* parameters,
-        const ProcessEventInvoker& actor_process_event) noexcept;
+        const ProcessEventInvoker& process_event) noexcept;
+    void OnProcessEventPre(
+        std::uintptr_t object, std::uintptr_t function,
+        void* parameters) noexcept;
 
     [[nodiscard]] bool Started() const noexcept;
     [[nodiscard]] DWORD GameThreadId() const noexcept;
@@ -83,6 +104,10 @@ public:
     [[nodiscard]] bool AhudBindingReady() const noexcept;
     [[nodiscard]] std::uint64_t AhudFrameCount() const noexcept;
     [[nodiscard]] std::uint64_t AhudProcessEventCallCount() const noexcept;
+    // Native combat capture stays dormant until the combat reflection gate
+    // has completed on the game thread.
+    [[nodiscard]] bool CombatFeatureAvailable() const noexcept;
+    [[nodiscard]] NteCombatDiagnosticsSnapshot CombatDiagnostics() const noexcept;
     [[nodiscard]] ProfileResolutionSnapshot Resolution() const;
 
 private:

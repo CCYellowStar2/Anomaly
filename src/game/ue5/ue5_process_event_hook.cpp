@@ -10,7 +10,7 @@
 namespace anomaly {
 namespace {
 
-inline constexpr std::string_view kOwner = "anomaly.ue5.ahud";
+inline constexpr std::string_view kOwner = "anomaly.ue5.process-event";
 inline constexpr std::uint64_t kGeneration = 1;
 
 }  // namespace
@@ -19,8 +19,10 @@ class Ue5ProcessEventHook::Impl final {
 public:
     using ProcessEventFunction = void(__fastcall*)(void*, void*, void*);
 
-    Impl(std::unique_ptr<HookBackend> backend, Callback callback)
-        : hooks_(std::move(backend)), callback_(std::move(callback)) {
+    Impl(std::unique_ptr<HookBackend> backend, Callback callback,
+         PreCallback pre_callback)
+        : hooks_(std::move(backend)), callback_(std::move(callback)),
+          pre_callback_(std::move(pre_callback)) {
         if (!callback_) throw std::invalid_argument("Ue5ProcessEventHook requires callback");
         original_invoker_ = [this](
             const std::uintptr_t object,
@@ -135,6 +137,14 @@ private:
         }
 
         if (original == nullptr) return;
+        if (self != nullptr && self->pre_callback_) {
+            try {
+                self->pre_callback_(
+                    reinterpret_cast<std::uintptr_t>(object),
+                    reinterpret_cast<std::uintptr_t>(function), parameters);
+            } catch (...) {
+            }
+        }
         original(object, function, parameters);
         if (self == nullptr) return;
         try {
@@ -149,6 +159,7 @@ private:
 
     HookManager hooks_;
     Callback callback_;
+    PreCallback pre_callback_;
     Ue5ProcessEventInvoker original_invoker_;
     ProcessEventFunction original_{};
     void* target_{};
@@ -165,13 +176,15 @@ std::atomic<Ue5ProcessEventHook::Impl::ProcessEventFunction>
     Ue5ProcessEventHook::Impl::passthrough_{};
 std::mutex Ue5ProcessEventHook::Impl::process_mutex_;
 
-Ue5ProcessEventHook::Ue5ProcessEventHook(Callback callback)
-    : Ue5ProcessEventHook(CreateMinHookBackend(), std::move(callback)) {}
+Ue5ProcessEventHook::Ue5ProcessEventHook(Callback callback, PreCallback pre_callback)
+    : Ue5ProcessEventHook(
+          CreateMinHookBackend(), std::move(callback), std::move(pre_callback)) {}
 
 Ue5ProcessEventHook::Ue5ProcessEventHook(
     std::unique_ptr<HookBackend> backend,
-    Callback callback)
-    : impl_(std::make_unique<Impl>(std::move(backend), std::move(callback))) {}
+    Callback callback, PreCallback pre_callback)
+    : impl_(std::make_unique<Impl>(
+          std::move(backend), std::move(callback), std::move(pre_callback))) {}
 
 Ue5ProcessEventHook::~Ue5ProcessEventHook() {
     if (impl_ != nullptr && !impl_->Stop(std::chrono::milliseconds::zero())) {

@@ -15,7 +15,7 @@
 | [WebSocket 广播](websocket.md) | `anomaly.websocket` |
 | [UI 服务](ui-services.md) | `anomaly.ui`、`window`、`font`、`texture`、`input` |
 | [UE5 服务](ue5-services.md) | `ue5.build`、`ahud`、`framework`、`names`、`objects`、`world` |
-| [NTE 服务](nte-services.md) | `nte.build`、`session`、`player`、`player-teleport`、`map-landmarks`、`navigation`、`pickup`、`entities`、`actors`、`metrics` |
+| [NTE 服务](nte-services.md) | `nte.build`、`session`、`player`、`player-teleport`、`map-landmarks`、`navigation`、`pickup`、`combat`、`skills`、`skill-invocation`、`entities`、`actors`、`metrics` |
 | [Manifest 与 capability](manifest-and-capabilities.md) | Manifest v2 schema、capability 映射、状态码 |
 
 ## ABI 约定
@@ -138,6 +138,9 @@ void*    user;             // 调用每个函数时作为第一个参数回传
 | `anomaly.nte.pickup` | 1 | `nte-pickup` | [nte.pickup](nte-services.md#anomalyntepickup) |
 | `anomaly.nte.entities` | 1 | `nte-entity-snapshot` | [nte.entities](nte-services.md#anomalynteentities) |
 | `anomaly.nte.actors` | 1 | `nte-actor-snapshot` | [nte.actors](nte-services.md#anomalynteactors) |
+| `anomaly.nte.combat` | 1 | `nte-combat-read` | [nte.combat](nte-services.md#anomalyntecombat) |
+| `anomaly.nte.skills` | 1 | `nte-skills-read` | [nte.skills](nte-services.md#anomalynteskills) |
+| `anomaly.nte.skill-invocation` | 1 | `nte-skill-invocation` | [nte.skill-invocation](nte-services.md#anomalynteskill-invocation) |
 | `anomaly.nte.metrics` | 1 | `nte-snapshot-metrics` | [nte.metrics](nte-services.md#anomalyntemetrics) |
 
 所有公开服务均使用版本 1。可选服务仍可能因 capability、活动 Profile 或 Feature gate 而不可用，插件必须按服务粒度降级。

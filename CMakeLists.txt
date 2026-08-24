@@ -399,6 +399,7 @@ add_library(anomaly_adapter_services STATIC
     src/game/ue5/ue5_object_lookup.cpp
     src/game/ue5/ue5_process_event.cpp
     src/game/ue5/ue5_process_event_hook.cpp
+    src/game/ue5/ue5_damage_function_hook.cpp
     src/game/ue5/ue5_nte_adapter.cpp
     src/game/nte/nte_navigation_input_policy.cpp
     src/game/ue5/game_tick_hook.cpp
@@ -1031,19 +1032,27 @@ if(ANOMALY_BUILD_SDK_EXAMPLES)
         MANIFEST examples/nte_inspector/manifest.json
         PACKAGE_NAME NteInspector
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/sdk-examples/NteInspector")
+    anomaly_add_plugin(anomaly_example_nte_combat_demo
+        SOURCES examples/nte_combat_demo/plugin.cpp
+        MANIFEST examples/nte_combat_demo/manifest.json
+        PACKAGE_NAME NteCombatDemo
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/sdk-examples/NteCombatDemo")
     foreach(example_target IN ITEMS anomaly_example_hello_ui anomaly_example_tick_counter
-            anomaly_example_reliable_config anomaly_example_nte_inspector)
+            anomaly_example_reliable_config anomaly_example_nte_inspector
+            anomaly_example_nte_combat_demo)
         target_compile_definitions(${example_target} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
     endforeach()
     set_target_properties(anomaly_example_hello_ui PROPERTIES PDB_NAME HelloUi)
     set_target_properties(anomaly_example_tick_counter PROPERTIES PDB_NAME TickCounter)
     set_target_properties(anomaly_example_reliable_config PROPERTIES PDB_NAME ReliableConfig)
     set_target_properties(anomaly_example_nte_inspector PROPERTIES PDB_NAME NteInspector)
+    set_target_properties(anomaly_example_nte_combat_demo PROPERTIES PDB_NAME NteCombatDemo)
     add_dependencies(anomaly-platform-preview
         anomaly_example_hello_ui
         anomaly_example_tick_counter
         anomaly_example_reliable_config
-        anomaly_example_nte_inspector)
+        anomaly_example_nte_inspector
+        anomaly_example_nte_combat_demo)
 endif()
 
 if(ANOMALY_BUILD_BUILTIN_PLUGINS)
@@ -1090,6 +1099,11 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         MANIFEST plugins/CameraTools/manifest.json
         PACKAGE_NAME CameraTools
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/CameraTools")
+    anomaly_add_plugin(anomaly_builtin_camera_blur_fix
+        SOURCES plugins/CameraBlurFix/plugin.cpp
+        MANIFEST plugins/CameraBlurFix/manifest.json
+        PACKAGE_NAME CameraBlurFix
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/CameraBlurFix")
     anomaly_add_plugin(anomaly_builtin_teleport_landmarks_probe
         SOURCES plugins/TeleportLandmarksProbe/plugin.cpp
         MANIFEST plugins/TeleportLandmarksProbe/manifest.json
@@ -1119,6 +1133,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
             anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
             anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
             anomaly_builtin_fake_uid anomaly_builtin_camera_tools
+            anomaly_builtin_camera_blur_fix
             anomaly_builtin_teleport_landmarks_probe
             anomaly_builtin_map_spawn_exporter
             anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
@@ -1151,6 +1166,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     set_target_properties(anomaly_builtin_pink_paw_heist_esp PROPERTIES PDB_NAME PinkPawHeistESP)
     set_target_properties(anomaly_builtin_fake_uid PROPERTIES PDB_NAME FakeUID)
     set_target_properties(anomaly_builtin_camera_tools PROPERTIES PDB_NAME CameraTools)
+    set_target_properties(anomaly_builtin_camera_blur_fix PROPERTIES PDB_NAME CameraBlurFix)
     set_target_properties(anomaly_builtin_teleport_landmarks_probe PROPERTIES PDB_NAME TeleportLandmarksProbe)
     set_target_properties(anomaly_builtin_map_spawn_exporter PROPERTIES PDB_NAME MapSpawnExporter)
     set_target_properties(anomaly_builtin_wallet_collector PROPERTIES PDB_NAME WalletCollector)
@@ -1163,6 +1179,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
+        anomaly_builtin_camera_blur_fix
         anomaly_builtin_teleport_landmarks_probe
         anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
@@ -1171,6 +1188,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
+        anomaly_builtin_camera_blur_fix
         anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
 endif()
@@ -1197,6 +1215,7 @@ anomaly_stage_platform_preview_plugin(anomaly_example_hello_ui HelloUi)
 anomaly_stage_platform_preview_plugin(anomaly_example_tick_counter TickCounter)
 anomaly_stage_platform_preview_plugin(anomaly_example_reliable_config ReliableConfig)
 anomaly_stage_platform_preview_plugin(anomaly_example_nte_inspector NteInspector)
+anomaly_stage_platform_preview_plugin(anomaly_example_nte_combat_demo NteCombatDemo)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_position NtePosition)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_teleport NteTeleport)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_nte_navigation NteNavmeshDemo)
@@ -1205,6 +1224,7 @@ anomaly_stage_platform_preview_plugin(anomaly_builtin_entity_esp EntityESP)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_pink_paw_heist_esp PinkPawHeistESP)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_fake_uid FakeUID)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_camera_tools CameraTools)
+anomaly_stage_platform_preview_plugin(anomaly_builtin_camera_blur_fix CameraBlurFix)
 anomaly_stage_platform_preview_plugin(
     anomaly_builtin_teleport_landmarks_probe TeleportLandmarksProbe)
 anomaly_stage_platform_preview_plugin(
@@ -1302,10 +1322,12 @@ set(ANOMALY_RELEASE_PE_TARGETS
 foreach(runtime_plugin_target IN ITEMS
         anomaly_example_hello_ui anomaly_example_tick_counter
         anomaly_example_reliable_config anomaly_example_nte_inspector
+        anomaly_example_nte_combat_demo
         anomaly_builtin_nte_position anomaly_builtin_nte_teleport
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
+        anomaly_builtin_camera_blur_fix
         anomaly_builtin_teleport_landmarks_probe
         anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
@@ -1332,6 +1354,13 @@ install(TARGETS anomaly_core
     LIBRARY DESTINATION Anomaly COMPONENT GameRuntime)
 install(TARGETS anomaly_crash_coordinator
     RUNTIME DESTINATION Anomaly COMPONENT GameRuntime)
+if(TARGET anomaly_example_nte_combat_demo)
+    install(TARGETS anomaly_example_nte_combat_demo
+        RUNTIME DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime)
+    install(FILES examples/nte_combat_demo/manifest.json
+        DESTINATION Anomaly/plugins/NteCombatDemo COMPONENT GameRuntime)
+endif()
 if(TARGET anomaly_builtin_nte_position)
     install(TARGETS anomaly_builtin_nte_position
         RUNTIME DESTINATION Anomaly/plugins/NtePosition COMPONENT GameRuntime
@@ -1403,6 +1432,13 @@ if(TARGET anomaly_builtin_camera_tools)
         DESTINATION Anomaly/plugins/CameraTools COMPONENT GameRuntime)
     install(DIRECTORY plugins/CameraTools/locales/
         DESTINATION Anomaly/plugins/CameraTools/locales COMPONENT GameRuntime)
+endif()
+if(TARGET anomaly_builtin_camera_blur_fix)
+    install(TARGETS anomaly_builtin_camera_blur_fix
+        RUNTIME DESTINATION Anomaly/plugins/CameraBlurFix COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/CameraBlurFix COMPONENT GameRuntime)
+    install(FILES plugins/CameraBlurFix/manifest.json
+        DESTINATION Anomaly/plugins/CameraBlurFix COMPONENT GameRuntime)
 endif()
 if(TARGET anomaly_builtin_teleport_landmarks_probe)
     install(TARGETS anomaly_builtin_teleport_landmarks_probe
@@ -1478,6 +1514,8 @@ install(FILES examples/reliable_config/plugin.cpp examples/reliable_config/manif
     DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/reliable_config COMPONENT SDK)
 install(FILES examples/nte_inspector/plugin.cpp examples/nte_inspector/manifest.json
     DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/nte_inspector COMPONENT SDK)
+install(FILES examples/nte_combat_demo/plugin.cpp examples/nte_combat_demo/manifest.json
+    DESTINATION ${ANOMALY_SDK_EXAMPLES_DESTINATION}/nte_combat_demo COMPONENT SDK)
 configure_package_config_file(
     cmake/sdk/AnomalySDKConfig.cmake.in
     "${CMAKE_CURRENT_BINARY_DIR}/AnomalySDKConfig.cmake"

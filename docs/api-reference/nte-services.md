@@ -1,6 +1,6 @@
 # NTE 服务
 
-对应头文件：`services/nte.h`。这些是**高层 NTE 语义服务**：会话事件、玩家 / 相机、实体 / Actor 分页与快照指标。它们只在活动 [Profile](../user-guide/nte-profiles.md) 的相应符号验证通过后发布，否则按 Feature 保持 `UNAVAILABLE`。通用约定见 [API 参考总览](README.md)。
+对应头文件：`services/nte.h`。这些是**高层 NTE 语义服务**：会话事件、玩家 / 相机、实体 / Actor、角色战斗、技能与快照指标。它们只在活动 [Profile](../user-guide/nte-profiles.md) 的相应符号和运行时反射形状验证通过后发布，否则按 Feature 保持 `UNAVAILABLE`。通用约定见 [API 参考总览](README.md)。
 
 > [!IMPORTANT]
 > 服务表属于一个 Host 生命周期 generation。来自已停止 / 已替换 generation 的缓存表只报告 `UNAVAILABLE`（标量查询返回 0），且非零 cursor / generation 不跨 Host 重启存活。
@@ -17,7 +17,7 @@ typedef uint32_t AnomalyNteSnapshotFlagsV1;
 #define ANOMALY_NTE_SNAPSHOT_V1_PARTIAL (1u << 31u)
 ```
 
-`VALID / STALE / PARTIAL` 与过期 generation 不可用于普通绘制。
+没有 `VALID` 或带 `STALE` 的快照不可作为当前状态使用；`PARTIAL` 表示其余字段仍有效但服务明确缺少一部分数据，具体缺失项由各服务合同说明。过期 generation 必须重新取得当前 frame / snapshot。
 
 ## `anomaly.nte.pickup`
 
@@ -378,6 +378,162 @@ typedef struct AnomalyNteEntitiesServiceV1 {
 `AnomalyNteActorsServiceV1` 与 `AnomalyNteEntitiesServiceV1` 具有相同函数形状，但用于 **Actor discovery**。某个 World 的首次 `frame` 请求会扫描所有已加载 UWorld level 并为该 World 缓存结果；反射读同样仅在 Game 回调域内有效。
 
 Actor discovery 有意与高频的 Entity 快照分离——前者面向全量枚举，后者面向每帧采样。
+
+---
+
+## `anomaly.nte.combat`
+
+- **ID**：`"anomaly.nte.combat"` · **版本** 1 · **capability** `nte-combat-read`
+
+```c
+typedef struct AnomalyNteCombatantSnapshotV1 {
+    uint32_t struct_size; uint32_t flags; uint64_t sequence;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 target;
+    double hp; double max_hp; double shield;
+} AnomalyNteCombatantSnapshotV1;
+
+typedef struct AnomalyNteDamageEventV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t sequence; uint64_t tick_sequence;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 attacker;
+    AnomalyGenerationHandleV1 victim;
+    uint64_t source_id;
+    int64_t display_damage; int64_t basic_damage; int64_t final_damage;
+    double hit_location[3];
+    uint32_t damage_type; uint32_t display_type;
+    uint32_t reaction_type; uint32_t reaction_display_type;
+} AnomalyNteDamageEventV1;
+```
+
+`current_combatant` 返回当前玩家角色的 HP、最大 HP、护盾、死亡状态和攻击目标。`DEAD` 是 combatant 专用低位标志；`VALID / STALE / PARTIAL` 继续使用公共快照高位。目标对象解析失败时目标 handle 为零且快照标记 `PARTIAL`，不会暴露 UObject 地址。
+
+伤害采集只 Hook `AHTAbilityCharacter::CharacterOnDamaged` 的精确原生广播模板，不经过飘字函数、全局 `ProcessEvent` 或 Actor vtable。广播实参直接提供 `FHTDamageEvent`、受击角色、伤害发起角色和 causer；`final_damage` 是 `FHTDamageEvent::Damage` 的整数舍入值，事件带 `ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT`。`source_id` 来自同一事件的 `DamageGEDef` 弱对象并解析为精确 Gameplay Effect 对象路径；该路径没有客户端展示值、暴击或命中位置语义，因此对应字段保持 0 且不设置相关 flags。
+
+```c
+typedef enum AnomalyNteCombatDirectionV1 {
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_ANY = 0,
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_ATTACKER = 1,
+    ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_VICTIM = 2
+} AnomalyNteCombatDirectionV1;
+
+typedef struct AnomalyNteCombatStatisticsRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    uint64_t source_id;
+    uint32_t direction; uint32_t reserved;
+} AnomalyNteCombatStatisticsRequestV1;
+
+typedef struct AnomalyNteCombatStatisticsV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t through_sequence;
+    uint64_t hit_count; uint64_t critical_count; uint64_t head_hit_count;
+    int64_t display_damage_total;
+    int64_t basic_damage_total;
+    int64_t final_damage_total;
+} AnomalyNteCombatStatisticsV1;
+```
+
+`next_damage_event(after_sequence, ...)` 返回第一个更大的保留序列。固定 ring 溢出、World 切换或 Host 重启会使旧非零 cursor 过期；过期和当前没有新事件都返回 `NOT_FOUND`。调用方可比较 `latest_damage_sequence`：若最新序列大于 cursor 但仍取不到下一条，应从 0 重新建立保留窗口游标。
+
+`statistics` 要求当前 `world`，并可按 `source_id`、角色和方向过滤；零 `character` / `source_id` 表示不应用该过滤。统计覆盖当前 World 的宿主保留窗口，ring 曾覆盖或解析曾丢弃时设置 `PARTIAL`，64 位累计饱和时同时设置 `OVERFLOW`，不会整数环绕。`source_name_utf8` 返回当前 combat generation 中缓存的 FName 或精确 `GameplayEffect` 对象路径。`participant_path_utf8` 返回伤害采集时在游戏线程缓存的 attacker/victim UObject 路径；过期 generation 或未参与已采集事件的 handle 返回 `NOT_FOUND`，服务调用本身不会跨线程读取 UObject。
+
+```c
+typedef struct AnomalyNteCombatServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *current_combatant)(void*, AnomalyNteCombatantSnapshotV1*);
+    uint64_t (ANOMALY_CALL *latest_damage_sequence)(void*);
+    AnomalyStatusV1 (ANOMALY_CALL *next_damage_event)(void*, uint64_t, AnomalyNteDamageEventV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *statistics)(void*, const AnomalyNteCombatStatisticsRequestV1*, AnomalyNteCombatStatisticsV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *source_name_utf8)(void*, uint64_t, char*, size_t*);
+    AnomalyStatusV1 (ANOMALY_CALL *participant_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
+} AnomalyNteCombatServiceV1;
+```
+
+消费端应在 Game 域 `on_update` 中查询 combat 服务：先比较 `latest_damage_sequence`，只在序列变化时有界调用 `next_damage_event`，并在接纳新事件时各解析一次 source、attacker 和 victim。HP、统计和解析结果应立即转换为插件自有、可直接绘制的不可变快照。Render 域 `on_draw` 只复制该本地快照并调用 UI 服务，不查询 combat 服务、不推进 cursor，也不解析名称。完整消费边界见 [`examples/nte_combat_demo`](../../examples/nte_combat_demo/plugin.cpp)。
+
+---
+
+## `anomaly.nte.skills`
+
+- **ID**：`"anomaly.nte.skills"` · **版本** 1 · **capability** `nte-skills-read`
+- **单页容量上限**：`ANOMALY_NTE_SKILL_PAGE_V1_MAX_CAPACITY` = 128
+
+```c
+typedef struct AnomalyNteSkillFrameV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation; uint64_t sequence;
+    AnomalyGenerationHandleV1 character;
+    uint32_t skill_count; uint32_t reserved;
+} AnomalyNteSkillFrameV1;
+
+typedef struct AnomalyNteSkillSnapshotV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 handle;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 ability_class;
+    uint64_t sequence;
+    int32_t level; int32_t input_id;
+    float cooldown_remaining_seconds; float cooldown_duration_seconds;
+} AnomalyNteSkillSnapshotV1;
+
+typedef struct AnomalyNteSkillPageRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation;
+    uint32_t offset; uint32_t capacity;
+} AnomalyNteSkillPageRequestV1;
+
+typedef struct AnomalyNteSkillPageResultV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t generation; uint64_t sequence;
+    uint32_t total_skills; uint32_t returned;
+    uint32_t next_offset; uint32_t reserved;
+} AnomalyNteSkillPageResultV1;
+```
+
+`frame` 固定当前不可变技能帧，`snapshot_at` 和 `page` 只访问 Host cache。分页首请求可使用 generation 0，后续请求必须回传结果 generation；技能重排保持同一组 spec identity 的 handle，技能移除、重新授予、角色 / World 切换或 spec identity 改变会产生新 generation，使旧 handle 返回 `NOT_FOUND`。
+
+skill handle 是宿主生成的 opaque identity，不等于 `FGameplayAbilitySpecHandle`。`ability_class` 同样是 generation handle，只能传给 `ability_path_utf8`，不能解释为 UE 地址。v1 已发布 level、input、active / input-pressed / remove 状态；冷却标签形状尚未独立验证，因此当前技能带 `PARTIAL` 且不带 `COOLDOWN_VALID`，两个冷却浮点字段为 0。
+
+```c
+typedef struct AnomalyNteSkillsServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *frame)(void*, AnomalyNteSkillFrameV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *snapshot_at)(void*, uint64_t, uint32_t, AnomalyNteSkillSnapshotV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *page)(void*, const AnomalyNteSkillPageRequestV1*, AnomalyNteSkillSnapshotV1*, AnomalyNteSkillPageResultV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *ability_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
+    AnomalyStatusV1 (ANOMALY_CALL *snapshot_by_handle)(void*, AnomalyGenerationHandleV1, AnomalyNteSkillSnapshotV1*);
+} AnomalyNteSkillsServiceV1;
+```
+
+---
+
+## `anomaly.nte.skill-invocation`
+
+- **ID**：`"anomaly.nte.skill-invocation"` · **版本** 1 · **capability** `nte-skill-invocation`
+
+```c
+typedef struct AnomalyNteSkillInvocationRequestV1 {
+    uint32_t struct_size; uint32_t flags;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 character;
+    AnomalyGenerationHandleV1 skill;
+} AnomalyNteSkillInvocationRequestV1;
+
+typedef struct AnomalyNteSkillInvocationResultV1 {
+    uint32_t struct_size; uint32_t flags;
+    uint64_t tick_sequence;
+    uint32_t accepted; uint32_t reserved;
+} AnomalyNteSkillInvocationResultV1;
+```
+
+> [!CAUTION]
+> 这是独立的**修改**类服务，只能在 Game 回调域调用。`world`、`character` 和 `skill` 必须来自当前 combat / skills 快照，`flags` 必须为 0。宿主在调用前重新验证当前 ASC、spec handle、ability CDO 与 ability class identity，然后仅通过已验证的 `HTTryActivateAbilityByClass` 入口请求激活；不接受任意路径、UFunction、参数缓冲、目标或位置。
+
+`activate` 返回 `OK` 表示反射桥接调用正常完成，游戏返回的 bool 写入 `accepted`。`accepted == 0` 是游戏拒绝本次请求，不等于 ABI 调用失败；非 Game 线程返回 `CONFLICT`，stale generation 返回 `NOT_FOUND`，且宿主不会自动重试。Render 域 Draw 回调只能把用户意图写入插件自有队列，随后由 Game 域 `on_update` 调用该服务。
 
 ---
 
