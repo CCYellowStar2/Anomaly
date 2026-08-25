@@ -164,6 +164,8 @@ std::string BuildSnapshot() {
     AppendUnsigned(output, ANOMALY_CONFIG_SERVICE_V1_VERSION);
     output.append(",\n    \"ANOMALY_STORAGE_SERVICE_V1_VERSION\": ");
     AppendUnsigned(output, ANOMALY_STORAGE_SERVICE_V1_VERSION);
+    output.append(",\n    \"ANOMALY_JSON_SERVICE_V1_VERSION\": ");
+    AppendUnsigned(output, ANOMALY_JSON_SERVICE_V1_VERSION);
     output.append(",\n    \"ANOMALY_RUNTIME_INFO_SERVICE_V1_VERSION\": ");
     AppendUnsigned(output, ANOMALY_RUNTIME_INFO_SERVICE_V1_VERSION);
     output.append(",\n    \"ANOMALY_DIAGNOSTICS_SERVICE_V1_VERSION\": ");
@@ -306,6 +308,18 @@ std::string BuildSnapshot() {
         alignof(AnomalyFeatureStateV1),
         {{"ANOMALY_FEATURE_V1_UNAVAILABLE", ANOMALY_FEATURE_V1_UNAVAILABLE},
          {"ANOMALY_FEATURE_V1_AVAILABLE", ANOMALY_FEATURE_V1_AVAILABLE}},
+        false);
+    AppendEnum(
+        output,
+        "AnomalyJsonKindV1",
+        sizeof(AnomalyJsonKindV1),
+        alignof(AnomalyJsonKindV1),
+        {{"ANOMALY_JSON_V1_NULL", ANOMALY_JSON_V1_NULL},
+         {"ANOMALY_JSON_V1_BOOLEAN", ANOMALY_JSON_V1_BOOLEAN},
+         {"ANOMALY_JSON_V1_NUMBER", ANOMALY_JSON_V1_NUMBER},
+         {"ANOMALY_JSON_V1_STRING", ANOMALY_JSON_V1_STRING},
+         {"ANOMALY_JSON_V1_ARRAY", ANOMALY_JSON_V1_ARRAY},
+         {"ANOMALY_JSON_V1_OBJECT", ANOMALY_JSON_V1_OBJECT}},
         false);
     AppendEnum(
         output,
@@ -776,6 +790,27 @@ std::string BuildSnapshot() {
          {"read", offsetof(AnomalyStorageServiceV1, read)},
          {"write_atomic", offsetof(AnomalyStorageServiceV1, write_atomic)},
          {"remove", offsetof(AnomalyStorageServiceV1, remove)}},
+        false);
+    AppendStruct(
+        output,
+        "AnomalyJsonServiceV1",
+        sizeof(AnomalyJsonServiceV1),
+        alignof(AnomalyJsonServiceV1),
+        {{"struct_size", offsetof(AnomalyJsonServiceV1, struct_size)},
+         {"service_version", offsetof(AnomalyJsonServiceV1, service_version)},
+         {"user", offsetof(AnomalyJsonServiceV1, user)},
+         {"parse", offsetof(AnomalyJsonServiceV1, parse)},
+         {"release", offsetof(AnomalyJsonServiceV1, release)},
+         {"kind", offsetof(AnomalyJsonServiceV1, kind)},
+         {"boolean_value", offsetof(AnomalyJsonServiceV1, boolean_value)},
+         {"number_value", offsetof(AnomalyJsonServiceV1, number_value)},
+         {"string_value", offsetof(AnomalyJsonServiceV1, string_value)},
+         {"array_size", offsetof(AnomalyJsonServiceV1, array_size)},
+         {"array_item", offsetof(AnomalyJsonServiceV1, array_item)},
+         {"object_size", offsetof(AnomalyJsonServiceV1, object_size)},
+         {"object_key_at", offsetof(AnomalyJsonServiceV1, object_key_at)},
+         {"object_find", offsetof(AnomalyJsonServiceV1, object_find)},
+         {"serialize", offsetof(AnomalyJsonServiceV1, serialize)}},
         false);
     AppendStruct(
         output,
@@ -1926,6 +1961,8 @@ std::string BuildSnapshot() {
         ANOMALY_CONFIG_SERVICE_V1_VERSION, "AnomalyConfigServiceV1", false);
     AppendService(output, ANOMALY_STORAGE_SERVICE_V1_ID,
         ANOMALY_STORAGE_SERVICE_V1_VERSION, "AnomalyStorageServiceV1", false);
+    AppendService(output, ANOMALY_JSON_SERVICE_V1_ID,
+        ANOMALY_JSON_SERVICE_V1_VERSION, "AnomalyJsonServiceV1", false);
     AppendService(output, ANOMALY_RUNTIME_INFO_SERVICE_V1_ID,
         ANOMALY_RUNTIME_INFO_SERVICE_V1_VERSION, "AnomalyRuntimeInfoServiceV1", false);
     AppendService(output, ANOMALY_DIAGNOSTICS_SERVICE_V1_ID,
