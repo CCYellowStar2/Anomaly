@@ -185,7 +185,7 @@
     "dataTable.rowMapFlagsNum": 40,
     "dataTable.rowMapFlagsMax": 44,
     "dataTable.maxRows": 4096,
-    "gameData.teleportPointDataTable": 400,
+    "gameData.teleportPointDataTable": 408,
     "teleportPoint.belongsLevel": 8,
     "teleportPoint.floor": 40,
     "teleportPoint.transformTranslation": 96,
