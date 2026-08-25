@@ -88,6 +88,56 @@ typedef struct AnomalyStorageServiceV1 {
 
 ---
 
+## `anomaly.json`
+
+- **ID**：`"anomaly.json"` · **版本** 1 · **capability** `json`
+
+为插件提供作用域内的轻量 JSON DOM 解析 / 遍历 / 序列化。所有返回的 handle 都绑定
+plugin generation，插件停止时由 Scope 统一失效；插件也可以在不再使用时主动 `release`。
+
+```c
+typedef enum AnomalyJsonKindV1 {
+    ANOMALY_JSON_V1_NULL = 0, ANOMALY_JSON_V1_BOOLEAN = 1,
+    ANOMALY_JSON_V1_NUMBER = 2, ANOMALY_JSON_V1_STRING = 3,
+    ANOMALY_JSON_V1_ARRAY = 4, ANOMALY_JSON_V1_OBJECT = 5
+} AnomalyJsonKindV1;
+
+typedef struct AnomalyJsonServiceV1 {
+    uint32_t struct_size; uint32_t service_version; void* user;
+    AnomalyStatusV1 (ANOMALY_CALL *parse)(void* user, AnomalyStringViewV1 document,
+        AnomalyGenerationHandleV1* handle);
+    AnomalyStatusV1 (ANOMALY_CALL *release)(void* user, AnomalyGenerationHandleV1 handle);
+    AnomalyStatusV1 (ANOMALY_CALL *kind)(void* user, AnomalyGenerationHandleV1 handle,
+        uint32_t* kind);
+    AnomalyStatusV1 (ANOMALY_CALL *boolean_value)(void* user,
+        AnomalyGenerationHandleV1 handle, int32_t* value);
+    AnomalyStatusV1 (ANOMALY_CALL *number_value)(void* user,
+        AnomalyGenerationHandleV1 handle, double* value);
+    AnomalyStatusV1 (ANOMALY_CALL *string_value)(void* user,
+        AnomalyGenerationHandleV1 handle, char* destination, size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *array_size)(void* user,
+        AnomalyGenerationHandleV1 handle, size_t* size);
+    AnomalyStatusV1 (ANOMALY_CALL *array_item)(void* user,
+        AnomalyGenerationHandleV1 handle, size_t index, AnomalyGenerationHandleV1* child);
+    AnomalyStatusV1 (ANOMALY_CALL *object_size)(void* user,
+        AnomalyGenerationHandleV1 handle, size_t* size);
+    AnomalyStatusV1 (ANOMALY_CALL *object_key_at)(void* user,
+        AnomalyGenerationHandleV1 handle, size_t index, char* destination,
+        size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *object_find)(void* user,
+        AnomalyGenerationHandleV1 handle, AnomalyStringViewV1 key,
+        AnomalyGenerationHandleV1* child);
+    AnomalyStatusV1 (ANOMALY_CALL *serialize)(void* user,
+        AnomalyGenerationHandleV1 handle, char* destination, size_t* inout_size);
+} AnomalyJsonServiceV1;
+```
+
+`parse` 接受完整 UTF-8 JSON 文档；`string_value` / `serialize` / `object_key_at` 遵循
+两段式缓冲协议。`array_item` 和 `object_find` 返回的 child handle 也必须释放，或随
+plugin generation 一起失效。
+
+---
+
 ## `anomaly.runtime-info`
 
 - **ID**：`"anomaly.runtime-info"` · **版本** 1 · **capability** `runtime-info`
