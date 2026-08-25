@@ -208,6 +208,18 @@ void RecordMouseMessage(
 }
 
 void ReconcileAsyncInput(EmbeddedState& state, EmbeddedInputMailbox& mailbox) noexcept {
+    // GetAsyncKeyState reads the desktop-wide keyboard state, which would leak
+    // keystrokes typed into other applications into game-local input (and
+    // therefore into plugin hotkeys). Only reconcile physical keys while the
+    // game window owns the foreground.
+    const bool foreground =
+        state.window != nullptr && GetForegroundWindow() == state.window;
+    if (!foreground) {
+        mailbox.frame.keys.fill(false);
+        mailbox.frame.mouse_buttons.fill(false);
+        UpdateModifiers(mailbox.frame);
+        return;
+    }
     for (std::size_t key = 1; key < mailbox.frame.keys.size(); ++key) {
         mailbox.frame.keys[key] =
             (GetAsyncKeyState(static_cast<int>(key)) & 0x8000) != 0;

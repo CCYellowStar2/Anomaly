@@ -7067,7 +7067,19 @@ void RunPlatform(
             const auto settings = settings_snapshot();
             if (settings.ready) host.toggle_key = settings.values.input_menu_toggle;
         }
-        const int toggle_state = GetAsyncKeyState(static_cast<int>(host.toggle_key));
+        // The menu hotkey must only react while the game (or, in attached mode,
+        // the overlay host itself) owns focus, not while the user is typing in
+        // an unrelated application.
+        const HWND foreground_window = GetForegroundWindow();
+        const bool host_window_focused =
+            host.window != nullptr && foreground_window == host.window;
+        const bool game_window_focused =
+            host.attached && host.target != nullptr &&
+            foreground_window == host.target;
+        const bool menu_focus = host_window_focused || game_window_focused;
+        const int toggle_state = menu_focus
+            ? GetAsyncKeyState(static_cast<int>(host.toggle_key))
+            : 0;
         if (anomaly::ShouldTogglePlatformMenus(
                 PlatformUiCapturingHotkey(), toggle_state)) {
             if (!host.visible) {

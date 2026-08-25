@@ -1351,7 +1351,13 @@ void RenderEmbedded(IDXGISwapChain* swap_chain, UINT flags) {
         const auto settings = state->diagnostics.settings_snapshot();
         if (settings.ready) toggle_key = settings.values.input_menu_toggle;
     }
-    const int toggle_state = GetAsyncKeyState(static_cast<int>(toggle_key));
+    // The menu hotkey must only react while the game window owns focus, not
+    // while the user is typing in an unrelated application.
+    const bool game_focused =
+        state->window != nullptr && GetForegroundWindow() == state->window;
+    const int toggle_state = game_focused
+        ? GetAsyncKeyState(static_cast<int>(toggle_key))
+        : 0;
     if (anomaly::ShouldTogglePlatformMenus(
             PlatformUiCapturingHotkey(), toggle_state)) {
         const bool expanding = anomaly::HostUiMenusCollapsed();
