@@ -1485,12 +1485,10 @@ struct Ue5NteAdapter::State {
     }
 
     [[nodiscard]] bool AhudFeatureAvailable() const noexcept {
-        return static_cast<bool>(process_event_invoker) &&
-            framework_hook_ready && ahud_hook_ready &&
+        return framework_hook_ready && ahud_hook_ready &&
             resolution.FeatureAvailable("ue5.ahud") &&
             resolution.FeatureAvailable("ue5.functions") &&
             resolution.FeatureAvailable(kUe5ProcessEventFeature) &&
-            resolution.FeatureAvailable(kUe5ActorProcessEventFeature) &&
             LayoutKeysAvailable(profile, {
                 "object.class",
                 "object.nameOffset",
@@ -1513,25 +1511,7 @@ struct Ue5NteAdapter::State {
                 "fboolProperty.fieldMask"}) &&
             FeatureDeclaresDependency(profile, "ue5.ahud", "ue5.functions") &&
             FeatureDeclaresDependency(
-                profile, "ue5.ahud", kUe5ActorProcessEventFeature) &&
-            FeatureDeclaresDependency(
-                profile,
-                kUe5ActorProcessEventFeature,
-                kUe5ProcessEventFeature) &&
-            FeatureDeclaresSymbol(
-                profile, kUe5ProcessEventFeature, kUe5ProcessEventSymbol) &&
-            FeatureDeclaresLayoutValidator(
-                profile,
-                kUe5ProcessEventFeature,
-                kUe5ProcessEventAbiValidator) &&
-            FeatureDeclaresSymbol(
-                profile,
-                kUe5ActorProcessEventFeature,
-                kUe5ActorProcessEventSymbol) &&
-            FeatureDeclaresLayoutValidator(
-                profile,
-                kUe5ActorProcessEventFeature,
-                kUe5ActorProcessEventAbiValidator) &&
+                profile, "ue5.ahud", kUe5ProcessEventFeature) &&
             FeatureDeclaresLayoutValidator(
                 profile, "ue5.ahud", "ue5-ahud-reflection-v1");
     }
@@ -4711,7 +4691,7 @@ struct Ue5NteAdapter::State {
         std::uintptr_t object,
         std::uintptr_t function,
         void* parameters,
-        const ProcessEventInvoker& actor_process_event) noexcept;
+        const ProcessEventInvoker& process_event) noexcept;
 
     [[nodiscard]] bool BuildTeleportBindingLocked(
         const std::uintptr_t function,
@@ -9009,9 +8989,9 @@ void Ue5NteAdapter::State::DispatchAhudFrame(
     const std::uintptr_t object,
     const std::uintptr_t function,
     void* const parameters,
-    const ProcessEventInvoker& actor_process_event) noexcept {
+    const ProcessEventInvoker& process_event) noexcept {
     if (object == 0 || function == 0 || parameters == nullptr ||
-        !actor_process_event ||
+        !process_event ||
         !started.load(std::memory_order_acquire) ||
         GetCurrentThreadId() != game_thread_id.load(std::memory_order_acquire)) {
         return;
@@ -9040,7 +9020,7 @@ void Ue5NteAdapter::State::DispatchAhudFrame(
     AhudFrameCallContext context{
         object,
         binding.get(),
-        &actor_process_event,
+        &process_event,
         &ahud_process_event_call_count};
     const AnomalyUe5AhudFrameV1 frame{
         sizeof(AnomalyUe5AhudFrameV1),
@@ -9737,9 +9717,9 @@ void Ue5NteAdapter::OnProcessEvent(
     const std::uintptr_t object,
     const std::uintptr_t function,
     void* const parameters,
-    const ProcessEventInvoker& actor_process_event) noexcept {
+    const ProcessEventInvoker& process_event) noexcept {
     const auto state = state_;
-    state->DispatchAhudFrame(object, function, parameters, actor_process_event);
+    state->DispatchAhudFrame(object, function, parameters, process_event);
 }
 
 void Ue5NteAdapter::OnProcessEventPre(

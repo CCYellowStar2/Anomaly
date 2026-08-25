@@ -175,7 +175,7 @@
     "ue5.object-find": ["ue5.StaticFindObject"],
     "ue5.process-event": ["ue5.ProcessEvent"],
     "ue5.actor-process-event": ["ue5.AActorProcessEvent"],
-    "ue5.ahud": [],
+    "ue5.ahud": ["ue5.ProcessEvent"],
     "ue5.actors": ["ue5.GWorld", "ue5.GameTick", "ue5.FNamePool"],
     "ue5.functions": ["ue5.GObjects", "ue5.GameTick", "ue5.FNamePool"],
     "nte.session": ["ue5.GWorld", "ue5.GameTick"],
@@ -265,7 +265,7 @@
     "ue5.functions": ["ue5.objects", "ue5.names"],
     "ue5.object-find": ["ue5.objects"],
     "ue5.actor-process-event": ["ue5.process-event"],
-    "ue5.ahud": ["ue5.functions", "ue5.actor-process-event"],
+    "ue5.ahud": ["ue5.functions", "ue5.process-event"],
     "nte.player-esp": ["nte.player"],
     "nte.player-teleport": [
       "nte.player",

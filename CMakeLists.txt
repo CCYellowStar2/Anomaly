@@ -399,6 +399,7 @@ add_library(anomaly_adapter_services STATIC
     src/game/ue5/ue5_object_lookup.cpp
     src/game/ue5/ue5_process_event.cpp
     src/game/ue5/ue5_process_event_hook.cpp
+    src/game/ue5/ue5_actor_process_event_hook.cpp
     src/game/ue5/ue5_damage_function_hook.cpp
     src/game/ue5/ue5_nte_adapter.cpp
     src/game/nte/nte_navigation_input_policy.cpp
