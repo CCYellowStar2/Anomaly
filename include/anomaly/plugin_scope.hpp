@@ -30,6 +30,7 @@ enum class PluginResourceKind : std::uint8_t {
     Notification,
     Diagnostics,
     NteEscMenuButton,
+    Json,
 };
 
 struct PluginResourceRecord {

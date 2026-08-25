@@ -1307,6 +1307,11 @@ bool ValidPluginStateId(const std::string_view id) noexcept {
     return saw_separator && segment_size != 0 && !previous_hyphen;
 }
 
+struct JsonNode final {
+    std::shared_ptr<nlohmann::json> root;
+    nlohmann::json* value{};
+};
+
 struct PluginServiceContext {
     PluginManager* manager{};
     PluginUiProxyContext* ui_proxy_context{};
@@ -1328,6 +1333,7 @@ struct PluginServiceContext {
     AnomalyPluginStateServiceV1 plugin_state{};
     AnomalyConfigServiceV1 config{};
     AnomalyStorageServiceV1 storage{};
+    AnomalyJsonServiceV1 json{};
     AnomalyRuntimeInfoServiceV1 runtime_info{};
     AnomalyLocalizationServiceV1 localization{};
     AnomalyDiagnosticsServiceV1 diagnostics{};
@@ -1348,6 +1354,8 @@ struct PluginServiceContext {
     AnomalyInputServiceV1 input_service{};
     std::shared_ptr<AhudProxyState> ahud_state;
     AnomalyUe5AhudServiceV1 ahud{};
+    std::mutex json_mutex;
+    std::unordered_map<std::uint64_t, JsonNode> json_nodes;
     std::vector<anomaly::UiResourceHandle> open_windows;
     std::vector<anomaly::UiResourceHandle> pushed_fonts;
 };
@@ -2885,6 +2893,294 @@ AnomalyStatusV1 ANOMALY_CALL InputCaptureStateV1(void* user, std::uint32_t* flag
     });
 }
 
+AnomalyStatusV1 JsonCopyString(
+    const std::string_view source, char* destination, std::size_t* inout_size) noexcept {
+    if (inout_size == nullptr) {
+        return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "result size is required");
+    }
+    const std::size_t required = source.size() + 1U;
+    if (destination == nullptr) {
+        *inout_size = required;
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    }
+    if (*inout_size < required) {
+        *inout_size = required;
+        return StatusV1(ANOMALY_STATUS_V1_BUFFER_TOO_SMALL, "destination is too small");
+    }
+    if (!source.empty()) std::memcpy(destination, source.data(), source.size());
+    destination[source.size()] = '\0';
+    *inout_size = required;
+    return StatusV1(ANOMALY_STATUS_V1_OK);
+}
+
+void EraseJsonNode(PluginServiceContext* context, const std::uint64_t id) noexcept {
+    if (context == nullptr) return;
+    try {
+        std::scoped_lock lock(context->json_mutex);
+        context->json_nodes.erase(id);
+    } catch (...) {
+    }
+}
+
+AnomalyStatusV1 RegisterJsonNode(
+    PluginServiceContext& context, std::shared_ptr<nlohmann::json> root,
+    nlohmann::json* value, AnomalyGenerationHandleV1* handle) noexcept {
+    auto token = std::make_shared<std::uint64_t>(0);
+    const std::uint64_t resource =
+        context.scope->Register(
+            anomaly::PluginResourceKind::Json, "anomaly.json.value",
+            [&context, token] { EraseJsonNode(&context, *token); });
+    if (resource == 0) {
+        return StatusV1(ANOMALY_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+    }
+    *token = resource;
+    {
+        std::scoped_lock lock(context.json_mutex);
+        context.json_nodes.insert_or_assign(
+            resource, JsonNode{std::move(root), value});
+    }
+    *handle = {resource, context.generation};
+    return StatusV1(ANOMALY_STATUS_V1_OK);
+}
+
+template <typename Callback>
+AnomalyStatusV1 InvokeJsonService(void* user, Callback&& callback) noexcept {
+    auto* context = static_cast<PluginServiceContext*>(user);
+    if (!ValidServiceContext(context)) {
+        return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "plugin JSON context is invalid");
+    }
+    auto lease = AcquireServiceCallback(context);
+    if (!lease) return StatusV1(ANOMALY_STATUS_V1_UNAVAILABLE, "plugin scope is stopping");
+    try {
+        return callback(*context);
+    } catch (...) {
+        return StatusV1(ANOMALY_STATUS_V1_FAILED, "JSON service failed");
+    }
+}
+
+bool FindJsonNode(
+    PluginServiceContext& context, const AnomalyGenerationHandleV1 handle,
+    JsonNode& node) noexcept {
+    if (handle.id == 0 || handle.generation != context.generation) return false;
+    std::scoped_lock lock(context.json_mutex);
+    const auto found = context.json_nodes.find(handle.id);
+    if (found == context.json_nodes.end() || found->second.value == nullptr) return false;
+    node = found->second;
+    return true;
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonParseV1(
+    void* user, const AnomalyStringViewV1 document,
+    AnomalyGenerationHandleV1* handle) {
+    if (handle == nullptr || (document.data == nullptr && document.size != 0)) {
+        return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON document is invalid");
+    }
+    *handle = {};
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        if (document.size == 0 || document.data == nullptr) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON document is empty");
+        }
+        auto root = std::make_shared<nlohmann::json>(
+            nlohmann::json::parse(document.data, document.data + document.size));
+        return RegisterJsonNode(context, std::move(root), root.get(), handle);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonReleaseV1(
+    void* user, const AnomalyGenerationHandleV1 handle) {
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        if (handle.id == 0 || handle.generation != context.generation) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON handle is invalid");
+        }
+        return context.scope->Release(handle.id)
+            ? StatusV1(ANOMALY_STATUS_V1_OK)
+            : StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonKindV1(
+    void* user, const AnomalyGenerationHandleV1 handle, std::uint32_t* kind) {
+    if (kind == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "kind is null");
+    *kind = ANOMALY_JSON_V1_NULL;
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        switch (node.value->type()) {
+        case nlohmann::json::value_t::null: *kind = ANOMALY_JSON_V1_NULL; break;
+        case nlohmann::json::value_t::boolean: *kind = ANOMALY_JSON_V1_BOOLEAN; break;
+        case nlohmann::json::value_t::number_integer:
+        case nlohmann::json::value_t::number_unsigned:
+        case nlohmann::json::value_t::number_float: *kind = ANOMALY_JSON_V1_NUMBER; break;
+        case nlohmann::json::value_t::string: *kind = ANOMALY_JSON_V1_STRING; break;
+        case nlohmann::json::value_t::array: *kind = ANOMALY_JSON_V1_ARRAY; break;
+        case nlohmann::json::value_t::object: *kind = ANOMALY_JSON_V1_OBJECT; break;
+        default: *kind = ANOMALY_JSON_V1_NULL; break;
+        }
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonBooleanV1(
+    void* user, const AnomalyGenerationHandleV1 handle, std::int32_t* value) {
+    if (value == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "value is null");
+    *value = 0;
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_boolean()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not boolean");
+        }
+        *value = node.value->get<bool>() ? 1 : 0;
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonNumberV1(
+    void* user, const AnomalyGenerationHandleV1 handle, double* value) {
+    if (value == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "value is null");
+    *value = 0.0;
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_number()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not a number");
+        }
+        *value = node.value->get<double>();
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonStringV1(
+    void* user, const AnomalyGenerationHandleV1 handle,
+    char* destination, std::size_t* inout_size) {
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_string()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not a string");
+        }
+        return JsonCopyString(node.value->get_ref<const std::string&>(), destination, inout_size);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonArraySizeV1(
+    void* user, const AnomalyGenerationHandleV1 handle, std::size_t* size) {
+    if (size == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "size is null");
+    *size = 0;
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_array()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not an array");
+        }
+        *size = node.value->size();
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonArrayItemV1(
+    void* user, const AnomalyGenerationHandleV1 handle, const std::size_t index,
+    AnomalyGenerationHandleV1* child) {
+    if (child == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "child is null");
+    *child = {};
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_array()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not an array");
+        }
+        if (index >= node.value->size()) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON array index is out of range");
+        }
+        return RegisterJsonNode(context, node.root, &(*node.value)[index], child);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonObjectSizeV1(
+    void* user, const AnomalyGenerationHandleV1 handle, std::size_t* size) {
+    if (size == nullptr) return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "size is null");
+    *size = 0;
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_object()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not an object");
+        }
+        *size = node.value->size();
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonObjectKeyAtV1(
+    void* user, const AnomalyGenerationHandleV1 handle, const std::size_t index,
+    char* destination, std::size_t* inout_size) {
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_object()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not an object");
+        }
+        std::size_t current = 0;
+        for (auto iterator = node.value->begin(); iterator != node.value->end(); ++iterator) {
+            if (current++ == index) {
+                return JsonCopyString(iterator.key(), destination, inout_size);
+            }
+        }
+        return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON object index is out of range");
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonObjectFindV1(
+    void* user, const AnomalyGenerationHandleV1 handle,
+    const AnomalyStringViewV1 key, AnomalyGenerationHandleV1* child) {
+    if (child == nullptr || key.data == nullptr) {
+        return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON object lookup is invalid");
+    }
+    *child = {};
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        if (!node.value->is_object()) {
+            return StatusV1(ANOMALY_STATUS_V1_INVALID_ARGUMENT, "JSON value is not an object");
+        }
+        auto found = node.value->find(std::string(key.data, key.size));
+        if (found == node.value->end()) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON object key is missing");
+        }
+        return RegisterJsonNode(context, node.root, &found.value(), child);
+    });
+}
+
+AnomalyStatusV1 ANOMALY_CALL JsonSerializeV1(
+    void* user, const AnomalyGenerationHandleV1 handle,
+    char* destination, std::size_t* inout_size) {
+    return InvokeJsonService(user, [&](PluginServiceContext& context) {
+        JsonNode node;
+        if (!FindJsonNode(context, handle, node)) {
+            return StatusV1(ANOMALY_STATUS_V1_NOT_FOUND, "JSON handle is not live");
+        }
+        return JsonCopyString(node.value->dump(), destination, inout_size);
+    });
+}
+
 AnomalyStatusV1 ANOMALY_CALL QueryServiceV1(
     void* host_context, AnomalyStringViewV1 service_id,
     std::uint32_t minimum_version, const void** service) {
@@ -2924,6 +3220,11 @@ AnomalyStatusV1 ANOMALY_CALL QueryServiceV1(
     if (id == ANOMALY_STORAGE_SERVICE_V1_ID &&
         minimum_version <= context->storage.service_version) {
         *service = &context->storage;
+        return StatusV1(ANOMALY_STATUS_V1_OK);
+    }
+    if (id == ANOMALY_JSON_SERVICE_V1_ID &&
+        minimum_version <= context->json.service_version) {
+        *service = &context->json;
         return StatusV1(ANOMALY_STATUS_V1_OK);
     }
     if (id == ANOMALY_RUNTIME_INFO_SERVICE_V1_ID &&
@@ -3894,6 +4195,12 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     plugin.service_context.storage = {
         sizeof(AnomalyStorageServiceV1), ANOMALY_STORAGE_SERVICE_V1_VERSION,
         &plugin.service_context, ReadStorageV1, WriteStorageV1, RemoveStorageV1};
+    plugin.service_context.json = {
+        sizeof(AnomalyJsonServiceV1), ANOMALY_JSON_SERVICE_V1_VERSION,
+        &plugin.service_context,
+        JsonParseV1, JsonReleaseV1, JsonKindV1, JsonBooleanV1, JsonNumberV1,
+        JsonStringV1, JsonArraySizeV1, JsonArrayItemV1, JsonObjectSizeV1,
+        JsonObjectKeyAtV1, JsonObjectFindV1, JsonSerializeV1};
     plugin.service_context.runtime_info = {
         sizeof(AnomalyRuntimeInfoServiceV1), ANOMALY_RUNTIME_INFO_SERVICE_V1_VERSION,
         &plugin.service_context, RuntimeInfoV1, RuntimeVersionV1};
@@ -5667,6 +5974,8 @@ PluginRuntimeDiagnosticsSnapshot PluginManager::DiagnosticsSnapshot() const {
                     plugin.service_context.config.service_version, true},
                 ServiceCandidate{ANOMALY_STORAGE_SERVICE_V1_ID,
                     plugin.service_context.storage.service_version, true},
+                ServiceCandidate{ANOMALY_JSON_SERVICE_V1_ID,
+                    plugin.service_context.json.service_version, true},
                 ServiceCandidate{ANOMALY_RUNTIME_INFO_SERVICE_V1_ID,
                     plugin.service_context.runtime_info.service_version, true},
                 ServiceCandidate{ANOMALY_LOCALIZATION_SERVICE_V1_ID,
