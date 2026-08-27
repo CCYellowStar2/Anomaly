@@ -1105,6 +1105,11 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         MANIFEST plugins/CameraBlurFix/manifest.json
         PACKAGE_NAME CameraBlurFix
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/CameraBlurFix")
+    anomaly_add_plugin(anomaly_builtin_better_pose
+        SOURCES plugins/BetterPose/plugin.cpp
+        MANIFEST plugins/BetterPose/manifest.json
+        PACKAGE_NAME BetterPose
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/BetterPose")
     anomaly_add_plugin(anomaly_builtin_teleport_landmarks_probe
         SOURCES plugins/TeleportLandmarksProbe/plugin.cpp
         MANIFEST plugins/TeleportLandmarksProbe/manifest.json
@@ -1127,6 +1132,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/DllLoader")
     target_link_libraries(anomaly_builtin_fake_uid PRIVATE nlohmann_json::nlohmann_json)
     target_link_libraries(anomaly_builtin_camera_tools PRIVATE nlohmann_json::nlohmann_json)
+    target_link_libraries(anomaly_builtin_better_pose PRIVATE nlohmann_json::nlohmann_json)
     target_link_libraries(anomaly_builtin_dll_loader PRIVATE nlohmann_json::nlohmann_json)
 
     foreach(builtin_target IN ITEMS
@@ -1134,7 +1140,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
             anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
             anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
             anomaly_builtin_fake_uid anomaly_builtin_camera_tools
-            anomaly_builtin_camera_blur_fix
+            anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
             anomaly_builtin_teleport_landmarks_probe
             anomaly_builtin_map_spawn_exporter
             anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
@@ -1158,6 +1164,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     anomaly_copy_builtin_locales(anomaly_builtin_pink_paw_heist_esp PinkPawHeistESP)
     anomaly_copy_builtin_locales(anomaly_builtin_fake_uid FakeUID)
     anomaly_copy_builtin_locales(anomaly_builtin_camera_tools CameraTools)
+    anomaly_copy_builtin_locales(anomaly_builtin_better_pose BetterPose)
     anomaly_copy_builtin_locales(anomaly_builtin_wallet_collector WalletCollector)
     set_target_properties(anomaly_builtin_nte_position PROPERTIES PDB_NAME NtePosition)
     set_target_properties(anomaly_builtin_nte_teleport PROPERTIES PDB_NAME NteTeleport)
@@ -1168,6 +1175,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     set_target_properties(anomaly_builtin_fake_uid PROPERTIES PDB_NAME FakeUID)
     set_target_properties(anomaly_builtin_camera_tools PROPERTIES PDB_NAME CameraTools)
     set_target_properties(anomaly_builtin_camera_blur_fix PROPERTIES PDB_NAME CameraBlurFix)
+    set_target_properties(anomaly_builtin_better_pose PROPERTIES PDB_NAME BetterPose)
     set_target_properties(anomaly_builtin_teleport_landmarks_probe PROPERTIES PDB_NAME TeleportLandmarksProbe)
     set_target_properties(anomaly_builtin_map_spawn_exporter PROPERTIES PDB_NAME MapSpawnExporter)
     set_target_properties(anomaly_builtin_wallet_collector PROPERTIES PDB_NAME WalletCollector)
@@ -1180,7 +1188,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
-        anomaly_builtin_camera_blur_fix
+        anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
         anomaly_builtin_teleport_landmarks_probe
         anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
@@ -1189,7 +1197,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
         anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
-        anomaly_builtin_camera_blur_fix
+        anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
         anomaly_builtin_map_spawn_exporter
         anomaly_builtin_wallet_collector anomaly_builtin_dll_loader)
 endif()
@@ -1226,6 +1234,7 @@ anomaly_stage_platform_preview_plugin(anomaly_builtin_pink_paw_heist_esp PinkPaw
 anomaly_stage_platform_preview_plugin(anomaly_builtin_fake_uid FakeUID)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_camera_tools CameraTools)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_camera_blur_fix CameraBlurFix)
+anomaly_stage_platform_preview_plugin(anomaly_builtin_better_pose BetterPose)
 anomaly_stage_platform_preview_plugin(
     anomaly_builtin_teleport_landmarks_probe TeleportLandmarksProbe)
 anomaly_stage_platform_preview_plugin(
@@ -1440,6 +1449,15 @@ if(TARGET anomaly_builtin_camera_blur_fix)
         LIBRARY DESTINATION Anomaly/plugins/CameraBlurFix COMPONENT GameRuntime)
     install(FILES plugins/CameraBlurFix/manifest.json
         DESTINATION Anomaly/plugins/CameraBlurFix COMPONENT GameRuntime)
+endif()
+if(TARGET anomaly_builtin_better_pose)
+    install(TARGETS anomaly_builtin_better_pose
+        RUNTIME DESTINATION Anomaly/plugins/BetterPose COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/BetterPose COMPONENT GameRuntime)
+    install(FILES plugins/BetterPose/manifest.json
+        DESTINATION Anomaly/plugins/BetterPose COMPONENT GameRuntime)
+    install(DIRECTORY plugins/BetterPose/locales/
+        DESTINATION Anomaly/plugins/BetterPose/locales COMPONENT GameRuntime)
 endif()
 if(TARGET anomaly_builtin_teleport_landmarks_probe)
     install(TARGETS anomaly_builtin_teleport_landmarks_probe
