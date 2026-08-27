@@ -6,7 +6,7 @@
     "plugin.description": "自定义 NTE 客户端界面上显示的 UID，不修改账号数据。",
     "current.detecting": "当前 UID：检测中",
     "current.value": "当前 UID：{0}",
-    "field.hide_prefix": "隐藏 UID：前缀",
+    "field.hide_prefix": "隐藏UID：",
     "field.display_uid": "显示 UID",
     "display.value": "显示 UID：{0}",
     "action.apply": "应用",
