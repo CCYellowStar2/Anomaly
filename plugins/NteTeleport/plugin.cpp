@@ -1,4 +1,6 @@
 #include "anomaly/sdk/cpp.hpp"
+#include "anomaly/sdk/services/core.h"
+#include "anomaly/sdk/services/interop.h"
 #include "plugins/common/localization.hpp"
 
 #include <Windows.h>
@@ -41,6 +43,37 @@ constexpr std::size_t kMaximumImportedPoints = 4096;
 constexpr std::size_t kMaximumPointNameBytes = 255;
 constexpr std::size_t kMaximumPointCategoryBytes = 255;
 constexpr std::size_t kPointsPerPage = 10;
+
+// Tracked map target read chain. These offsets mirror the validated UE5/NTE
+// layout used by the active profile and the 5.6.1-0+UE5-HT SDK dump.
+constexpr std::string_view kGWorldPattern =
+    "48 8B 1D ?? ?? ?? ?? 48 85 DB 74 ?? 41 B0 01";
+constexpr std::uint32_t kRipDisplacementOffset = 3;
+constexpr std::uint32_t kRipInstructionSize = 7;
+constexpr std::uint32_t kWorldGameInstanceOffset = 0x230;
+constexpr std::uint32_t kGameInstanceLocalPlayersOffset = 0x38;
+constexpr std::uint32_t kLocalPlayerControllerOffset = 0x30;
+constexpr std::uint32_t kControllerPlayerStateOffset = 0x2D0;
+// HTPlayerState.CurrentPathEffectParam (NavPathEffectParam) -> GoalLocation
+// (FVector, double precision = 24 bytes). Verified against the live game:
+// the currently tracked map target is stored here (also mirrored in the
+// NavigationPathEffectActor's LastRequestParam).
+constexpr std::uint32_t kPlayerStateCurrentPathEffectOffset = 0x1BD0;
+constexpr std::uint32_t kNavPathEffectGoalLocationOffset = 0x28;
+// The host teleport bridge uses bSweep=false and places the actor exactly at
+// the requested position. Coordinates taken from map markers, imported points
+// or tracked goals are often at (or slightly below) the walkable floor, which
+// leaves the character embedded in geometry. We lift the target Z before
+// sending, then watch the player for a short window and re-issue with a higher
+// lift if the player is still well below the intended landing height.
+constexpr double kLandingLiftDefault = 250.0;
+constexpr double kLandingLiftMaximum = 2000.0;
+constexpr std::uint32_t kSinkRetriesDefault = 2;
+constexpr std::uint32_t kSinkRetriesMaximum = 8;
+constexpr std::uint32_t kLandingSettleTicks = 40;
+constexpr std::uint32_t kLandingWatchTicks = 180;
+constexpr double kSinkThreshold = 300.0;
+constexpr double kSinkRetryLiftStep = 200.0;
 constexpr std::string_view kSettingsSchema = R"json(
 {
   "type": "object",
@@ -68,6 +101,8 @@ constexpr std::string_view kSettingsSchema = R"json(
     },
     "forwardDistance": {"type": "number"},
     "zLift": {"type": "number"},
+    "landingLift": {"type": "number"},
+    "sinkRetries": {"type": "integer"},
     "forwardHotkey": {"type": "integer"},
     "points": {
       "type": "array", "maxItems": 4096,
@@ -111,6 +146,8 @@ struct TeleportSettings {
     std::vector<CoordinatePreset> presets;
     double forward_distance{1000.0};
     double z_lift{100.0};
+    double landing_lift{250.0};
+    std::uint32_t sink_retries{2};
     std::uint32_t forward_hotkey{};
     std::vector<ImportedPoint> points;
 };
@@ -119,9 +156,25 @@ enum class TeleportAction : std::uint8_t { none, forward };
 
 struct PendingTeleport {
     bool queued{};
+    bool apply_landing_lift{true};
     AnomalyGenerationHandleV1 world{};
     AnomalyGenerationHandleV1 player{};
     double position[3]{};
+};
+
+// Tracks a teleport after it is issued so the plugin can detect the player
+// sinking into geometry (the host bridge uses bSweep=false and places the
+// actor exactly at the requested position). When the player's Z stays well
+// below the intended landing Z after a short settle window, we re-issue the
+// teleport with a higher landing lift instead of leaving the player inside
+// the ground.
+struct LandingMonitor {
+    bool active{};
+    AnomalyGenerationHandleV1 world{};
+    AnomalyGenerationHandleV1 player{};
+    double base_position[3]{};
+    std::uint32_t retries{};
+    std::uint32_t settle_ticks{};
 };
 
 struct Context {
@@ -131,16 +184,26 @@ struct Context {
     const AnomalyInputServiceV1* input{};
     const AnomalyJsonServiceV1* json{};
     const AnomalySchedulerServiceV1* scheduler{};
+    const AnomalyCoreServiceV1* core{};
+    const AnomalySignatureServiceV1* signature{};
     AnomalyGenerationHandleV1 settings_schema{};
     double target[3]{};
+    std::uintptr_t g_world_address{};
+    bool tracked_target_valid{};
+    bool tracked_target_read_requested{};
+    bool tracked_target_teleport_requested{};
+    std::array<double, 3> tracked_target{};
     std::vector<CoordinatePreset> presets;
     std::vector<ImportedPoint> imported_points;
     double forward_distance{1000.0};
     double z_lift{100.0};
+    double landing_lift{250.0};
+    std::uint32_t sink_retries{2};
     std::uint32_t forward_hotkey_key{};
     AnomalyGenerationHandleV1 forward_hotkey{};
     bool capturing_forward{};
     TeleportAction hotkey_action{TeleportAction::none};
+    LandingMonitor landing{};
     std::string import_folder;
     std::vector<ImportFile> import_files;
     std::size_t imported_page{};
@@ -340,6 +403,113 @@ bool SchedulerMethodsAvailable(const AnomalySchedulerServiceV1* service) noexcep
         HasField<AnomalySchedulerServiceV1, decltype(AnomalySchedulerServiceV1::schedule)>(
             service, offsetof(AnomalySchedulerServiceV1, schedule)) &&
         service->schedule != nullptr;
+}
+
+bool CoreMethodsAvailable(const AnomalyCoreServiceV1* service) noexcept {
+    return service != nullptr &&
+        service->service_version >= ANOMALY_CORE_SERVICE_V1_VERSION &&
+        HasField<AnomalyCoreServiceV1, decltype(AnomalyCoreServiceV1::read_memory)>(
+            service, offsetof(AnomalyCoreServiceV1, read_memory)) &&
+        service->read_memory != nullptr;
+}
+
+bool SignatureMethodsAvailable(const AnomalySignatureServiceV1* service) noexcept {
+    return service != nullptr &&
+        service->service_version >= ANOMALY_SIGNATURE_SERVICE_V1_VERSION &&
+        HasField<AnomalySignatureServiceV1, decltype(AnomalySignatureServiceV1::resolve)>(
+            service, offsetof(AnomalySignatureServiceV1, resolve)) &&
+        service->resolve != nullptr;
+}
+
+bool IsFinitePosition(const double position[3]) noexcept;
+bool IsFinitePosition(const std::array<double, 3>& position) noexcept;
+bool TryReadCurrentPosition(const AnomalyHostApiV1* host, double position[3]);
+
+bool ReadBytes(
+    const std::uintptr_t address, void* destination, const std::size_t size) noexcept {
+    if (!CoreMethodsAvailable(g_context.core) || address == 0 || destination == nullptr ||
+        size == 0) {
+        return false;
+    }
+    AnomalyMutableByteSpanV1 output{static_cast<std::uint8_t*>(destination), size};
+    return g_context.core->read_memory(g_context.core->user, address, output).code ==
+        ANOMALY_STATUS_V1_OK;
+}
+
+template <typename Value>
+bool ReadValue(const std::uintptr_t address, Value& value) noexcept {
+    return ReadBytes(address, &value, sizeof(value));
+}
+
+bool AddAddress(const std::uintptr_t base, const std::uint64_t offset,
+                std::uintptr_t& result) noexcept {
+    if (base == 0 || offset > (std::numeric_limits<std::uintptr_t>::max)() - base) return false;
+    result = base + static_cast<std::uintptr_t>(offset);
+    return true;
+}
+
+bool ReadPointerAt(const std::uintptr_t base, const std::uint64_t offset,
+                   std::uintptr_t& value) noexcept {
+    std::uintptr_t address{};
+    return AddAddress(base, offset, address) && ReadValue(address, value) && value != 0;
+}
+
+bool ResolveSignature(const std::string_view pattern, std::uintptr_t& address) noexcept {
+    address = 0;
+    if (!SignatureMethodsAvailable(g_context.signature)) return false;
+    return g_context.signature->resolve(
+        g_context.signature->user, anomaly::sdk::StringView("HTGame.exe"),
+        anomaly::sdk::StringView(".text"), anomaly::sdk::StringView(pattern), &address).code ==
+        ANOMALY_STATUS_V1_OK && address != 0;
+}
+
+bool ResolveGWorld() noexcept {
+    if (g_context.g_world_address != 0) return true;
+    std::uintptr_t instruction{};
+    if (!ResolveSignature(kGWorldPattern, instruction)) return false;
+    std::int32_t displacement{};
+    std::uintptr_t displacement_address{};
+    if (!AddAddress(instruction, kRipDisplacementOffset, displacement_address) ||
+        !ReadValue(displacement_address, displacement)) return false;
+    const auto resolved = static_cast<std::intptr_t>(instruction) +
+        static_cast<std::intptr_t>(kRipInstructionSize) + displacement;
+    if (resolved <= 0) return false;
+    g_context.g_world_address = static_cast<std::uintptr_t>(resolved);
+    return true;
+}
+
+bool ReadTrackedTarget(double position[3]) noexcept {
+    if (!ResolveGWorld()) return false;
+    std::uintptr_t world{};
+    std::uintptr_t game_instance{};
+    std::uintptr_t local_players{};
+    std::uintptr_t local_player{};
+    std::uintptr_t controller{};
+    std::uintptr_t player_state{};
+    if (!ReadValue(g_context.g_world_address, world) || world == 0 ||
+        !ReadPointerAt(world, kWorldGameInstanceOffset, game_instance) ||
+        !ReadPointerAt(game_instance, kGameInstanceLocalPlayersOffset, local_players) ||
+        !ReadValue(local_players, local_player) || local_player == 0 ||
+        !ReadPointerAt(local_player, kLocalPlayerControllerOffset, controller) ||
+        !ReadPointerAt(controller, kControllerPlayerStateOffset, player_state)) {
+        return false;
+    }
+    std::uintptr_t goal_location{};
+    if (!AddAddress(player_state,
+                    kPlayerStateCurrentPathEffectOffset + kNavPathEffectGoalLocationOffset,
+                    goal_location)) {
+        return false;
+    }
+    std::array<double, 3> location{};
+    if (!ReadBytes(goal_location, location.data(), sizeof(location))) return false;
+    if (!IsFinitePosition(location) ||
+        !std::ranges::any_of(location, [](const double value) {
+            return std::abs(value) > 1.0;
+        })) {
+        return false;
+    }
+    std::ranges::copy(location, position);
+    return true;
 }
 
 void DrawText(const AnomalyUiServiceV1* ui, const std::string_view text) {
@@ -678,6 +848,10 @@ bool ParseSettingsDocument(const std::string_view document, TeleportSettings& se
             if (!reader.ReadNumber(settings.forward_distance)) return false;
         } else if (key == "zLift") {
             if (!reader.ReadNumber(settings.z_lift)) return false;
+        } else if (key == "landingLift") {
+            if (!reader.ReadNumber(settings.landing_lift)) return false;
+        } else if (key == "sinkRetries") {
+            if (!reader.ReadUnsigned(settings.sink_retries)) return false;
         } else if (key == "forwardHotkey") {
             if (!reader.ReadUnsigned(settings.forward_hotkey)) return false;
         } else if (key == "points") {
@@ -694,6 +868,8 @@ bool ParseSettingsDocument(const std::string_view document, TeleportSettings& se
     return target_seen && presets_seen && reader.AtEnd() &&
         IsFinitePosition(settings.target) &&
         std::isfinite(settings.forward_distance) && std::isfinite(settings.z_lift) &&
+        std::isfinite(settings.landing_lift) && settings.landing_lift >= 0.0 &&
+        settings.landing_lift <= 2000.0 && settings.sink_retries <= 8U &&
         settings.forward_hotkey < 256U;
 }
 
@@ -727,6 +903,8 @@ std::string SerializeSettings(const TeleportSettings& settings) {
     }
     document += "],\"forwardDistance\":" + FormatDouble(settings.forward_distance) +
         ",\"zLift\":" + FormatDouble(settings.z_lift) +
+        ",\"landingLift\":" + FormatDouble(settings.landing_lift) +
+        ",\"sinkRetries\":" + std::to_string(settings.sink_retries) +
         ",\"forwardHotkey\":" + std::to_string(settings.forward_hotkey) +
         ",\"points\":[";
     for (std::size_t index = 0; index < settings.points.size(); ++index) {
@@ -777,6 +955,8 @@ bool LoadSettings() {
         g_context.imported_points = std::move(settings.points);
         g_context.forward_distance = settings.forward_distance;
         g_context.z_lift = settings.z_lift;
+        g_context.landing_lift = settings.landing_lift;
+        g_context.sink_retries = settings.sink_retries;
         g_context.forward_hotkey_key = settings.forward_hotkey;
         g_context.settings_dirty = false;
         return true;
@@ -794,6 +974,8 @@ bool SaveSettings() {
         settings.presets = g_context.presets;
         settings.forward_distance = g_context.forward_distance;
         settings.z_lift = g_context.z_lift;
+        settings.landing_lift = g_context.landing_lift;
+        settings.sink_retries = g_context.sink_retries;
         settings.forward_hotkey = g_context.forward_hotkey_key;
         settings.points = g_context.imported_points;
     }
@@ -1387,11 +1569,91 @@ void ScheduleImportFile(Context& context) {
     }
 }
 
+AnomalyStatusV1 IssueTeleport(
+    const AnomalyHostApiV1* host, const AnomalyGenerationHandleV1 world,
+    const AnomalyGenerationHandleV1 player, const double position[3]) {
+    const auto teleport = QueryService<AnomalyNtePlayerTeleportServiceV1>(
+        host, ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_ID,
+        ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_VERSION);
+    if (!teleport ||
+        !HasField<AnomalyNtePlayerTeleportServiceV1,
+            decltype(AnomalyNtePlayerTeleportServiceV1::teleport)>(
+            teleport.service,
+            offsetof(AnomalyNtePlayerTeleportServiceV1, teleport)) ||
+        teleport.service->teleport == nullptr) {
+        return teleport ? StatusCode(ANOMALY_STATUS_V1_UNAVAILABLE) : teleport.status;
+    }
+    AnomalyNtePlayerTeleportRequestV1 request{sizeof(request)};
+    request.flags = 0;
+    request.world = world;
+    request.player = player;
+    for (std::size_t axis = 0; axis != 3; ++axis) request.position[axis] = position[axis];
+    return teleport.service->teleport(teleport.service->user, &request);
+}
+
+void ProcessLandingMonitor(const AnomalyHostApiV1* host) {
+    LandingMonitor monitor{};
+    double landing_lift{};
+    std::uint32_t sink_retries{};
+    {
+        std::scoped_lock lock(g_context.mutex);
+        monitor = g_context.landing;
+        landing_lift = g_context.landing_lift;
+        sink_retries = g_context.sink_retries;
+    }
+    if (!monitor.active || host == nullptr) return;
+
+    ++monitor.settle_ticks;
+    if (monitor.settle_ticks < kLandingSettleTicks) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing.settle_ticks = monitor.settle_ticks;
+        return;
+    }
+    if (monitor.settle_ticks > kLandingWatchTicks) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing = {};
+        return;
+    }
+
+    double player_position[3]{};
+    if (!TryReadCurrentPosition(host, player_position)) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing.settle_ticks = monitor.settle_ticks;
+        return;
+    }
+
+    if (player_position[2] >= monitor.base_position[2] - kSinkThreshold) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing = {};
+        return;
+    }
+    if (monitor.retries >= sink_retries) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing = {};
+        return;
+    }
+
+    std::array<double, 3> retry{};
+    std::ranges::copy(monitor.base_position, retry.begin());
+    const double lift = std::isfinite(landing_lift) ? landing_lift : kLandingLiftDefault;
+    retry[2] += lift + static_cast<double>(monitor.retries + 1U) * kSinkRetryLiftStep;
+    const AnomalyStatusV1 status = IssueTeleport(host, monitor.world, monitor.player, retry.data());
+    if (status.code != ANOMALY_STATUS_V1_OK) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing = {};
+        return;
+    }
+    std::scoped_lock lock(g_context.mutex);
+    g_context.landing.retries = monitor.retries + 1U;
+    g_context.landing.settle_ticks = 0;
+}
+
 void QueueRequest(
     const AnomalyNteSessionSnapshotV1& session, const AnomalyNtePlayerSnapshotV1& player,
-    const double position[3]) noexcept {
+    const double position[3], const bool apply_landing_lift = true) noexcept {
     std::scoped_lock lock(g_context.mutex);
     g_context.pending.queued = true;
+    g_context.pending.apply_landing_lift = apply_landing_lift;
     g_context.pending.world = session.world;
     g_context.pending.player = player.handle;
     for (std::size_t axis = 0; axis != 3; ++axis) {
@@ -1589,7 +1851,7 @@ void QueueDirectionalTeleport(
         RecordResult(ANOMALY_STATUS_V1_INVALID_ARGUMENT);
         return;
     }
-    QueueRequest(session_snapshot, player_snapshot, destination.data());
+    QueueRequest(session_snapshot, player_snapshot, destination.data(), false);
 }
 
 std::string FormatPosition(const std::array<double, 3>& position) {
@@ -1612,6 +1874,10 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         host, ANOMALY_JSON_SERVICE_V1_ID, ANOMALY_JSON_SERVICE_V1_VERSION);
     const auto scheduler = QueryService<AnomalySchedulerServiceV1>(
         host, ANOMALY_SCHEDULER_SERVICE_V1_ID, ANOMALY_SCHEDULER_SERVICE_V1_VERSION);
+    const auto core = QueryService<AnomalyCoreServiceV1>(
+        host, ANOMALY_CORE_SERVICE_V1_ID, ANOMALY_CORE_SERVICE_V1_VERSION);
+    const auto signature = QueryService<AnomalySignatureServiceV1>(
+        host, ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION);
     if (!ui) return ui.status;
     if (!config) return config.status;
     if (!HasUiFunctions(ui.service) || !ConfigMethodsAvailable(config.service)) {
@@ -1627,6 +1893,15 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         g_context.scheduler = SchedulerMethodsAvailable(scheduler.service)
             ? scheduler.service
             : nullptr;
+        g_context.core = CoreMethodsAvailable(core.service) ? core.service : nullptr;
+        g_context.signature = SignatureMethodsAvailable(signature.service)
+            ? signature.service
+            : nullptr;
+        g_context.g_world_address = 0;
+        g_context.tracked_target_valid = false;
+        g_context.tracked_target_read_requested = false;
+        g_context.tracked_target_teleport_requested = false;
+        g_context.tracked_target = {};
         g_context.settings_schema = {};
         g_context.target[0] = 0.0;
         g_context.target[1] = 0.0;
@@ -1635,10 +1910,13 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** context) 
         g_context.imported_points.clear();
         g_context.forward_distance = 1000.0;
         g_context.z_lift = 100.0;
+        g_context.landing_lift = 250.0;
+        g_context.sink_retries = 2;
         g_context.forward_hotkey_key = 0;
         g_context.forward_hotkey = {};
         g_context.capturing_forward = false;
         g_context.hotkey_action = TeleportAction::none;
+        g_context.landing = {};
         g_context.import_folder.clear();
         g_context.import_files.clear();
         g_context.imported_page = 0;
@@ -1685,6 +1963,7 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* context) {
         g_context.pending = {};
         g_context.has_result = false;
         g_context.hotkey_action = TeleportAction::none;
+        g_context.landing = {};
         g_context.result_message[0] = '\0';
     }
     ReleaseHotkeys(g_context);
@@ -1715,12 +1994,20 @@ void ANOMALY_CALL Unload(void* context) {
     g_context.input = nullptr;
     g_context.json = nullptr;
     g_context.scheduler = nullptr;
+    g_context.core = nullptr;
+    g_context.signature = nullptr;
+    g_context.g_world_address = 0;
+    g_context.tracked_target_valid = false;
+    g_context.tracked_target_read_requested = false;
+    g_context.tracked_target_teleport_requested = false;
+    g_context.tracked_target = {};
     g_context.settings_schema = {};
     g_context.presets.clear();
     g_context.imported_points.clear();
     g_context.forward_hotkey = {};
     g_context.capturing_forward = false;
     g_context.hotkey_action = TeleportAction::none;
+    g_context.landing = {};
     g_context.import_folder.clear();
     g_context.import_files.clear();
     g_context.imported_page = 0;
@@ -1767,8 +2054,42 @@ void ANOMALY_CALL Update(void* context, double) {
         return;
     }
 
+    ProcessLandingMonitor(host);
+
     if (import_folder_selected) ScheduleFolderScan(g_context);
     if (import_file_selected) ScheduleImportFile(g_context);
+
+    bool tracked_teleport_requested{};
+    bool tracked_read_requested{};
+    {
+        std::scoped_lock lock(g_context.mutex);
+        tracked_teleport_requested = g_context.tracked_target_teleport_requested;
+        g_context.tracked_target_teleport_requested = false;
+        tracked_read_requested = g_context.tracked_target_read_requested;
+        g_context.tracked_target_read_requested = false;
+    }
+    if (tracked_read_requested) {
+        std::array<double, 3> position{};
+        const bool valid = ReadTrackedTarget(position.data());
+        std::scoped_lock lock(g_context.mutex);
+        g_context.tracked_target_valid = valid;
+        if (valid) g_context.tracked_target = position;
+        else g_context.tracked_target = {};
+    }
+    if (tracked_teleport_requested) {
+        std::array<double, 3> position{};
+        if (ReadTrackedTarget(position.data())) {
+            TryQueueRequest(host, position.data());
+        } else {
+            std::scoped_lock lock(g_context.mutex);
+            g_context.tracked_target_valid = false;
+            g_context.tracked_target = {};
+            g_context.has_result = true;
+            g_context.result_code = ANOMALY_STATUS_V1_UNAVAILABLE;
+            g_context.result_message[0] = '\0';
+        }
+        return;
+    }
 
     if (action != TeleportAction::none) {
         QueueDirectionalTeleport(host, action);
@@ -1776,27 +2097,40 @@ void ANOMALY_CALL Update(void* context, double) {
     }
     if (!pending.queued) return;
 
-    const auto teleport = QueryService<AnomalyNtePlayerTeleportServiceV1>(
-        host, ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_ID,
-        ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_VERSION);
-    if (!teleport ||
-        !HasField<AnomalyNtePlayerTeleportServiceV1,
-            decltype(AnomalyNtePlayerTeleportServiceV1::teleport)>(
-            teleport.service,
-            offsetof(AnomalyNtePlayerTeleportServiceV1, teleport)) ||
-        teleport.service->teleport == nullptr) {
-        RecordResult(teleport ? StatusCode(ANOMALY_STATUS_V1_UNAVAILABLE) : teleport.status);
-        return;
+    // The host teleport bridge places the actor exactly at the requested
+    // position (bSweep=false). Coordinates from map markers, imported points
+    // or tracked goals are frequently at (or just below) the walkable floor,
+    // which leaves the character embedded in the ground. When enabled we lift
+    // the destination Z so the character falls onto the surface, then watch
+    // the player for a short window and re-issue with a higher lift if it
+    // still sank through geometry.
+    double landing_lift{};
+    std::uint32_t sink_retries{};
+    {
+        std::scoped_lock lock(g_context.mutex);
+        landing_lift = g_context.landing_lift;
+        sink_retries = g_context.sink_retries;
     }
 
-    AnomalyNtePlayerTeleportRequestV1 request{sizeof(request)};
-    request.flags = 0;
-    request.world = pending.world;
-    request.player = pending.player;
-    for (std::size_t axis = 0; axis != 3; ++axis) request.position[axis] = pending.position[axis];
-    const AnomalyStatusV1 status = teleport.service->teleport(
-        teleport.service->user, &request);
+    std::array<double, 3> target{};
+    std::ranges::copy(pending.position, target.begin());
+    if (pending.apply_landing_lift && std::isfinite(landing_lift) && landing_lift > 0.0) {
+        target[2] += landing_lift;
+    }
+    const AnomalyStatusV1 status = IssueTeleport(host, pending.world, pending.player, target.data());
     RecordResult(status);
+
+    if (status.code == ANOMALY_STATUS_V1_OK && pending.apply_landing_lift &&
+        std::isfinite(landing_lift) && landing_lift > 0.0) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.landing = {};
+        g_context.landing.active = true;
+        g_context.landing.world = pending.world;
+        g_context.landing.player = pending.player;
+        std::ranges::copy(pending.position, g_context.landing.base_position);
+        g_context.landing.retries = 0;
+        g_context.landing.settle_ticks = 0;
+    }
 }
 
 void DrawImportStatus(const AnomalyUiServiceV1* ui) {
@@ -1862,6 +2196,52 @@ void DrawTabCoordinate(
             ui->user, anomaly::sdk::StringView(apply), 0.0F, 0.0F) != 0) {
         TryQueueRequest(host, target);
     }
+    ui->end_tab_item(ui->user);
+}
+
+void DrawTabTrackedTarget(const AnomalyUiServiceV1* ui) {
+    const std::string label = g_context.localizer.Label(
+        "tab.tracked_target", "Tracked Target", "tab-tracked-target");
+    if (ui->begin_tab_item(
+            ui->user, anomaly::sdk::StringView(label), nullptr, 0, 1) == 0) {
+        return;
+    }
+
+    bool available{};
+    std::array<double, 3> position{};
+    {
+        std::scoped_lock lock(g_context.mutex);
+        available = g_context.tracked_target_valid;
+        position = g_context.tracked_target;
+    }
+
+    ui->separator(ui->user);
+    if (available) {
+        DrawText(ui, g_context.localizer.Format(
+            "tracked.position", "Tracked target: {0}",
+            std::array{std::string_view(FormatPosition(position))}));
+    } else {
+        DrawText(ui, g_context.localizer.Text(
+            "tracked.unavailable", "No tracked map target available"));
+    }
+
+    const std::string refresh = g_context.localizer.Label(
+        "action.tracked.refresh", "Read tracked target", "read-tracked-target");
+    if (ui->button(
+            ui->user, anomaly::sdk::StringView(refresh), 0.0F, 0.0F) != 0) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.tracked_target_read_requested = true;
+    }
+
+    const std::string teleport = g_context.localizer.Label(
+        "action.tracked.teleport", "Teleport to tracked target", "teleport-tracked-target");
+    if (ui->button_enabled(
+            ui->user, anomaly::sdk::StringView(teleport), 0.0F, 0.0F,
+            available ? 1 : 0) != 0) {
+        std::scoped_lock lock(g_context.mutex);
+        g_context.tracked_target_teleport_requested = true;
+    }
+
     ui->end_tab_item(ui->user);
 }
 
@@ -2068,12 +2448,16 @@ void DrawTabSettings(const AnomalyUiServiceV1* ui) {
     std::uint32_t forward_key{};
     double forward_distance{};
     double z_lift{};
+    double landing_lift{};
+    std::uint32_t sink_retries{};
     {
         std::scoped_lock lock(g_context.mutex);
         capturing_forward = g_context.capturing_forward;
         forward_key = g_context.forward_hotkey_key;
         forward_distance = g_context.forward_distance;
         z_lift = g_context.z_lift;
+        landing_lift = g_context.landing_lift;
+        sink_retries = g_context.sink_retries;
     }
 
     const std::string forward_name = forward_key == 0
@@ -2105,6 +2489,17 @@ void DrawTabSettings(const AnomalyUiServiceV1* ui) {
     options_changed |= ui->input_double(
         ui->user, anomaly::sdk::StringView(z_lift_label),
         &z_lift, 10.0, 100.0) != 0;
+    const std::string landing_lift_label = g_context.localizer.Label(
+        "settings.distance.landing_lift", "Landing lift", "landing-lift");
+    const std::string sink_retries_label = g_context.localizer.Label(
+        "settings.distance.sink_retries", "Sink retries", "sink-retries");
+    double sink_retries_input = static_cast<double>(sink_retries);
+    options_changed |= ui->input_double(
+        ui->user, anomaly::sdk::StringView(landing_lift_label),
+        &landing_lift, 0.0, 300.0) != 0;
+    options_changed |= ui->input_double(
+        ui->user, anomaly::sdk::StringView(sink_retries_label),
+        &sink_retries_input, 0.0, 4.0) != 0;
     {
         std::scoped_lock lock(g_context.mutex);
         if (options_changed) {
@@ -2112,6 +2507,13 @@ void DrawTabSettings(const AnomalyUiServiceV1* ui) {
                 g_context.forward_distance = forward_distance;
             }
             if (std::isfinite(z_lift)) g_context.z_lift = z_lift;
+            if (std::isfinite(landing_lift)) {
+                g_context.landing_lift = std::clamp(landing_lift, 0.0, kLandingLiftMaximum);
+            }
+            if (std::isfinite(sink_retries_input)) {
+                g_context.sink_retries = std::clamp(
+                    static_cast<std::uint32_t>(sink_retries_input), 0U, kSinkRetriesMaximum);
+            }
             g_context.settings_dirty = true;
         }
     }
@@ -2149,6 +2551,7 @@ void ANOMALY_CALL Draw(void* context, const AnomalyUiServiceV1* ui) {
     if (input_ui->begin_tab_bar(
             input_ui->user, anomaly::sdk::StringView("teleport-tabs"), 0) != 0) {
         DrawTabCoordinate(input_ui, host, target);
+        DrawTabTrackedTarget(input_ui);
         DrawTabPoints(input_ui, host);
         DrawTabSettings(input_ui);
         input_ui->end_tab_bar(input_ui->user);
@@ -2167,6 +2570,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
         anomaly::sdk::StringView("anomaly.builtin.nte-teleport"),
         anomaly::sdk::StringView("Teleport"), anomaly::sdk::StringView("Anomaly"),
-        anomaly::sdk::StringView("1.3.0"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("1.4.0"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }

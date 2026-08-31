@@ -6,7 +6,7 @@
   "author": "Anomaly",
   "license": "AGPL-3.0-only",
   "audience": "developer",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "entry": "plugin.dll",
   "api": {"major": 1, "minMinor": 0, "maxMinor": 0},
   "games": ["nte"],
@@ -19,9 +19,11 @@
     {"id": "anomaly.json", "minVersion": 1, "optional": true},
     {"id": "anomaly.scheduler", "minVersion": 1, "optional": true},
     {"id": "anomaly.plugin-state", "minVersion": 1, "optional": true},
+    {"id": "anomaly.core", "minVersion": 1, "optional": true},
+    {"id": "anomaly.interop.signature", "minVersion": 1, "optional": true},
     {"id": "anomaly.nte.session", "minVersion": 1, "optional": true},
     {"id": "anomaly.nte.player", "minVersion": 1, "optional": true},
     {"id": "anomaly.nte.player-teleport", "minVersion": 1, "optional": true}
   ],
-  "capabilities": ["ui", "configuration", "input", "json", "scheduler", "nte-session-snapshot", "nte-player-snapshot", "nte-player-teleport"]
+  "capabilities": ["ui", "configuration", "input", "json", "scheduler", "memory-read", "interop-signature", "nte-session-snapshot", "nte-player-snapshot", "nte-player-teleport"]
 }

@@ -34,6 +34,15 @@ inline constexpr std::string_view kTextToStringPattern =
     "?? ?? ?? 48 8B C3 48 83 C4 20 5B C3";
 inline constexpr std::string_view kGObjectsPattern =
     "48 8B 05 ?? ?? ?? ?? 48 8B 0C C8 48 8B 04 D1 C3 33 C0 48 8B 00 C3";
+inline constexpr std::string_view kProcessEventPattern =
+    // Start five bytes into the function. Anomaly's public ProcessEvent
+    // observer may already have replaced the entry with an E9 detour before
+    // this plugin hot-loads; the remaining prologue is stable and unique.
+    "54 41 55 41 56 41 57 48 81 EC 00 01 00 00 48 8D 6C 24 30 "
+    "48 89 9D 28 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C5 48 89 85 C0 00 00 00 "
+    "8B 41 08 4D 8B F0 C1 E8 1E 48 8B FA F6 D0 4C 8B F9 A8 01 0F 84 ?? ?? ?? ?? "
+    "33 F6 F7 82 B0 00 00 00 00 04 00 00";
+inline constexpr std::uint32_t kProcessEventMatchOffset = 5;
 
 inline constexpr std::uint32_t kObjectNameOffset = 24;
 inline constexpr std::uint32_t kObjectRegistryItemsOffset = 16;
@@ -41,6 +50,13 @@ inline constexpr std::uint32_t kObjectChunkSize = 65536;
 inline constexpr std::uint32_t kObjectItemStride = 24;
 inline constexpr std::uint32_t kObjectItemSerialOffset = 16;
 inline constexpr std::uint32_t kTextFieldOffset = 392;
+inline constexpr std::uint32_t kWidgetSlotOffset = 0x30;
+inline constexpr std::uint32_t kWidgetVisibilityOffset = 0xDC;
+inline constexpr std::uint32_t kUFunctionFlagsOffset = 0xB0;
+inline constexpr std::uint32_t kUFunctionFuncOffset = 0xD8;
+inline constexpr std::uint32_t kUFunctionNumParmsOffset = 180;
+inline constexpr std::uint32_t kUFunctionParmsSizeOffset = 182;
+inline constexpr std::uint32_t kUFunctionReturnValueOffset = 184;
 inline constexpr std::uintptr_t kSetTextVtableOffset = 856;
 inline constexpr std::uint32_t kGObjectsResolveOffset = 3;
 inline constexpr std::uint32_t kGObjectsInstructionSize = 7;
