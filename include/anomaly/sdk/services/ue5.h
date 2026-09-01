@@ -84,6 +84,10 @@ typedef struct AnomalyUe5ProcessEventServiceV1 {
 typedef struct AnomalyUe5NamesServiceV1 {
     uint32_t struct_size; uint32_t service_version; void* user;
     AnomalyStatusV1 (ANOMALY_CALL *resolve_utf8)(void* user, uint32_t name_id, char* destination, size_t* inout_size);
+    // Resolves an in-process UE FText value to UTF-8. The address is valid only
+    // for the current Game-thread snapshot and is never retained by the Host.
+    AnomalyStatusV1 (ANOMALY_CALL *resolve_ftext_utf8)(
+        void* user, uintptr_t ftext_address, char* destination, size_t* inout_size);
 } AnomalyUe5NamesServiceV1;
 typedef struct AnomalyUe5ObjectSnapshotV1 {
     uint32_t struct_size; uint32_t reserved; AnomalyGenerationHandleV1 handle; uint32_t name_id; uint32_t flags;

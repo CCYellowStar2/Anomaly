@@ -1,10 +1,14 @@
 #include "anomaly/ue5_reflection_query.hpp"
 
+#include <Windows.h>
+
 #include <algorithm>
+#include <array>
 #include <charconv>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <string>
@@ -167,7 +171,7 @@ bool ContainsInsensitive(std::string_view value, std::string_view filter) noexce
 }
 
 struct ParsedRequest final {
-    enum class Kind : std::uint8_t { Actors, Functions };
+    enum class Kind : std::uint8_t { Actors, Functions, Objects };
 
     Kind kind{};
     std::string_view filter;
@@ -185,8 +189,10 @@ std::optional<ParsedRequest> ParseRequest(
         parsed.kind = ParsedRequest::Kind::Actors;
     } else if (kind == "functions") {
         parsed.kind = ParsedRequest::Kind::Functions;
+    } else if (kind == "objects") {
+        parsed.kind = ParsedRequest::Kind::Objects;
     } else {
-        error = "usage: ue actors <filter|*> [limit] [cursor] | ue functions <filter|*> [limit] [cursor]";
+        error = "usage: ue actors|objects|functions <filter|*> [limit] [cursor]";
         return std::nullopt;
     }
 
@@ -280,15 +286,73 @@ public:
         }
         const std::size_t length = header >> *length_shift;
         const bool wide = (header & 1U) != 0;
-        if (wide || length == 0 || length > kMaximumNameBytes) return {};
-
-        std::string result(length, '\0');
+        if (length == 0 || length > kMaximumNameBytes) return {};
         std::uintptr_t text{};
-        if (!AddUnsignedAddress(entry, sizeof(header), text) ||
-            !memory_.Read(text, result.data(), result.size())) {
+        if (!AddUnsignedAddress(entry, sizeof(header), text)) return {};
+        if (!wide) {
+            std::string result(length, '\0');
+            if (!memory_.Read(text, result.data(), result.size())) return {};
+            return result;
+        }
+        std::vector<wchar_t> wide_value(length);
+        if (!memory_.Read(text, wide_value.data(), wide_value.size() * sizeof(wchar_t))) return {};
+        const int required = WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wide_value.data(), static_cast<int>(wide_value.size()),
+            nullptr, 0, nullptr, nullptr);
+        if (required <= 0) return {};
+        std::string result(static_cast<std::size_t>(required), '\0');
+        return WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, wide_value.data(), static_cast<int>(wide_value.size()),
+            result.data(), required, nullptr, nullptr) == required ? result : std::string{};
+    }
+
+    [[nodiscard]] std::string ResolveFText(const std::uintptr_t address) const noexcept {
+        const auto text_data_offset = Layout(profile_, "ftext.textData").value_or(0);
+        const auto data_offset = Layout(profile_, "fstring.data").value_or(0);
+        const auto count_offset = Layout(profile_, "fstring.count").value_or(8);
+        const auto capacity_offset = Layout(profile_, "fstring.capacity").value_or(12);
+        std::uintptr_t text_data{};
+        if (address == 0 || !ReadValue(memory_, address + static_cast<std::uintptr_t>(text_data_offset), text_data) || text_data == 0) {
             return {};
         }
-        return result;
+        std::string value;
+        const auto configured_source = Layout(profile_, "ftextData.textSource");
+        const auto try_source = [&](const std::int64_t source_offset) {
+            if (source_offset < 0) return false;
+            const auto source = text_data + static_cast<std::uintptr_t>(source_offset);
+            std::uintptr_t data{};
+            std::int32_t count{};
+            std::int32_t capacity{};
+            if (!ReadValue(memory_, source + static_cast<std::uintptr_t>(data_offset), data) ||
+                !ReadValue(memory_, source + static_cast<std::uintptr_t>(count_offset), count) ||
+                !ReadValue(memory_, source + static_cast<std::uintptr_t>(capacity_offset), capacity) ||
+                data == 0 || count <= 0 || count > 4096 || capacity < count || capacity > 8192) {
+                return false;
+            }
+            std::vector<wchar_t> wide(static_cast<std::size_t>(count));
+            if (!memory_.Read(data, wide.data(), wide.size() * sizeof(wchar_t))) return false;
+            if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
+            if (wide.empty()) return false;
+            const int required = WideCharToMultiByte(
+                CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), static_cast<int>(wide.size()),
+                nullptr, 0, nullptr, nullptr);
+            if (required <= 0) return false;
+            std::string result(static_cast<std::size_t>(required), '\0');
+            if (WideCharToMultiByte(
+                    CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), static_cast<int>(wide.size()),
+                    result.data(), required, nullptr, nullptr) == required) {
+                value = std::move(result);
+                return true;
+            }
+            return false;
+        };
+        if (configured_source && try_source(*configured_source)) return value;
+        if (!configured_source) {
+            for (const auto source_offset : {40LL, 48LL, 24LL, 16LL, 0LL, 56LL}) {
+                if (try_source(source_offset)) return value;
+            }
+        }
+        return {};
     }
 
 private:
@@ -296,6 +360,44 @@ private:
     const ProfileResolutionSnapshot& resolution_;
     const SymbolMemory& memory_;
 };
+
+std::optional<std::uintptr_t> ParseAddress(std::string_view value) noexcept {
+    if (value.empty()) return std::nullopt;
+    const std::string owned(value);
+    char* end{};
+    const auto parsed = _strtoui64(owned.c_str(), &end, 0);
+    if (end == owned.c_str() || *end != '\0' ||
+        parsed > static_cast<unsigned long long>((std::numeric_limits<std::uintptr_t>::max)())) {
+        return std::nullopt;
+    }
+    return static_cast<std::uintptr_t>(parsed);
+}
+
+std::string NameQuery(
+    const Ue5ReflectionQueryContext& context, std::string_view argument) noexcept {
+    const auto [id_text, trailing] = Shift(argument);
+    if (id_text.empty() || !trailing.empty()) return Error("usage: ue fname <id>");
+    const auto id = ParseUnsigned(id_text);
+    if (!id || *id > UINT32_MAX) return Error("FName id is invalid");
+    NameResolver names(context.profile, context.resolution, context.memory);
+    const auto value = names.Resolve(static_cast<std::uint32_t>(*id));
+    if (value.empty()) return Error("FName is unavailable");
+    return Ok("\"kind\":\"fname\",\"id\":" + std::to_string(*id) +
+              ",\"value\":" + Quote(value));
+}
+
+std::string FTextQuery(
+    const Ue5ReflectionQueryContext& context, std::string_view argument) noexcept {
+    const auto [address_text, trailing] = Shift(argument);
+    if (address_text.empty() || !trailing.empty()) return Error("usage: ue ftext <address>");
+    const auto address = ParseAddress(address_text);
+    if (!address) return Error("FText address is invalid");
+    NameResolver names(context.profile, context.resolution, context.memory);
+    const auto value = names.ResolveFText(*address);
+    if (value.empty()) return Error("FText is unavailable");
+    return Ok("\"kind\":\"ftext\",\"address\":" + HexAddress(*address) +
+              ",\"value\":" + Quote(value));
+}
 
 struct ObjectDescription final {
     std::string name;
@@ -640,18 +742,89 @@ std::string FunctionsJson(
               ",\"functions\":[" + entries + "]");
 }
 
+std::string ObjectsJson(
+    const Ue5ReflectionQueryContext& context,
+    const ParsedRequest& request) {
+    if (!context.resolution.FeatureAvailable("ue5.functions")) {
+        return Error("ue5 object enumeration is unavailable for the selected profile");
+    }
+    if (!HasLayout(context.profile, {
+            "object.class", "object.nameOffset", "object.outer"})) {
+        return Error("ue5 object layout is unavailable for the selected profile");
+    }
+    const NameResolver names(context.profile, context.resolution, context.memory);
+    if (!names.Available()) return Error("ue5.FNamePool layout is unavailable for the selected profile");
+    ObjectRegistry registry;
+    if (!LoadObjectRegistry(context, registry)) {
+        return Error("ue5.GObjects registry is unavailable for the selected profile");
+    }
+    if (request.cursor > registry.count) return Error("object cursor is beyond the current object registry");
+    const std::uint32_t maximum_scan = static_cast<std::uint32_t>((std::min)(
+        context.options.maximum_objects_per_request,
+        static_cast<std::size_t>((std::numeric_limits<std::uint32_t>::max)())));
+    const std::uint32_t end = (std::min)(registry.count, request.cursor + (std::min)(
+        maximum_scan, registry.count - request.cursor));
+    std::string entries;
+    std::size_t matched{};
+    std::size_t unreadable{};
+    std::uint32_t next = end;
+    for (std::uint32_t index = request.cursor; index < end; ++index) {
+        std::uintptr_t object{};
+        std::uint32_t serial{};
+        if (!ReadObjectSlot(context, registry, index, object, serial)) {
+            ++unreadable;
+            continue;
+        }
+        if (object == 0) continue;
+        ObjectDescription description;
+        if (!DescribeObject(context, names, object, description)) {
+            ++unreadable;
+            continue;
+        }
+        if (!Matches(description, request.filter)) continue;
+        if (matched != 0) entries.push_back(',');
+        entries += "{\"index\":" + std::to_string(index) +
+            ",\"serial\":" + std::to_string(serial) +
+            ",\"address\":" + Quote(HexAddress(object)) +
+            ",\"name\":" + Quote(description.name) +
+            ",\"class\":" + Quote(description.class_name) +
+            ",\"outer\":" + Quote(description.outer_name) + "}";
+        ++matched;
+        if (matched == request.limit) {
+            next = index + 1U;
+            break;
+        }
+    }
+    const bool complete = next >= registry.count;
+    return Ok(std::string{"\"profileMode\":\"exact\""} +
+              ",\"kind\":\"objects\",\"filter\":" + Quote(request.filter) +
+              ",\"objectCount\":" + std::to_string(registry.count) +
+              ",\"cursor\":" + std::to_string(request.cursor) +
+              ",\"nextCursor\":" + (complete ? std::string("null") : std::to_string(next)) +
+              ",\"complete\":" + (complete ? "true" : "false") +
+              ",\"scanned\":" + std::to_string(next - request.cursor) +
+              ",\"unreadable\":" + std::to_string(unreadable) +
+              ",\"objects\":[" + entries + "]");
+}
+
 }  // namespace
 
 std::string ExecuteUe5ReflectionQuery(
     const Ue5ReflectionQueryContext& context,
     const std::string_view request) noexcept {
     try {
+        const auto [kind, arguments] = Shift(request);
+        if (kind == "fname") return NameQuery(context, arguments);
+        if (kind == "ftext") return FTextQuery(context, arguments);
         std::string error;
         const auto parsed = ParseRequest(request, context.options, error);
         if (!parsed) return Error(error);
-        return parsed->kind == ParsedRequest::Kind::Actors
-            ? ActorsJson(context, *parsed)
-            : FunctionsJson(context, *parsed);
+        switch (parsed->kind) {
+        case ParsedRequest::Kind::Actors: return ActorsJson(context, *parsed);
+        case ParsedRequest::Kind::Functions: return FunctionsJson(context, *parsed);
+        case ParsedRequest::Kind::Objects: return ObjectsJson(context, *parsed);
+        }
+        return Error("unknown UE reflection query kind");
     } catch (...) {
         return Error("UE reflection query failed");
     }

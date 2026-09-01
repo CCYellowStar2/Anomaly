@@ -378,7 +378,7 @@ FeatureValidationResult ValidateNteMapLandmarks(
     const BuildProfile& profile,
     const ProfileResolutionSnapshot&,
     const SymbolMemory&) {
-    constexpr std::array<std::string_view, 35> kRequiredLayout{
+    constexpr std::array<std::string_view, 36> kRequiredLayout{
         "object.internalIndex",
         "object.class",
         "object.nameOffset",
@@ -399,6 +399,7 @@ FeatureValidationResult ValidateNteMapLandmarks(
         "dataTable.rowMap",
         "dataTable.rowMapData",
         "dataTable.rowMapNum",
+        "dataTable.rowMapNumFree",
         "dataTable.rowMapMax",
         "dataTable.rowMapElementStride",
         "dataTable.rowMapRowOffset",

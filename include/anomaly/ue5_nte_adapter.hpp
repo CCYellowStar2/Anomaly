@@ -9,6 +9,7 @@
 
 #include <Windows.h>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -23,16 +24,48 @@ namespace anomaly {
 struct NteSnapshotSamplingOptions {
     std::uint32_t player_tick_interval{1};
     std::uint32_t entity_tick_interval{1};
+    std::uint32_t combat_tick_interval{6};
+    std::uint32_t skill_tick_interval{6};
 };
 
 struct NteCombatDiagnosticsSnapshot {
     bool damage_event_layout_ready{};
+    std::uint32_t process_event_binding_mask{};
+    std::uint64_t damage_floaties_call_count{};
+    std::uint64_t monster_damage_call_count{};
+    std::uint64_t player_damage_queue_call_count{};
+    std::uint64_t damage_widget_call_count{};
+    std::uint64_t treatment_call_count{};
+    std::uint64_t treatment_direct_call_count{};
+    std::uint64_t health_changed_call_count{};
+    std::uint64_t buff_call_count{};
+    std::uint64_t crit_query_call_count{};
+    std::uint64_t crit_query_success_count{};
+    std::uint64_t crit_true_count{};
+    std::uint64_t heal_snapshot_published_count{};
     std::uint64_t native_call_count{};
     std::uint64_t captured_event_count{};
     std::uint64_t dropped_count{};
     std::uint64_t attacker_resolution_failure_count{};
     std::uint64_t victim_resolution_failure_count{};
     std::uint64_t source_resolution_failure_count{};
+    std::uint64_t saved_trigger_skill_mapping_count{};
+    std::uint64_t trigger_ability_handle_mapping_count{};
+    std::uint64_t damage_source_mapping_failure_count{};
+    std::uint64_t delayed_damage_name_completion_count{};
+};
+
+inline constexpr std::size_t kNteCombatExecFunctionCapacity = 14;
+
+struct NteCombatExecFunctionTarget {
+    std::uintptr_t function{};
+    std::uintptr_t target{};
+};
+
+struct NteCombatExecFunctionTargetsSnapshot {
+    std::array<NteCombatExecFunctionTarget, kNteCombatExecFunctionCapacity> entries{};
+    std::size_t count{};
+    bool discovery_complete{};
 };
 
 class Ue5NteAdapter final {
@@ -85,6 +118,10 @@ public:
         std::uintptr_t victim,
         std::uintptr_t attacker,
         std::uintptr_t damage_causer) noexcept;
+    void OnCombatExecFunction(
+        std::uintptr_t receiver,
+        std::uintptr_t function,
+        std::uintptr_t stack) noexcept;
     // Called by the shared UObject ProcessEvent detour after the original
     // function completes. Damage capture uses the exact native
     // CharacterOnDamaged broadcast and never enters through this broad hook.
@@ -107,7 +144,11 @@ public:
     // Native combat capture stays dormant until the combat reflection gate
     // has completed on the game thread.
     [[nodiscard]] bool CombatFeatureAvailable() const noexcept;
+    [[nodiscard]] NteCombatExecFunctionTargetsSnapshot
+        CombatExecFunctionTargets() const noexcept;
     [[nodiscard]] NteCombatDiagnosticsSnapshot CombatDiagnostics() const noexcept;
+    // Read-only diagnostic view used by anomaly-cli's ue combat/buffs commands.
+    [[nodiscard]] std::string CombatEventsJson(bool buffs_only = false) const;
     [[nodiscard]] ProfileResolutionSnapshot Resolution() const;
 
 private:

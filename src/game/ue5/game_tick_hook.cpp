@@ -53,18 +53,20 @@ public:
 
     bool Stop(std::chrono::milliseconds timeout) noexcept {
         std::scoped_lock stop_lock(stop_mutex_);
-        const bool was_started = started_.exchange(false, std::memory_order_acq_rel);
         if (!owner_registered_) return true;
-        if (was_started) {
-            static_cast<void>(hooks_.DisableOwner(kOwner, kGeneration));
+        if (started_.load(std::memory_order_acquire)) {
+            if (!hooks_.DisableOwner(kOwner, kGeneration)) return false;
+            started_.store(false, std::memory_order_release);
+        }
+        const auto bounded_timeout =
+            (std::max)(timeout, std::chrono::milliseconds::zero());
+        if (!hooks_.RemoveOwner(kOwner, kGeneration, bounded_timeout)) return false;
+        {
             std::scoped_lock process_lock(process_mutex_);
             Impl* expected = this;
             static_cast<void>(active_.compare_exchange_strong(
                 expected, nullptr, std::memory_order_acq_rel));
         }
-        const auto bounded_timeout =
-            (std::max)(timeout, std::chrono::milliseconds::zero());
-        if (!hooks_.RemoveOwner(kOwner, kGeneration, bounded_timeout)) return false;
         owner_registered_ = false;
         original_ = nullptr;
         target_ = nullptr;
@@ -119,8 +121,8 @@ GameTickHook::GameTickHook(std::unique_ptr<HookBackend> backend, Callback callba
 
 GameTickHook::~GameTickHook() {
     if (impl_ != nullptr && !impl_->Stop(std::chrono::milliseconds::zero())) {
-        // The detour is disabled and detached from active_, but its callback
-        // frame still uses Impl. Keep that generation mapped for process life.
+        // Keep the generation mapped while a detour or callback can still
+        // reach its active instance.
         static_cast<void>(impl_.release());
     }
 }

@@ -470,7 +470,7 @@ std::string Analyzer::Execute(std::string_view command_line) const {
     const auto [command, arguments] = Shift(command_line);
     if (command == "ping") return Ok("\"pid\":" + std::to_string(GetCurrentProcessId()));
     if (command == "help") {
-        return Ok("\"commands\":[\"ping\",\"status\",\"modules\",\"sections <module|.>\",\"regions <module|.>\",\"scan <module|.> <section> <pattern>\",\"xrefs <module|.> <target>\",\"ue\",\"ue actors <filter|*> [limit] [cursor]\",\"ue functions <filter|*> [limit] [cursor]\",\"read <address> <size<=1048576>\",\"write <address> <hex bytes>\",\"patch <address> <hex bytes>\",\"protect <address> <size> <r|rw|x|rx|rwx>\",\"alloc <size> [protection]\",\"free <address>\",\"chain <base> [offset ...]\",\"rip <instruction> <disp_offset> <instruction_size>\",\"ptr <address>\",\"f32 <address> [count]\",\"f64 <address> [count]\",\"snapshot [filename]\"]");
+        return Ok("\"commands\":[\"ping\",\"status\",\"modules\",\"sections <module|.>\",\"regions <module|.>\",\"scan <module|.> <section> <pattern>\",\"xrefs <module|.> <target>\",\"ue\",\"ue actors <filter|*> [limit] [cursor]\",\"ue objects <filter|*> [limit] [cursor]\",\"ue functions <filter|*> [limit] [cursor]\",\"ue fname <id>\",\"ue ftext <address>\",\"ue combat\",\"ue buffs\",\"read <address> <size<=1048576>\",\"write <address> <hex bytes>\",\"patch <address> <hex bytes>\",\"protect <address> <size> <r|rw|x|rx|rwx>\",\"alloc <size> [protection]\",\"free <address>\",\"chain <base> [offset ...]\",\"rip <instruction> <disp_offset> <instruction_size>\",\"ptr <address>\",\"f32 <address> [count]\",\"f64 <address> [count]\",\"snapshot [filename]\"]");
     }
     if (command == "status") {
         std::string runtime = "null";

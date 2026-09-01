@@ -406,6 +406,36 @@ typedef struct AnomalyNteDamageEventV1 {
     uint32_t reaction_type; uint32_t reaction_display_type;
 } AnomalyNteDamageEventV1;
 
+// Unified low-latency combat stream. Damage entries are emitted from the
+// CharacterOnDamaged hook and enriched by FHTDamageTextInfo when available.
+// Heal and buff entries come from the cached combat/ASC snapshots; UI callbacks
+// are optional enrichers. name_id identifies a FName or generation-local source.
+typedef enum AnomalyNteCombatEventKindV1 {
+    ANOMALY_NTE_COMBAT_EVENT_V1_DAMAGE = 1,
+    ANOMALY_NTE_COMBAT_EVENT_V1_HEAL = 2,
+    ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_ADD = 3,
+    ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_REMOVE = 4
+} AnomalyNteCombatEventKindV1;
+typedef uint32_t AnomalyNteCombatEventFlagsV1;
+#define ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL (1u << 0u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT (1u << 1u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_WEAK_UNBALANCE (1u << 2u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID (1u << 3u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID (1u << 4u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_PARTIAL (1u << 5u)
+typedef struct AnomalyNteCombatEventV1 {
+    uint32_t struct_size; uint32_t kind; uint32_t flags; uint32_t reserved;
+    uint64_t sequence; uint64_t tick_sequence;
+    AnomalyGenerationHandleV1 world;
+    AnomalyGenerationHandleV1 source;
+    AnomalyGenerationHandleV1 target;
+    uint64_t name_id;
+    int64_t value; int64_t basic_value; int64_t final_value;
+    float duration_seconds; int32_t stack_count;
+    uint32_t damage_type; uint32_t display_type;
+    uint32_t reaction_type; uint32_t reaction_display_type;
+} AnomalyNteCombatEventV1;
+
 typedef enum AnomalyNteCombatDirectionV1 {
     ANOMALY_NTE_COMBAT_DIRECTION_V1_ANY = 0,
     ANOMALY_NTE_COMBAT_DIRECTION_V1_AS_ATTACKER = 1,
@@ -444,6 +474,15 @@ typedef struct AnomalyNteCombatServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *participant_path_utf8)(void* user,
         AnomalyGenerationHandleV1 participant, char* destination,
         size_t* inout_size);
+    uint64_t (ANOMALY_CALL *latest_event_sequence)(void* user);
+    AnomalyStatusV1 (ANOMALY_CALL *next_event)(
+        void* user, uint64_t after_sequence, AnomalyNteCombatEventV1* event);
+    AnomalyStatusV1 (ANOMALY_CALL *event_name_utf8)(
+        void* user, const AnomalyNteCombatEventV1* event,
+        char* destination, size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *participant_display_name_utf8)(
+        void* user, AnomalyGenerationHandleV1 participant,
+        char* destination, size_t* inout_size);
 } AnomalyNteCombatServiceV1;
 
 typedef struct AnomalyNteSkillFrameV1 {
@@ -497,6 +536,9 @@ typedef struct AnomalyNteSkillsServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *snapshot_by_handle)(
         void* user, AnomalyGenerationHandleV1 skill,
         AnomalyNteSkillSnapshotV1* snapshot);
+    AnomalyStatusV1 (ANOMALY_CALL *ability_display_name_utf8)(
+        void* user, AnomalyGenerationHandleV1 ability_class,
+        char* destination, size_t* inout_size);
 } AnomalyNteSkillsServiceV1;
 
 typedef struct AnomalyNteSkillInvocationRequestV1 {

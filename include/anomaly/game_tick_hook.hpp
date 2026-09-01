@@ -21,8 +21,8 @@ public:
 
     [[nodiscard]] bool Start(void* target);
     // Disables new detour entries, then drains callbacks within timeout. A
-    // false result leaves the disabled hook generation intact for quarantine
-    // and may be retried after the in-flight callback exits.
+    // false result leaves the hook generation intact for quarantine and may
+    // be retried after disable succeeds or an in-flight callback exits.
     bool Stop(
         std::chrono::milliseconds timeout = std::chrono::seconds(5)) noexcept;
     [[nodiscard]] bool Started() const noexcept;

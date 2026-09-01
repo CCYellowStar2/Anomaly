@@ -2,6 +2,7 @@
 
 #include "anomaly/hook_manager.hpp"
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -9,8 +10,18 @@
 
 namespace anomaly {
 
+inline constexpr std::size_t kUe5CombatExecFunctionCapacity = 14;
+
+struct Ue5CombatExecFunctionTarget {
+    void* function{};
+    void* target{};
+};
+
 struct Ue5DamageFunctionTargets {
     void* character_on_damaged{};
+    std::array<Ue5CombatExecFunctionTarget, kUe5CombatExecFunctionCapacity>
+        combat_exec_functions{};
+    std::size_t combat_exec_function_count{};
 };
 
 class Ue5DamageFunctionHook final {
@@ -20,11 +31,17 @@ public:
         std::uintptr_t victim,
         std::uintptr_t attacker,
         std::uintptr_t damage_causer)>;
+    using ExecCallback = std::function<void(
+        std::uintptr_t function,
+        std::uintptr_t receiver,
+        std::uintptr_t stack)>;
 
-    explicit Ue5DamageFunctionHook(Callback callback);
+    explicit Ue5DamageFunctionHook(
+        Callback callback, ExecCallback exec_callback = {});
     Ue5DamageFunctionHook(
         std::unique_ptr<HookBackend> backend,
-        Callback callback);
+        Callback callback,
+        ExecCallback exec_callback = {});
     ~Ue5DamageFunctionHook();
 
     Ue5DamageFunctionHook(const Ue5DamageFunctionHook&) = delete;

@@ -168,6 +168,7 @@ FeatureValidationResult ValidateCombatReflectionLayout(
     }
     const auto required = ValidateBoundedLayoutKeys(profile, feature, {
         "object.internalIndex", "object.class", "object.outer",
+        "uclass.classDefaultObject",
         "ustruct.superStruct", "ustruct.propertyLink", "ufunction.numParms",
         "ufunction.parmsSize", "ufunction.returnValueOffset", "ffield.class",
         "ffield.name", "ffieldClass.name", "fproperty.arrayDim",
@@ -177,7 +178,41 @@ FeatureValidationResult ValidateCombatReflectionLayout(
         "fboolProperty.fieldSize", "fboolProperty.byteOffset",
         "fboolProperty.byteMask", "fboolProperty.fieldMask",
         "damageEvent.size", "damageEvent.damage", "damageEvent.damageGEDef",
-        "weakObject.index", "weakObject.serial"});
+        "damageEvent.damageTags", "controller.playerState", "playerState.roleName",
+        "abilityCharacter.characterConfigId",
+        "abilitySpawnActor.triggerAbilityHandle",
+        "abilitySpawnActor.savedTriggerSkillCDO", "gameplayEffectSpec.size",
+        "gameplayEffectSpec.def", "gameplayEffectSpec.duration",
+        "gameplayEffectSpec.stackCount", "activeGameplayEffect.size",
+        "activeGameplayEffect.spec", "activeGameplayEffect.replicationId",
+        "activeGameplayEffect.replicationKey", "abilitySystem.activeGameplayEffects",
+        "activeGameplayEffects.size", "activeGameplayEffects.arrayReplicationKey",
+        "activeGameplayEffects.items", "buffs.maxCount",
+        "weakObject.index", "weakObject.serial",
+        "damageTextInfo.displayDamage", "damageTextInfo.damageType",
+        "damageTextInfo.critical", "damageTextInfo.headHit",
+        "damageTextInfo.weakUnbalance", "damageTextInfo.attacker",
+        "damageTextInfo.victim", "damageTextInfo.combatStatistics",
+        "damageTextInfo.basicDamage", "damageTextInfo.finalDamage",
+        "damageTextInfo.displayType", "damageTextInfo.reactionType",
+        "damageTextInfo.reactionDisplayType", "treatment.player",
+        "gameplayEffect.uiData", "gameplayEffectUIData.description",
+        "treatment.target", "treatment.value", "buff.specDef",
+        "buff.duration", "buff.stackCount", "ftext.textData",
+        "ftextData.textSource", "fstring.data", "fstring.count",
+        "fstring.capacity", "abilityCharacter.abilitySystemComponent",
+        "abilitySystem.lastTreatmentGEDef", "gameData.abilityDataAsset",
+        "abilityData.skillDamageDataTable", "skillDamage.gaName",
+        "gameData.monsterInfoDataTable",
+        "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
+        "gameData.gameplayEffectTipsDataTable", "gameplayAbilityTips.name",
+        "gameplayAbilityTips.gameplayAbility", "gameplayEffectTips.name",
+        "gameplayEffectTips.geParamName",
+        "monsterData.textName", "dataTable.rowMap", "dataTable.rowMapData",
+        "dataTable.rowMapNum", "dataTable.rowMapNumFree", "dataTable.rowMapMax",
+        "dataTable.rowMapElementStride", "dataTable.rowMapRowOffset",
+        "dataTable.rowMapInlineFlags", "dataTable.rowMapFlagsData",
+        "dataTable.rowMapFlagsNum", "dataTable.rowMapFlagsMax"});
     if (!required.valid) return required;
 
     const auto value = [&profile](const std::string_view key) {
@@ -187,8 +222,73 @@ FeatureValidationResult ValidateCombatReflectionLayout(
     if (event_size == 0 || event_size > 4096U ||
         value("damageEvent.damage") + sizeof(float) > event_size ||
         value("damageEvent.damageGEDef") + 8U > event_size ||
+        value("damageEvent.damageTags") + 0x20U > event_size ||
         value("weakObject.index") + 4U > 8U || value("weakObject.serial") + 4U > 8U) {
         return {false, "combat structure layout is internally inconsistent"};
+    }
+    const std::uint64_t effect_spec_size = value("gameplayEffectSpec.size");
+    const std::uint64_t active_effect_size = value("activeGameplayEffect.size");
+    const std::uint64_t active_effects_size = value("activeGameplayEffects.size");
+    if (effect_spec_size == 0 || effect_spec_size > 4096U ||
+        value("gameplayEffectSpec.def") + sizeof(std::uintptr_t) > effect_spec_size ||
+        value("gameplayEffectSpec.duration") + sizeof(float) > effect_spec_size ||
+        value("gameplayEffectSpec.stackCount") + sizeof(std::int32_t) > effect_spec_size ||
+        active_effect_size == 0 || active_effect_size > 4096U ||
+        value("activeGameplayEffect.spec") + effect_spec_size > active_effect_size ||
+        value("activeGameplayEffect.replicationId") + sizeof(std::int32_t) > active_effect_size ||
+        value("activeGameplayEffect.replicationKey") + sizeof(std::int32_t) > active_effect_size ||
+        active_effects_size == 0 || active_effects_size > 4096U ||
+        value("activeGameplayEffects.arrayReplicationKey") + sizeof(std::int32_t) > active_effects_size ||
+        value("activeGameplayEffects.items") + 16U > active_effects_size ||
+        value("abilitySystem.activeGameplayEffects") + active_effects_size > 0x2588U ||
+        value("buffs.maxCount") == 0 || value("buffs.maxCount") > 4096U ||
+        value("abilitySpawnActor.triggerAbilityHandle") + sizeof(std::int32_t) > 0x4A0U ||
+        value("abilitySpawnActor.savedTriggerSkillCDO") + sizeof(std::uintptr_t) > 0x4A0U) {
+        return {false, "combat callback layout is internally inconsistent"};
+    }
+    constexpr std::uint64_t kDamageTextInfoSize = 72U;
+    if (value("damageTextInfo.combatStatistics") + 8U > kDamageTextInfoSize ||
+        value("damageTextInfo.basicDamage") + sizeof(std::int32_t) > kDamageTextInfoSize ||
+        value("damageTextInfo.finalDamage") + sizeof(std::int32_t) > kDamageTextInfoSize) {
+        return {false, "damage text layout is internally inconsistent"};
+    }
+    const auto field_fits = [&value](const std::string_view key,
+                                     const std::uint64_t structure_size,
+                                     const std::uint64_t field_size) {
+        return value(key) <= structure_size && field_size <= structure_size - value(key);
+    };
+    if (!field_fits("gameData.abilityDataAsset", 0x23C0U, 8U) ||
+        !field_fits("abilityData.skillDamageDataTable", 0xD58U, 8U) ||
+        !field_fits("skillDamage.gaName", 0x78U, 8U) ||
+        !field_fits("gameData.monsterInfoDataTable", 0x23C0U, 8U) ||
+        !field_fits("gameData.characterDataTable", 0x23C0U, 8U) ||
+        !field_fits("gameData.gameplayAbilityTipsDataTable", 0x23C0U, 8U) ||
+        !field_fits("gameData.gameplayEffectTipsDataTable", 0x23C0U, 8U) ||
+        !field_fits("abilityCharacter.abilitySystemComponent", 0x1440U, 8U) ||
+        !field_fits("abilityCharacter.characterConfigId", 0x1D80U, 8U) ||
+        !field_fits("playerState.roleName", 0x470U, 16U) ||
+        !field_fits("abilitySystem.lastTreatmentGEDef", 0x2588U, 8U) ||
+        !field_fits("gameplayAbilityTips.name", 0xB8U, 16U) ||
+        !field_fits("gameplayAbilityTips.gameplayAbility", 0xB8U, 0x28U) ||
+        !field_fits("gameplayEffectTips.name", 0x88U, 16U) ||
+        !field_fits("gameplayEffectTips.geParamName", 0x88U, 8U) ||
+        !field_fits("monsterData.textName", 0x118U, 16U)) {
+        return {false, "combat display-name table layout is internally inconsistent"};
+    }
+    if (value("dataTable.rowMap") + 0x50U > 0x23C0U ||
+        value("dataTable.rowMapData") + sizeof(std::uintptr_t) > 0x50U ||
+        value("dataTable.rowMapNum") + sizeof(std::int32_t) > 0x50U ||
+        value("dataTable.rowMapNumFree") + sizeof(std::int32_t) > 0x50U ||
+        value("dataTable.rowMapMax") + sizeof(std::int32_t) > 0x50U ||
+        value("dataTable.rowMapElementStride") < 16U ||
+        value("dataTable.rowMapElementStride") > 128U ||
+        value("dataTable.rowMapRowOffset") + sizeof(std::uintptr_t) >
+            value("dataTable.rowMapElementStride") ||
+        value("dataTable.rowMapInlineFlags") + sizeof(std::uint32_t) > 0x50U ||
+        value("dataTable.rowMapFlagsData") + sizeof(std::uintptr_t) > 0x50U ||
+        value("dataTable.rowMapFlagsNum") + sizeof(std::int32_t) > 0x50U ||
+        value("dataTable.rowMapFlagsMax") + sizeof(std::int32_t) > 0x50U) {
+        return {false, "data table sparse-map layout is internally inconsistent"};
     }
     return {true, {}};
 }
@@ -1114,6 +1214,15 @@ public:
                         adapter->OnDamageEvent(
                             damage_event, victim, attacker, damage_causer);
                     }
+                },
+                [weak = std::weak_ptr<Ue5NteAdapter>(adapter_)](
+                    const std::uintptr_t function,
+                    const std::uintptr_t receiver,
+                    const std::uintptr_t stack) {
+                    const auto adapter = weak.lock();
+                    if (adapter) {
+                        adapter->OnCombatExecFunction(receiver, function, stack);
+                    }
                 });
         } catch (...) {
             diagnostics_.push_back("damage native hook allocation failed");
@@ -1146,8 +1255,20 @@ public:
                         adapter->OnGameTick(delta);
                         if (damage_hook != nullptr && !damage_hook->Attempted() &&
                             event_target != nullptr && adapter->CombatFeatureAvailable()) {
-                            static_cast<void>(damage_hook->Start(
-                                {const_cast<void*>(event_target)}));
+                            const auto exec_targets = adapter->CombatExecFunctionTargets();
+                            if (exec_targets.discovery_complete) {
+                                Ue5DamageFunctionTargets targets;
+                                targets.character_on_damaged = const_cast<void*>(event_target);
+                                targets.combat_exec_function_count = exec_targets.count;
+                                for (std::size_t index{}; index < exec_targets.count; ++index) {
+                                    targets.combat_exec_functions[index] = {
+                                        reinterpret_cast<void*>(
+                                            exec_targets.entries[index].function),
+                                        reinterpret_cast<void*>(
+                                            exec_targets.entries[index].target)};
+                                }
+                                static_cast<void>(damage_hook->Start(targets));
+                            }
                         }
                     }
                     if (evidence) {
@@ -1489,6 +1610,7 @@ public:
         std::optional<BuildProfile> profile;
         std::shared_ptr<const ProfileResolutionSnapshot> resolution;
         std::shared_ptr<const SymbolMemory> memory;
+        std::shared_ptr<Ue5NteAdapter> adapter;
         {
             std::scoped_lock lock(mutex_);
             if (!started_ || stopping_ || !profile_) {
@@ -1497,6 +1619,22 @@ public:
             profile = profile_;
             resolution = CurrentResolutionLocked();
             memory = memory_;
+            adapter = adapter_;
+        }
+        const auto first_non_space = request.find_first_not_of(" \t\r\n");
+        if (first_non_space == std::string_view::npos) {
+            return "{\"ok\":false,\"error\":\"empty UE query\"}";
+        }
+        const auto trimmed = request.substr(first_non_space);
+        const auto split = trimmed.find_first_of(" \t\r\n");
+        const auto command = trimmed.substr(0, split);
+        const auto arguments = split == std::string_view::npos
+            ? std::string_view{} : trimmed.substr(split + 1);
+        if ((command == "combat" || command == "buffs") && adapter != nullptr) {
+            if (!arguments.empty()) {
+                return "{\"ok\":false,\"error\":\"usage: ue combat|buffs\"}";
+            }
+            return adapter->CombatEventsJson(command == "buffs");
         }
         if (!resolution || !memory) {
             return "{\"ok\":false,\"error\":\"UE reflection queries are unavailable\"}";
@@ -1528,6 +1666,12 @@ public:
             std::string(quarantined_ ? "true" : "false");
         json += ",\"tickHookReady\":" +
             std::string(tick_hook_ready_ ? "true" : "false");
+        json += ",\"gameThreadId\":" +
+            std::to_string(adapter_ ? adapter_->GameThreadId() : 0U);
+        json += ",\"tickSequence\":" +
+            std::to_string(adapter_ ? adapter_->TickSequence() : 0U);
+        json += ",\"rejectedThreadTicks\":" +
+            std::to_string(adapter_ ? adapter_->RejectedThreadTicks() : 0U);
         json += ",\"ahudHookReady\":" +
             std::string(ahud_hook_ready_ ? "true" : "false");
         json += ",\"ahudBindingReady\":" +
@@ -1553,6 +1697,32 @@ public:
             damage_function_hook_ && damage_function_hook_->Started()
                 ? "true"
                 : "false");
+        json += ",\"processEventBindingMask\":" +
+            std::to_string(combat_diagnostics.process_event_binding_mask);
+        json += ",\"damageFloatiesCalls\":" +
+            std::to_string(combat_diagnostics.damage_floaties_call_count);
+        json += ",\"monsterDamageCalls\":" +
+            std::to_string(combat_diagnostics.monster_damage_call_count);
+        json += ",\"playerDamageQueueCalls\":" +
+            std::to_string(combat_diagnostics.player_damage_queue_call_count);
+        json += ",\"damageWidgetCalls\":" +
+            std::to_string(combat_diagnostics.damage_widget_call_count);
+        json += ",\"treatmentCalls\":" +
+            std::to_string(combat_diagnostics.treatment_call_count);
+        json += ",\"treatmentDirectCalls\":" +
+            std::to_string(combat_diagnostics.treatment_direct_call_count);
+        json += ",\"healthChangedCalls\":" +
+            std::to_string(combat_diagnostics.health_changed_call_count);
+        json += ",\"buffCalls\":" +
+            std::to_string(combat_diagnostics.buff_call_count);
+        json += ",\"critQueryCalls\":" +
+            std::to_string(combat_diagnostics.crit_query_call_count);
+        json += ",\"critQuerySuccesses\":" +
+            std::to_string(combat_diagnostics.crit_query_success_count);
+        json += ",\"critTrueCount\":" +
+            std::to_string(combat_diagnostics.crit_true_count);
+        json += ",\"healSnapshotsPublished\":" +
+            std::to_string(combat_diagnostics.heal_snapshot_published_count);
         json += ",\"nativeCalls\":" +
             std::to_string(combat_diagnostics.native_call_count);
         json += ",\"capturedEvents\":" +
@@ -1564,7 +1734,15 @@ public:
         json += ",\"victimResolutionFailures\":" +
             std::to_string(combat_diagnostics.victim_resolution_failure_count);
         json += ",\"sourceResolutionFailures\":" +
-            std::to_string(combat_diagnostics.source_resolution_failure_count) + "}";
+            std::to_string(combat_diagnostics.source_resolution_failure_count);
+        json += ",\"savedTriggerSkillMappings\":" +
+            std::to_string(combat_diagnostics.saved_trigger_skill_mapping_count);
+        json += ",\"triggerAbilityHandleMappings\":" +
+            std::to_string(combat_diagnostics.trigger_ability_handle_mapping_count);
+        json += ",\"damageSourceMappingFailures\":" +
+            std::to_string(combat_diagnostics.damage_source_mapping_failure_count);
+        json += ",\"delayedDamageNameCompletions\":" +
+            std::to_string(combat_diagnostics.delayed_damage_name_completion_count) + "}";
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
                 ANOMALY_NTE_PLAYER_SERVICE_V1_ID,
@@ -1580,6 +1758,10 @@ public:
             std::to_string(options_.snapshot_sampling.player_tick_interval);
         json += ",\"entitySnapshotTickInterval\":" +
             std::to_string(options_.snapshot_sampling.entity_tick_interval);
+        json += ",\"combatSnapshotTickInterval\":" +
+            std::to_string(options_.snapshot_sampling.combat_tick_interval);
+        json += ",\"skillSnapshotTickInterval\":" +
+            std::to_string(options_.snapshot_sampling.skill_tick_interval);
         json += ",\"outgoingTransformMetadataProbe\":";
         AppendOutgoingTransformProbeSnapshot(json, outgoing_transform_probe_.get());
         json += ",\"optionalFeatures\":";

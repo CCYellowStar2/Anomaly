@@ -258,6 +258,16 @@ std::string BuildSnapshot() {
     AppendUnsigned(output, ANOMALY_NTE_DAMAGE_V1_WEAK_UNBALANCE);
     output.append(",\n    \"ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT\": ");
     AppendUnsigned(output, ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_WEAK_UNBALANCE\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_WEAK_UNBALANCE);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL\": ");
     AppendUnsigned(output, ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW\": ");
@@ -790,6 +800,16 @@ std::string BuildSnapshot() {
          {"read", offsetof(AnomalyStorageServiceV1, read)},
          {"write_atomic", offsetof(AnomalyStorageServiceV1, write_atomic)},
          {"remove", offsetof(AnomalyStorageServiceV1, remove)}},
+        false);
+    AppendEnum(
+        output,
+        "AnomalyNteCombatEventKindV1",
+        sizeof(AnomalyNteCombatEventKindV1),
+        alignof(AnomalyNteCombatEventKindV1),
+        {{"ANOMALY_NTE_COMBAT_EVENT_V1_DAMAGE", ANOMALY_NTE_COMBAT_EVENT_V1_DAMAGE},
+         {"ANOMALY_NTE_COMBAT_EVENT_V1_HEAL", ANOMALY_NTE_COMBAT_EVENT_V1_HEAL},
+         {"ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_ADD", ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_ADD},
+         {"ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_REMOVE", ANOMALY_NTE_COMBAT_EVENT_V1_BUFF_REMOVE}},
         false);
     AppendStruct(
         output,
@@ -1334,7 +1354,8 @@ std::string BuildSnapshot() {
         {{"struct_size", offsetof(AnomalyUe5NamesServiceV1, struct_size)},
          {"service_version", offsetof(AnomalyUe5NamesServiceV1, service_version)},
          {"user", offsetof(AnomalyUe5NamesServiceV1, user)},
-         {"resolve_utf8", offsetof(AnomalyUe5NamesServiceV1, resolve_utf8)}},
+         {"resolve_utf8", offsetof(AnomalyUe5NamesServiceV1, resolve_utf8)},
+         {"resolve_ftext_utf8", offsetof(AnomalyUe5NamesServiceV1, resolve_ftext_utf8)}},
         false);
     AppendStruct(
         output,
@@ -1755,6 +1776,30 @@ std::string BuildSnapshot() {
         false);
     AppendStruct(
         output,
+        "AnomalyNteCombatEventV1",
+        sizeof(AnomalyNteCombatEventV1),
+        alignof(AnomalyNteCombatEventV1),
+        {{"struct_size", offsetof(AnomalyNteCombatEventV1, struct_size)},
+         {"kind", offsetof(AnomalyNteCombatEventV1, kind)},
+         {"flags", offsetof(AnomalyNteCombatEventV1, flags)},
+         {"sequence", offsetof(AnomalyNteCombatEventV1, sequence)},
+         {"tick_sequence", offsetof(AnomalyNteCombatEventV1, tick_sequence)},
+         {"world", offsetof(AnomalyNteCombatEventV1, world)},
+         {"source", offsetof(AnomalyNteCombatEventV1, source)},
+         {"target", offsetof(AnomalyNteCombatEventV1, target)},
+         {"name_id", offsetof(AnomalyNteCombatEventV1, name_id)},
+         {"value", offsetof(AnomalyNteCombatEventV1, value)},
+         {"basic_value", offsetof(AnomalyNteCombatEventV1, basic_value)},
+         {"final_value", offsetof(AnomalyNteCombatEventV1, final_value)},
+         {"duration_seconds", offsetof(AnomalyNteCombatEventV1, duration_seconds)},
+         {"stack_count", offsetof(AnomalyNteCombatEventV1, stack_count)},
+         {"damage_type", offsetof(AnomalyNteCombatEventV1, damage_type)},
+         {"display_type", offsetof(AnomalyNteCombatEventV1, display_type)},
+         {"reaction_type", offsetof(AnomalyNteCombatEventV1, reaction_type)},
+         {"reaction_display_type", offsetof(AnomalyNteCombatEventV1, reaction_display_type)}},
+        false);
+    AppendStruct(
+        output,
         "AnomalyNteCombatStatisticsRequestV1",
         sizeof(AnomalyNteCombatStatisticsRequestV1),
         alignof(AnomalyNteCombatStatisticsRequestV1),
@@ -1794,7 +1839,11 @@ std::string BuildSnapshot() {
          {"next_damage_event", offsetof(AnomalyNteCombatServiceV1, next_damage_event)},
          {"statistics", offsetof(AnomalyNteCombatServiceV1, statistics)},
          {"source_name_utf8", offsetof(AnomalyNteCombatServiceV1, source_name_utf8)},
-         {"participant_path_utf8", offsetof(AnomalyNteCombatServiceV1, participant_path_utf8)}},
+         {"participant_path_utf8", offsetof(AnomalyNteCombatServiceV1, participant_path_utf8)},
+         {"latest_event_sequence", offsetof(AnomalyNteCombatServiceV1, latest_event_sequence)},
+         {"next_event", offsetof(AnomalyNteCombatServiceV1, next_event)},
+         {"event_name_utf8", offsetof(AnomalyNteCombatServiceV1, event_name_utf8)},
+         {"participant_display_name_utf8", offsetof(AnomalyNteCombatServiceV1, participant_display_name_utf8)}},
         false);
     AppendStruct(
         output,
@@ -1862,7 +1911,8 @@ std::string BuildSnapshot() {
          {"snapshot_at", offsetof(AnomalyNteSkillsServiceV1, snapshot_at)},
          {"page", offsetof(AnomalyNteSkillsServiceV1, page)},
          {"ability_path_utf8", offsetof(AnomalyNteSkillsServiceV1, ability_path_utf8)},
-         {"snapshot_by_handle", offsetof(AnomalyNteSkillsServiceV1, snapshot_by_handle)}},
+         {"snapshot_by_handle", offsetof(AnomalyNteSkillsServiceV1, snapshot_by_handle)},
+         {"ability_display_name_utf8", offsetof(AnomalyNteSkillsServiceV1, ability_display_name_utf8)}},
         false);
     AppendStruct(
         output,
