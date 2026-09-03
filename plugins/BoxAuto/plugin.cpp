@@ -4062,7 +4062,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     }
     *descriptor = {
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
-        anomaly::sdk::StringView("local.box-auto"),
+        anomaly::sdk::StringView("anomaly.local.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
         anomaly::sdk::StringView("0.1.0"), Load, Start, Stop, Unload, Update, Draw};
