@@ -6,8 +6,10 @@ Rescans every signature from a Profile after the target program updates.
 Scans a running process with the patterns from a known-good profile and records
 instruction/target addresses and RVAs. When every symbol has exactly one match,
 the script writes a candidate Profile and validates it with anomaly-profile.exe.
-The PE fingerprint is included only in the report and output filename. The source
-Profile is never modified.
+The scan retries a clean pattern with a MinHook-style entry patch
+(E9 ?? ?? ?? ?? plus the original pattern suffix) when the first five bytes of
+the symbol are known. The PE fingerprint is included only in the report and
+output filename. The source Profile is never modified.
 
 .EXAMPLE
 .\tools\rescan_profile_signatures.ps1 `
@@ -135,6 +137,23 @@ function Find-ModuleForAddress {
     return $null
 }
 
+function ConvertTo-HookAwarePattern {
+    param([Parameter(Mandatory)][string]$Pattern)
+
+    $tokens = @($Pattern -split '\s+' | Where-Object { $_ -ne '' })
+    if ($tokens.Count -lt 5) {
+        return $null
+    }
+    foreach ($index in 0..4) {
+        if ($tokens[$index] -match '\?') {
+            return $null
+        }
+    }
+
+    $suffix = @($tokens | Select-Object -Skip 5)
+    return ('E9 ?? ?? ?? ?? ' + ($suffix -join ' ')).Trim()
+}
+
 $resolvedProfile = [IO.Path]::GetFullPath($ProfilePath)
 if (-not (Test-Path -LiteralPath $resolvedProfile -PathType Leaf)) {
     throw "Base profile not found: $resolvedProfile"
@@ -218,6 +237,20 @@ foreach ($property in @($profile.symbols.PSObject.Properties)) {
             '--pid', $pidText, 'scan', $moduleName,
             [string]$symbol.section, [string]$symbol.pattern)
         $matches = @($scan.matches)
+        $hookedEntry = $false
+        if ($matches.Count -eq 0) {
+            $hookAwarePattern = ConvertTo-HookAwarePattern ([string]$symbol.pattern)
+            if ($null -ne $hookAwarePattern) {
+                $hookScan = Invoke-JsonTool $resolvedCli @(
+                    '--pid', $pidText, 'scan', $moduleName,
+                    [string]$symbol.section, $hookAwarePattern)
+                $hookMatches = @($hookScan.matches)
+                if ($hookMatches.Count -eq 1) {
+                    $matches = $hookMatches
+                    $hookedEntry = $true
+                }
+            }
+        }
         $matchDetails = @()
         foreach ($matchText in $matches) {
             $instruction = Convert-HexToUInt64 ([string]$matchText)
@@ -283,6 +316,7 @@ foreach ($property in @($profile.symbols.PSObject.Properties)) {
             Pattern = [string]$symbol.pattern
             MatchCount = $matches.Count
             Matches = $matchDetails
+            HookedEntry = $hookedEntry
         })
     } catch {
         $results.Add([pscustomobject][ordered]@{
@@ -334,6 +368,9 @@ $report = [pscustomobject][ordered]@{
     Summary = [pscustomobject][ordered]@{
         SymbolCount = $results.Count
         Unique = $uniqueCount
+        HookAwareUnique = @($results | Where-Object {
+            $_.HookedEntry -eq $true
+        }).Count
         NotFound = @($results | Where-Object Status -eq 'not-found').Count
         Ambiguous = @($results | Where-Object Status -eq 'ambiguous').Count
         Failed = @($results | Where-Object {
