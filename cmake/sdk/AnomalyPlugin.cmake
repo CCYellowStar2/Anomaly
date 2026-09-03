@@ -1,7 +1,7 @@
 include(CMakeParseArguments)
 
 function(anomaly_add_plugin target)
-    set(options C_ONLY)
+    set(options C_ONLY NO_RELEASE)
     set(oneValueArgs MANIFEST PACKAGE_NAME OUTPUT_DIRECTORY)
     set(multiValueArgs SOURCES)
     cmake_parse_arguments(ANOMALY "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
@@ -43,4 +43,7 @@ function(anomaly_add_plugin target)
                 "${ANOMALY_MANIFEST}" "$<TARGET_FILE_DIR:${target}>/manifest.json"
         VERBATIM)
     set_property(TARGET ${target} PROPERTY ANOMALY_PACKAGE_DIRECTORY "${ANOMALY_OUTPUT_DIRECTORY}")
+    if(NOT ANOMALY_NO_RELEASE)
+        set_property(GLOBAL APPEND PROPERTY ANOMALY_RELEASE_PLUGIN_TARGETS "${target}")
+    endif()
 endfunction()

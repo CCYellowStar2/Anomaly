@@ -1273,7 +1273,7 @@ option(ANOMALY_BUILD_WINSOCK_TRACE_PROBES
     "Build opt-in bounded Winsock transport trace probe packages" ON)
 if(ANOMALY_BUILD_WINSOCK_TRACE_PROBES)
     function(anomaly_add_winsock_trace_probe target operation plugin_id package_name)
-        anomaly_add_plugin(${target}
+        anomaly_add_plugin(${target} NO_RELEASE
             SOURCES tools/winsock_trace_probe/plugin.cpp
             MANIFEST tools/winsock_trace_probe/manifests/${package_name}.json
             PACKAGE_NAME ${package_name}
@@ -1318,7 +1318,7 @@ endif()
 option(ANOMALY_BUILD_BIDKING_OBJECT_CATALOG
     "Build the read-only NTE BidKing UObject catalog package" ON)
 if(ANOMALY_BUILD_BIDKING_OBJECT_CATALOG)
-    anomaly_add_plugin(anomaly_bidking_object_catalog
+    anomaly_add_plugin(anomaly_bidking_object_catalog NO_RELEASE
         SOURCES tools/bidking_object_catalog/plugin.cpp
         MANIFEST tools/bidking_object_catalog/manifest.json
         PACKAGE_NAME BidKingObjectCatalog
@@ -1333,7 +1333,7 @@ endif()
 option(ANOMALY_BUILD_BIDKING_ROUND_POOL_PROBE
     "Build the exact-build NTE BidKing response diagnostic package" ON)
 if(ANOMALY_BUILD_BIDKING_ROUND_POOL_PROBE)
-    anomaly_add_plugin(anomaly_bidking_round_pool_probe
+    anomaly_add_plugin(anomaly_bidking_round_pool_probe NO_RELEASE
         SOURCES tools/bidking_round_pool_probe/plugin.cpp
         MANIFEST tools/bidking_round_pool_probe/manifest.json
         PACKAGE_NAME BidKingRoundPoolProbe
@@ -1347,18 +1347,9 @@ set(ANOMALY_RELEASE_PE_TARGETS
     dwmapi anomaly_core anomaly_launcher anomaly_crash_coordinator
     anomaly-plugin anomaly_abi_snapshot anomaly_test_host
     anomaly-profile anomaly_cli anomaly_inspect)
-foreach(runtime_plugin_target IN ITEMS
-        anomaly_example_hello_ui anomaly_example_tick_counter
-        anomaly_example_reliable_config anomaly_example_nte_inspector
-        anomaly_example_nte_combat_demo
-        anomaly_builtin_nte_position anomaly_builtin_nte_teleport
-        anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
-        anomaly_builtin_entity_esp anomaly_builtin_pink_paw_heist_esp
-        anomaly_builtin_fake_uid anomaly_builtin_camera_tools
-        anomaly_builtin_camera_blur_fix
-        anomaly_builtin_teleport_landmarks_probe
-        anomaly_builtin_map_spawn_exporter
-        anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box anomaly_builtin_dll_loader)
+get_property(ANOMALY_RELEASE_PLUGIN_TARGETS GLOBAL PROPERTY ANOMALY_RELEASE_PLUGIN_TARGETS)
+list(REMOVE_DUPLICATES ANOMALY_RELEASE_PLUGIN_TARGETS)
+foreach(runtime_plugin_target IN LISTS ANOMALY_RELEASE_PLUGIN_TARGETS)
     if(TARGET ${runtime_plugin_target})
         list(APPEND ANOMALY_RELEASE_PE_TARGETS ${runtime_plugin_target})
     endif()
