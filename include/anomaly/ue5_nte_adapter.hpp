@@ -30,19 +30,17 @@ struct NteSnapshotSamplingOptions {
 
 struct NteCombatDiagnosticsSnapshot {
     bool damage_event_layout_ready{};
+    bool combat_available{};
+    bool combat_partial{};
     std::uint32_t process_event_binding_mask{};
     std::uint64_t damage_floaties_call_count{};
     std::uint64_t monster_damage_call_count{};
     std::uint64_t player_damage_queue_call_count{};
     std::uint64_t damage_widget_call_count{};
-    std::uint64_t treatment_call_count{};
-    std::uint64_t treatment_direct_call_count{};
-    std::uint64_t health_changed_call_count{};
     std::uint64_t buff_call_count{};
     std::uint64_t crit_query_call_count{};
     std::uint64_t crit_query_success_count{};
     std::uint64_t crit_true_count{};
-    std::uint64_t heal_snapshot_published_count{};
     std::uint64_t native_call_count{};
     std::uint64_t captured_event_count{};
     std::uint64_t dropped_count{};
@@ -53,6 +51,12 @@ struct NteCombatDiagnosticsSnapshot {
     std::uint64_t trigger_ability_handle_mapping_count{};
     std::uint64_t damage_source_mapping_failure_count{};
     std::uint64_t delayed_damage_name_completion_count{};
+    std::uint64_t combat_sample_sequence{};
+    std::uint64_t world_pointer{};
+    std::uint64_t player_pawn{};
+    std::uint64_t combat_character_id{};
+    std::uint64_t combat_character_generation{};
+    std::uint32_t combat_refresh_failure{};
 };
 
 inline constexpr std::size_t kNteCombatExecFunctionCapacity = 14;

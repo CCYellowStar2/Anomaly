@@ -678,8 +678,6 @@ struct Ue5NteAdapter::State {
         MulticastShowMonsterDamageInfo,
         ClientShowPlayerDamageInfo,
         SetDamageInfo,
-        OnTreatment,
-        HandleOnHpAttributeChange2,
         OnActiveGameplayEffectAdded,
         OnAnyGameplayEffectRemoved,
         AddBuffControl,
@@ -908,8 +906,6 @@ struct Ue5NteAdapter::State {
     enum class CombatCaptureKind : std::uint8_t {
         CharacterDamage,
         Damage,
-        Treatment,
-        HealthChanged,
         BuffAdd,
         BuffRemove,
     };
@@ -918,7 +914,6 @@ struct Ue5NteAdapter::State {
         std::uint16_t payload_size{};
         std::uint16_t info_offset{};
         std::uint64_t tick_sequence{};
-        std::uintptr_t receiver{};
         std::array<std::uint8_t, kCombatCapturePayloadBytes> payload{};
     };
     std::array<PendingCombatCapture, kCombatCaptureQueueCapacity> combat_capture_queue{};
@@ -932,11 +927,6 @@ struct Ue5NteAdapter::State {
         std::uint16_t player_damage_queue_offset{};
         std::uintptr_t damage_widget{};
         std::uint16_t damage_widget_info_offset{};
-        std::uintptr_t treatment{};
-        std::uint16_t treatment_parms_size{};
-        std::uintptr_t health_changed{};
-        std::uint16_t health_old_offset{0xFFFFU};
-        std::uint16_t health_new_offset{0xFFFFU};
         struct Buff {
             std::uintptr_t function{};
             std::uint16_t parms_size{};
@@ -961,14 +951,10 @@ struct Ue5NteAdapter::State {
     std::atomic<std::uint64_t> monster_damage_call_count{};
     std::atomic<std::uint64_t> player_damage_queue_call_count{};
     std::atomic<std::uint64_t> damage_widget_call_count{};
-    std::atomic<std::uint64_t> treatment_call_count{};
-    std::atomic<std::uint64_t> treatment_direct_call_count{};
-    std::atomic<std::uint64_t> health_changed_call_count{};
     std::atomic<std::uint64_t> buff_call_count{};
     std::atomic<std::uint64_t> crit_query_call_count{};
     std::atomic<std::uint64_t> crit_query_success_count{};
     std::atomic<std::uint64_t> crit_true_count{};
-    std::atomic<std::uint64_t> heal_snapshot_published_count{};
     std::atomic_bool combat_demand{};
     std::atomic_bool display_name_demand{};
     std::uint64_t combat_attempt_sequence{};
@@ -981,16 +967,7 @@ struct Ue5NteAdapter::State {
     bool combat_dead{};
     bool combat_available{};
     bool combat_partial{};
-    // LastTreatmentGEDef is transient. Keep the latest nonzero value per ASC
-    // so health callbacks can use the exact runtime definition without any
-    // per-event reflection or a global cross-character attribution.
-    struct RecentTreatmentDefinition {
-        std::uintptr_t ability_system{};
-        std::uintptr_t definition{};
-        std::uint64_t name_id{};
-        std::uint64_t observed_sequence{};
-    };
-    std::array<RecentTreatmentDefinition, 4> recent_treatment_definitions{};
+    std::uint32_t combat_refresh_failure{};
     struct ActiveEffectRecord {
         std::int32_t replication_id{};
         std::int32_t replication_key{};
@@ -1295,13 +1272,6 @@ struct Ue5NteAdapter::State {
             NteFunctionParameterSpec{"InDamageFloatiesForm", "ObjectProperty", 8, false},
             NteFunctionParameterSpec{"InDamageInfo", "StructProperty", 72, false},
             NteFunctionParameterSpec{"bNeedSetTransform", "BoolProperty", 1, false}};
-        static constexpr std::array treatment{
-            NteFunctionParameterSpec{"PlayerCharacter", "ObjectProperty", 8, false},
-            NteFunctionParameterSpec{"TargetActor", "ObjectProperty", 8, false},
-            NteFunctionParameterSpec{"InValue", "FloatProperty", 4, false}};
-        static constexpr std::array health_changed{
-            NteFunctionParameterSpec{"fOldAttributeValue", "FloatProperty", 4, false},
-            NteFunctionParameterSpec{"fAttributeValue", "FloatProperty", 4, false}};
         static constexpr std::array active_effect_added{
             NteFunctionParameterSpec{"Source", "ObjectProperty", 8, false},
             NteFunctionParameterSpec{"SpecApplied", "StructProperty", 664, false},
@@ -1379,11 +1349,6 @@ struct Ue5NteAdapter::State {
         case NteFunctionKind::SetDamageInfo:
             return {kind, "SetDamageInfo", "HTUI_DamageFloatiesWidget", 81,
                 damage_widget};
-        case NteFunctionKind::OnTreatment:
-            return {kind, "OnTreatment", "HTAchievementComponent", 20, treatment};
-        case NteFunctionKind::HandleOnHpAttributeChange2:
-            return {kind, "HandleOnHpAttributeChange2", "HTAICharacter", 8,
-                health_changed};
         case NteFunctionKind::OnActiveGameplayEffectAdded:
             return {kind, "BP_OnActiveGameplayEffectAdded", "HTUI_AbilityCustomBase", 680,
                 active_effect_added};
@@ -1630,13 +1595,13 @@ struct Ue5NteAdapter::State {
                 "damageTextInfo.victim", "damageTextInfo.combatStatistics",
                 "damageTextInfo.basicDamage", "damageTextInfo.finalDamage",
                  "damageTextInfo.displayType", "damageTextInfo.reactionType",
-                 "damageTextInfo.reactionDisplayType", "treatment.player",
+                 "damageTextInfo.reactionDisplayType",
                  "gameplayEffect.uiData", "gameplayEffectUIData.description",
-                 "treatment.target", "treatment.value", "buff.specDef",
+                 "buff.specDef",
                  "buff.duration", "buff.stackCount", "ftext.textData",
                  "ftextData.textSource", "fstring.data", "fstring.count",
                  "fstring.capacity", "abilityCharacter.abilitySystemComponent",
-                 "abilitySystem.lastTreatmentGEDef", "gameData.abilityDataAsset",
+                 "gameData.abilityDataAsset",
                  "abilityData.skillDamageDataTable", "skillDamage.gaName",
                  "gameData.monsterInfoDataTable",
                  "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
@@ -2324,7 +2289,6 @@ struct Ue5NteAdapter::State {
         pending_combat_participant_names.clear();
         queued_combat_participant_names.clear();
         failed_combat_participant_names.clear();
-        recent_treatment_definitions = {};
         localized_names_by_fname.clear();
         localized_names_by_key.clear();
         display_table_generation = 0;
@@ -3196,20 +3160,19 @@ struct Ue5NteAdapter::State {
 
     void RefreshCombat(std::uint64_t sequence) noexcept {
         combat_attempt_sequence = sequence;
+        combat_refresh_failure = 0;
         if (!SemanticFeatureAvailable("nte.combat") || !player_available ||
             player_pawn == 0 || world_pointer == 0) {
+            combat_refresh_failure = 1;
             InvalidateCombatSnapshot();
             return;
         }
         AnomalyGenerationHandleV1 character{};
         if (!ObjectHandleLocked(player_pawn, character)) {
+            combat_refresh_failure = 2;
             InvalidateCombatSnapshot();
             return;
         }
-        const bool same_character = combat_available &&
-            combat_character.id == character.id &&
-            combat_character.generation == character.generation;
-        const double previous_hp = combat_hp;
         std::uintptr_t pawn_class{};
         const auto& get_hp = combat_skill_discovery.functions[
             NteIndex(NteFunctionKind::GetHp)];
@@ -3217,6 +3180,7 @@ struct Ue5NteAdapter::State {
             !ReadPointerAt(
                 *memory, player_pawn, Layout(profile, "object.class"), pawn_class) ||
             !IsClassDerivedFromLocked(pawn_class, get_hp->outer_class)) {
+            combat_refresh_failure = 3;
             InvalidateCombatSnapshot();
             return;
         }
@@ -3235,29 +3199,47 @@ struct Ue5NteAdapter::State {
             !InvokeNteFunctionLocked(
                 NteFunctionKind::GetHpMax, player_pawn, hp_max_parameters) ||
             !InvokeNteBoolReturnLocked(
-                NteFunctionKind::GetIsDead, player_pawn, dead) ||
-            !InvokeNteReturnLocked(
-                NteFunctionKind::GetAttackTarget, player_pawn, target) ||
-            !CurrentAbilitySystemLocked(player_pawn, ability_system) ||
-            !InvokeNteReturnLocked(
-                NteFunctionKind::GetShieldHealth, ability_system, shield)) {
+                NteFunctionKind::GetIsDead, player_pawn, dead)) {
+            combat_refresh_failure = 4;
             InvalidateCombatSnapshot();
             return;
+        }
+        bool partial = false;
+        if (!InvokeNteReturnLocked(
+                NteFunctionKind::GetAttackTarget, player_pawn, target)) {
+            target = 0;
+            combat_refresh_failure = 5;
+            partial = true;
+        }
+        if (!CurrentAbilitySystemLocked(player_pawn, ability_system)) {
+            ability_system = 0;
+            combat_refresh_failure = 6;
+            partial = true;
+        } else if (!InvokeNteReturnLocked(
+                NteFunctionKind::GetShieldHealth, ability_system, shield)) {
+            shield = 0.0F;
+            combat_refresh_failure = 7;
+            partial = true;
         }
         const std::size_t max_hp_return = hp_max_binding->offsets[1];
         if (max_hp_return > hp_max_parameters.size() ||
             sizeof(max_hp) > hp_max_parameters.size() - max_hp_return) {
+            combat_refresh_failure = 8;
             InvalidateCombatSnapshot();
             return;
         }
         std::memcpy(&max_hp, hp_max_parameters.data() + max_hp_return, sizeof(max_hp));
         if (!std::isfinite(hp) || !std::isfinite(max_hp) ||
             !std::isfinite(shield) || max_hp < 0.0F) {
+            combat_refresh_failure = 9;
             InvalidateCombatSnapshot();
             return;
         }
         AnomalyGenerationHandleV1 target_handle{};
-        const bool partial = target != 0 && !ObjectHandleLocked(target, target_handle);
+        const bool target_handle_failed =
+            target != 0 && !ObjectHandleLocked(target, target_handle);
+        partial = partial || target_handle_failed;
+        if (target_handle_failed) combat_refresh_failure = 10;
         combat_character = character;
         combat_target = target_handle;
         combat_hp = hp;
@@ -3267,15 +3249,15 @@ struct Ue5NteAdapter::State {
         combat_partial = partial;
         combat_available = true;
         combat_sample_sequence = sequence;
+        if (!partial) combat_refresh_failure = 0;
         try {
-            if (same_character) {
-                PublishHealSnapshotLocked(
-                    previous_hp, hp, ability_system, sequence, character);
+            if (ability_system != 0) {
+                RefreshActiveGameplayEffectsLocked(
+                    ability_system, sequence, character);
             }
-            RefreshActiveGameplayEffectsLocked(
-                ability_system, sequence, character);
         } catch (...) {
             combat_partial = true;
+            combat_refresh_failure = 11;
         }
     }
 
@@ -3486,161 +3468,6 @@ struct Ue5NteAdapter::State {
         active_effect_ability_system = ability_system;
         active_effect_array_key = key_after;
         active_effects_initialized = true;
-    }
-
-    void RememberTreatmentDefinitionLocked(
-        const std::uintptr_t ability_system,
-        const std::uintptr_t definition,
-        const std::uint64_t sequence) noexcept {
-        if (ability_system == 0 || definition == 0) return;
-        auto* target = &recent_treatment_definitions.front();
-        for (auto& entry : recent_treatment_definitions) {
-            if (entry.ability_system == ability_system) {
-                target = &entry;
-                break;
-            }
-            if (entry.ability_system == 0 ||
-                entry.observed_sequence < target->observed_sequence) {
-                target = &entry;
-            }
-        }
-        if (target->ability_system != ability_system || target->definition != definition) {
-            target->ability_system = ability_system;
-            target->definition = definition;
-            target->name_id = 0;
-            static_cast<void>(ReadCombatNameIdentityLocked(definition, target->name_id));
-        }
-        target->observed_sequence = sequence;
-    }
-
-    [[nodiscard]] bool FindRecentTreatmentDefinitionLocked(
-        const std::uintptr_t ability_system,
-        const std::uint64_t sequence,
-        std::uintptr_t& definition,
-        std::uint64_t& name_id) const noexcept {
-        definition = 0;
-        name_id = 0;
-        constexpr std::uint64_t kMaximumAgeTicks = 30;
-        for (const auto& entry : recent_treatment_definitions) {
-            if (entry.ability_system != ability_system || entry.definition == 0) continue;
-            const auto age = entry.observed_sequence > sequence
-                ? entry.observed_sequence - sequence
-                : sequence - entry.observed_sequence;
-            if (age > kMaximumAgeTicks) continue;
-            definition = entry.definition;
-            name_id = entry.name_id;
-            return true;
-        }
-        return false;
-    }
-
-    [[nodiscard]] bool ReadTreatmentDefinitionLocked(
-        const std::uintptr_t ability_system,
-        const std::uint64_t sequence,
-        std::uintptr_t& definition,
-        std::uint64_t& name_id) noexcept {
-        definition = 0;
-        name_id = 0;
-        const auto definition_offset = Layout(
-            profile, "abilitySystem.lastTreatmentGEDef", -1);
-        if (ability_system != 0 && definition_offset >= 0) {
-            static_cast<void>(ReadPointerAt(
-                *memory, ability_system, definition_offset, definition));
-        }
-        if (definition != 0) {
-            RememberTreatmentDefinitionLocked(ability_system, definition, sequence);
-            static_cast<void>(FindRecentTreatmentDefinitionLocked(
-                ability_system, sequence, definition, name_id));
-            return true;
-        }
-        return FindRecentTreatmentDefinitionLocked(
-            ability_system, sequence, definition, name_id);
-    }
-
-    void RefreshRecentTreatmentDefinitionLocked(const std::uint64_t sequence) noexcept {
-        const auto ability_system_offset = Layout(
-            profile, "abilityCharacter.abilitySystemComponent", -1);
-        const auto definition_offset = Layout(
-            profile, "abilitySystem.lastTreatmentGEDef", -1);
-        if (player_pawn == 0 || ability_system_offset < 0 || definition_offset < 0) return;
-        std::uintptr_t ability_system{};
-        std::uintptr_t definition{};
-        if (ReadPointerAt(*memory, player_pawn, ability_system_offset, ability_system) &&
-            ability_system != 0 &&
-            ReadPointerAt(*memory, ability_system, definition_offset, definition) &&
-            definition != 0) {
-            RememberTreatmentDefinitionLocked(ability_system, definition, sequence);
-        }
-    }
-
-    void PublishHealSnapshotLocked(
-        const double previous_hp, const double current_hp,
-        const std::uintptr_t ability_system, const std::uint64_t sequence,
-        const AnomalyGenerationHandleV1 target) {
-        if (!std::isfinite(previous_hp) || !std::isfinite(current_hp) ||
-            current_hp <= previous_hp) {
-            return;
-        }
-        AnomalyNteCombatEventV1 event{};
-        event.kind = ANOMALY_NTE_COMBAT_EVENT_V1_HEAL;
-        event.tick_sequence = sequence;
-        event.world = {1, world_generation};
-        event.source = target;
-        event.target = target;
-        event.value = static_cast<std::int64_t>(std::llround(current_hp - previous_hp));
-        const auto causer_offset = Layout(
-            profile, "abilitySystem.currentDamageCauserOrInstigator", -1);
-        if (ability_system != 0 && causer_offset >= 0) {
-            std::uintptr_t source_actor{};
-            if (ReadPointerAt(*memory, ability_system, causer_offset, source_actor) &&
-                source_actor != 0) {
-                AnomalyGenerationHandleV1 source_handle{};
-                if (ObjectHandleLocked(source_actor, source_handle) &&
-                    source_handle.id != 0) {
-                    event.source = source_handle;
-                }
-            }
-        }
-        std::uintptr_t definition{};
-        if (ReadTreatmentDefinitionLocked(
-                ability_system, sequence, definition, event.name_id) &&
-            event.name_id != 0) {
-            CacheCombatEventNameLocked(event.name_id, definition);
-            if (combat_event_names.contains(event.name_id)) {
-                event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID;
-            }
-        } else if (event.name_id == 0) {
-            const auto current_ge_offset = Layout(
-                profile, "abilitySystem.currentDamageGameplayEffect", -1);
-            if (ability_system != 0 && current_ge_offset >= 0 &&
-                ReadPointerAt(*memory, ability_system, current_ge_offset, definition) &&
-                definition != 0 &&
-                ReadCombatNameIdentityLocked(definition, event.name_id) &&
-                event.name_id != 0) {
-                CacheCombatEventNameLocked(event.name_id, definition);
-                if (combat_event_names.contains(event.name_id)) {
-                    event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID;
-                }
-            }
-        }
-        const std::size_t lookback = (std::min)(combat_event_count, std::size_t{8});
-        for (std::size_t index = combat_event_count;
-             index > combat_event_count - lookback; --index) {
-            auto& candidate = combat_events[
-                (combat_event_start + index - 1U) % kCombatEventCapacity].event;
-            if (candidate.kind != ANOMALY_NTE_COMBAT_EVENT_V1_HEAL ||
-                candidate.tick_sequence != sequence || candidate.value != event.value) {
-                continue;
-            }
-            if (candidate.target.id == 0) candidate.target = event.target;
-            if (candidate.name_id == 0 && event.name_id != 0) {
-                candidate.name_id = event.name_id;
-                candidate.flags |= event.flags;
-            }
-            return;
-        }
-        heal_snapshot_published_count.fetch_add(1, std::memory_order_relaxed);
-        RecordCombatEventLocked(event);
     }
 
     [[nodiscard]] bool ReadSkillIdentityLocked(
@@ -3910,6 +3737,25 @@ struct Ue5NteAdapter::State {
         return true;
     }
 
+    [[nodiscard]] bool ReadWeakObjectPointerLocked(
+        const std::uintptr_t address,
+        std::uintptr_t& object) const noexcept {
+        object = 0;
+        if (address == 0) return false;
+        std::int32_t index{};
+        std::int32_t serial{};
+        if (!ReadValue(*memory, address, index) ||
+            !ReadValue(
+                *memory,
+                address + static_cast<std::uintptr_t>(sizeof(index)),
+                serial)) {
+            return false;
+        }
+        AnomalyGenerationHandleV1 handle{};
+        if (!WeakObjectHandleLocked(index, serial, handle)) return false;
+        return ResolveObjectHandleLocked(handle, object) && object != 0;
+    }
+
     void RecordDamageEventLocked(AnomalyNteDamageEventV1 event) noexcept {
         event.struct_size = sizeof(event);
         event.sequence = ++damage_event_sequence;
@@ -4015,6 +3861,29 @@ struct Ue5NteAdapter::State {
         });
         pending.player_participant = is_player_participant;
         participant_last_player = is_player_participant;
+        if (is_player_participant) {
+            const auto read_character_id = [this, object, &pending](
+                                               const std::int64_t offset) {
+                if (offset < 0) return;
+                std::uint32_t index{};
+                std::uint32_t number{};
+                if (ReadValue(*memory,
+                        object + static_cast<std::uintptr_t>(offset),
+                        index) &&
+                    ReadValue(*memory,
+                        object + static_cast<std::uintptr_t>(offset) +
+                            sizeof(index),
+                        number)) {
+                    const auto key = static_cast<std::uint64_t>(index) |
+                        (static_cast<std::uint64_t>(number) << 32U);
+                    AppendParticipantNameCandidate(pending, key, {});
+                }
+            };
+            read_character_id(Layout(
+                profile, "playerCharacter.defaultCharacterId", -1));
+            read_character_id(Layout(
+                profile, "playerCharacter.currentDisplayCharacterId", -1));
+        }
         const auto config_id_offset = Layout(
             profile, "abilityCharacter.characterConfigId", -1);
         if (!is_player_participant && config_id_offset >= 0) {
@@ -5377,108 +5246,6 @@ struct Ue5NteAdapter::State {
         if (!MergeCombatDamageLocked(event)) RecordCombatEventLocked(event);
     }
 
-    void CaptureTreatmentBytesLocked(
-        const std::span<const std::uint8_t> parameters,
-        const std::uint64_t capture_tick_sequence) noexcept {
-        const auto& binding = combat_skill_discovery.functions[NteIndex(NteFunctionKind::OnTreatment)];
-        if (!binding) return;
-        std::uintptr_t source{};
-        std::uintptr_t target{};
-        float value{};
-        if (!ReadCaptureBytes(parameters, binding->offsets[0], source) ||
-            !ReadCaptureBytes(parameters, binding->offsets[1], target) ||
-            !ReadCaptureBytes(parameters, binding->offsets[2], value) ||
-            !std::isfinite(value) || value < 0.0F) return;
-        AnomalyNteCombatEventV1 event{};
-        event.kind = ANOMALY_NTE_COMBAT_EVENT_V1_HEAL;
-        event.tick_sequence = capture_tick_sequence;
-        event.world = {1, world_generation};
-        static_cast<void>(ObjectHandleLocked(source, event.source));
-        static_cast<void>(ObjectHandleLocked(target, event.target));
-        event.value = static_cast<std::int64_t>(std::llround(value));
-        std::uintptr_t ability_system{};
-        std::uintptr_t definition{};
-        const auto ability_system_offset = Layout(
-            profile, "abilityCharacter.abilitySystemComponent", -1);
-        if (target != 0 && ability_system_offset >= 0 &&
-            ReadPointerAt(*memory, target, ability_system_offset, ability_system) &&
-            ability_system != 0) {
-            static_cast<void>(ReadTreatmentDefinitionLocked(
-                ability_system, capture_tick_sequence, definition, event.name_id));
-        }
-        if (event.name_id == 0 && source != 0 && source != target &&
-            ability_system_offset >= 0 &&
-            ReadPointerAt(*memory, source, ability_system_offset, ability_system) &&
-            ability_system != 0) {
-            static_cast<void>(ReadTreatmentDefinitionLocked(
-                ability_system, capture_tick_sequence, definition, event.name_id));
-        }
-        if (event.name_id != 0) {
-            CacheCombatEventNameLocked(event.name_id, definition);
-            if (combat_event_names.contains(event.name_id)) {
-                event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID;
-            }
-        }
-        RecordCombatEventLocked(event);
-    }
-
-    void CaptureHealthChangedBytesLocked(
-        const std::span<const std::uint8_t> parameters,
-        const std::uintptr_t receiver,
-        const std::uint64_t capture_tick_sequence) noexcept {
-        const auto& binding = combat_skill_discovery.functions[
-            NteIndex(NteFunctionKind::HandleOnHpAttributeChange2)];
-        if (!binding || parameters.size() < binding->parms_size) return;
-        if (combat_skill_discovery.functions[
-                NteIndex(NteFunctionKind::OnTreatment)]) {
-            return;
-        }
-        float old_value{};
-        float new_value{};
-        if (!ReadCaptureBytes(parameters, binding->offsets[0], old_value) ||
-            !ReadCaptureBytes(parameters, binding->offsets[1], new_value) ||
-            !std::isfinite(old_value) || !std::isfinite(new_value) ||
-            new_value <= old_value) return;
-        AnomalyNteCombatEventV1 event{};
-        event.kind = ANOMALY_NTE_COMBAT_EVENT_V1_HEAL;
-        event.tick_sequence = capture_tick_sequence;
-        event.world = {1, world_generation};
-        static_cast<void>(ObjectHandleLocked(receiver, event.source));
-        event.target = event.source;
-        event.value = static_cast<std::int64_t>(std::llround(new_value - old_value));
-        std::uintptr_t ability_system{};
-        std::uintptr_t definition{};
-        std::uint64_t cached_name_id{};
-        static_cast<void>(ReadCaptureBytes(parameters, 8, definition));
-        const auto ability_system_offset = Layout(
-            profile, "abilityCharacter.abilitySystemComponent", -1);
-        if (receiver != 0 && ability_system_offset >= 0) {
-            static_cast<void>(ReadPointerAt(
-                *memory, receiver, ability_system_offset, ability_system));
-        }
-        if (definition != 0 && ability_system != 0) {
-            RememberTreatmentDefinitionLocked(
-                ability_system, definition, capture_tick_sequence);
-        }
-        if (definition == 0) {
-            static_cast<void>(ReadTreatmentDefinitionLocked(
-                ability_system, capture_tick_sequence, definition, cached_name_id));
-        } else if (ability_system != 0) {
-            static_cast<void>(FindRecentTreatmentDefinitionLocked(
-                ability_system, capture_tick_sequence, definition, cached_name_id));
-        } else {
-            static_cast<void>(ReadCombatNameIdentityLocked(definition, cached_name_id));
-        }
-        event.name_id = cached_name_id;
-        if (definition != 0 && event.name_id != 0) {
-            CacheCombatEventNameLocked(event.name_id, definition);
-            if (combat_event_names.contains(event.name_id)) {
-                event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID;
-            }
-        }
-        RecordCombatEventLocked(event);
-    }
-
     void CaptureBuffBytesLocked(
         const std::span<const std::uint8_t> parameters,
         const std::uint64_t capture_tick_sequence) noexcept {
@@ -5529,7 +5296,6 @@ struct Ue5NteAdapter::State {
         const CombatCaptureKind kind,
         const std::span<const std::uint8_t> parameters,
         const std::uint16_t info_offset,
-        const std::uintptr_t receiver,
         const std::uint64_t capture_tick_sequence) noexcept {
         switch (kind) {
         case CombatCaptureKind::CharacterDamage:
@@ -5537,13 +5303,6 @@ struct Ue5NteAdapter::State {
             break;
         case CombatCaptureKind::Damage:
             CaptureDamageTextBytesLocked(parameters, info_offset, capture_tick_sequence);
-            break;
-        case CombatCaptureKind::Treatment:
-            CaptureTreatmentBytesLocked(parameters, capture_tick_sequence);
-            break;
-        case CombatCaptureKind::HealthChanged:
-            CaptureHealthChangedBytesLocked(
-                parameters, receiver, capture_tick_sequence);
             break;
         case CombatCaptureKind::BuffAdd:
         case CombatCaptureKind::BuffRemove:
@@ -5563,7 +5322,7 @@ struct Ue5NteAdapter::State {
             CaptureCombatProcessEventLocked(
                 capture.kind,
                 std::span<const std::uint8_t>(capture.payload).first(capture.payload_size),
-                capture.info_offset, capture.receiver, capture.tick_sequence);
+                capture.info_offset, capture.tick_sequence);
             ++read;
             ++drained;
         }
@@ -5585,7 +5344,6 @@ struct Ue5NteAdapter::State {
         capture.payload_size = 72;
         capture.info_offset = 0;
         capture.tick_sequence = capture_tick_sequence;
-        capture.receiver = 0;
         std::memcpy(capture.payload.data(), source, capture.payload_size);
         combat_capture_write.store(write + 1U, std::memory_order_release);
         return true;
@@ -5593,7 +5351,6 @@ struct Ue5NteAdapter::State {
 
     void EnqueueCombatProcessEvent(
         const CombatCaptureBindings& bindings,
-        const std::uintptr_t receiver,
         const std::uintptr_t function,
         const void* const parameters) noexcept {
         if (parameters == nullptr) return;
@@ -5605,12 +5362,6 @@ struct Ue5NteAdapter::State {
             player_damage_queue_call_count.fetch_add(1, std::memory_order_relaxed);
         } else if (function == bindings.damage_widget) {
             damage_widget_call_count.fetch_add(1, std::memory_order_relaxed);
-        } else if (function == bindings.treatment) {
-            treatment_call_count.fetch_add(1, std::memory_order_relaxed);
-            treatment_direct_call_count.fetch_add(1, std::memory_order_relaxed);
-        } else if (function == bindings.health_changed) {
-            treatment_call_count.fetch_add(1, std::memory_order_relaxed);
-            health_changed_call_count.fetch_add(1, std::memory_order_relaxed);
         } else if (std::ranges::any_of(
                        bindings.buffs, [function](const auto& buff) {
                            return buff.function != 0 && buff.function == function;
@@ -5659,12 +5410,6 @@ struct Ue5NteAdapter::State {
             kind = CombatCaptureKind::Damage;
             info_offset = bindings.damage_info_offset;
             payload_size = 72;
-        } else if (function == bindings.health_changed) {
-            kind = CombatCaptureKind::HealthChanged;
-            payload_size = 16;
-        } else if (function == bindings.treatment) {
-            kind = CombatCaptureKind::Treatment;
-            payload_size = bindings.treatment_parms_size;
         } else {
             const CombatCaptureBindings::Buff* buff = nullptr;
             for (const auto& candidate : bindings.buffs) {
@@ -5688,7 +5433,6 @@ struct Ue5NteAdapter::State {
             capture.payload_size = payload_size;
             capture.info_offset = 0;
             capture.tick_sequence = tick_sequence.load(std::memory_order_relaxed);
-            capture.receiver = receiver;
             std::memset(capture.payload.data(), 0, payload_size);
             const auto* source = static_cast<const std::uint8_t*>(parameters);
             std::uintptr_t object_value{};
@@ -5747,27 +5491,8 @@ struct Ue5NteAdapter::State {
         capture.payload_size = payload_size;
         capture.info_offset = 0;
         capture.tick_sequence = tick_sequence.load(std::memory_order_relaxed);
-        capture.receiver = receiver;
         const auto* const source = static_cast<const std::uint8_t*>(parameters);
-        if (kind == CombatCaptureKind::Damage) {
-            std::memcpy(capture.payload.data(), source + info_offset, payload_size);
-        } else if (kind == CombatCaptureKind::HealthChanged) {
-            std::memset(capture.payload.data(), 0, payload_size);
-            std::memcpy(capture.payload.data(), source, 8);
-            std::uintptr_t ability_system{};
-            std::uintptr_t definition{};
-            if (receiver != 0 &&
-                ReadPointerAt(*memory, receiver,
-                    Layout(profile, "abilityCharacter.abilitySystemComponent", -1),
-                    ability_system) &&
-                ability_system != 0) {
-                static_cast<void>(ReadPointerAt(*memory, ability_system,
-                    Layout(profile, "abilitySystem.lastTreatmentGEDef", -1), definition));
-            }
-            std::memcpy(capture.payload.data() + 8, &definition, sizeof(definition));
-        } else {
-            std::memcpy(capture.payload.data(), source, payload_size);
-        }
+        std::memcpy(capture.payload.data(), source + info_offset, payload_size);
         combat_capture_write.store(write + 1U, std::memory_order_release);
     }
 
@@ -5802,7 +5527,6 @@ struct Ue5NteAdapter::State {
         capture.payload_size = 81;
         capture.info_offset = 0;
         capture.tick_sequence = tick_sequence.load(std::memory_order_relaxed);
-        capture.receiver = 0;
         std::memset(capture.payload.data(), 0, capture.payload_size);
         const auto* const source = static_cast<const std::uint8_t*>(
             reinterpret_cast<const void*>(damage_event));
@@ -8457,15 +8181,6 @@ struct Ue5NteAdapter::State {
                             next_capture_bindings.damage_widget = address;
                             next_capture_bindings.damage_widget_info_offset = binding.offsets[1];
                             break;
-                        case NteFunctionKind::OnTreatment:
-                            next_capture_bindings.treatment = address;
-                            next_capture_bindings.treatment_parms_size = binding.parms_size;
-                            break;
-                        case NteFunctionKind::HandleOnHpAttributeChange2:
-                            next_capture_bindings.health_changed = address;
-                            next_capture_bindings.health_old_offset = binding.offsets[0];
-                            next_capture_bindings.health_new_offset = binding.offsets[1];
-                            break;
                         case NteFunctionKind::OnActiveGameplayEffectAdded: {
                             const auto spec_offset = binding.offsets[1];
                             next_capture_bindings.buffs[0] = {
@@ -8555,8 +8270,6 @@ struct Ue5NteAdapter::State {
                     lookup_optional(NteFunctionKind::MulticastShowMonsterDamageInfo);
                     lookup_optional(NteFunctionKind::ClientShowPlayerDamageInfo);
                     lookup_optional(NteFunctionKind::SetDamageInfo);
-                    lookup_optional(NteFunctionKind::HandleOnHpAttributeChange2);
-                    lookup_optional(NteFunctionKind::OnTreatment);
                     lookup_optional(NteFunctionKind::CurrentDamageIsCrit);
                     lookup_optional(NteFunctionKind::OnActiveGameplayEffectAdded);
                     lookup_optional(NteFunctionKind::OnAnyGameplayEffectRemoved);
@@ -8584,14 +8297,12 @@ struct Ue5NteAdapter::State {
                     next_capture_bindings.monster_damage != 0 ||
                     next_capture_bindings.player_damage_queue != 0 ||
                     next_capture_bindings.damage_widget != 0 ||
-                    next_capture_bindings.treatment != 0 ||
-                    next_capture_bindings.health_changed != 0 ||
                     std::ranges::any_of(next_capture_bindings.buffs,
                         [](const auto& buff) { return buff.function != 0; });
                 if (has_capture_binding) {
                     // Publish capture-only bindings even when a separate
                     // combat/skill snapshot function is still unavailable.
-                    // This keeps damage/heal/buff events flowing while the
+                    // This keeps damage/buff events flowing while the
                     // optional reflection set finishes resolving.
                     combat_capture_binding_slot ^= 1U;
                     auto& slot = combat_capture_binding_slots[combat_capture_binding_slot];
@@ -14062,9 +13773,6 @@ void Ue5NteAdapter::OnGameTick(double delta_seconds) noexcept {
         } else if (player_requested) {
             ++state->player_cache_hit_count;
         }
-        // Sample the transient treatment definition once after the player
-        // identity is current, before processing the callback queue.
-            state->RefreshRecentTreatmentDefinitionLocked(sequence);
             state->DrainCombatCaptureQueueLocked();
             state->ResolveNextCombatEventNameLocked();
             state->ResolveNextCombatParticipantNameLocked();
@@ -14128,19 +13836,25 @@ void Ue5NteAdapter::OnDamageEvent(
         return;
     }
     bool synchronous_critical{};
-    if (victim != 0) {
+    for (const std::uintptr_t candidate : {victim, attacker}) {
+        if (candidate == 0 || synchronous_critical) {
+            continue;
+        }
         std::uintptr_t ability_system{};
-        if (state->CurrentAbilitySystemLocked(victim, ability_system)) {
-            state->crit_query_call_count.fetch_add(1, std::memory_order_relaxed);
-            if (state->InvokeNteBoolReturnLocked(
-                    State::NteFunctionKind::CurrentDamageIsCrit,
-                    ability_system, synchronous_critical)) {
-                state->crit_query_success_count.fetch_add(
+        if (!state->CurrentAbilitySystemLocked(candidate, ability_system)) {
+            continue;
+        }
+        bool candidate_critical{};
+        state->crit_query_call_count.fetch_add(1, std::memory_order_relaxed);
+        if (state->InvokeNteBoolReturnLocked(
+                State::NteFunctionKind::CurrentDamageIsCrit,
+                ability_system, candidate_critical)) {
+            state->crit_query_success_count.fetch_add(
+                1, std::memory_order_relaxed);
+            if (candidate_critical) {
+                synchronous_critical = true;
+                state->crit_true_count.fetch_add(
                     1, std::memory_order_relaxed);
-                if (synchronous_critical) {
-                    state->crit_true_count.fetch_add(
-                        1, std::memory_order_relaxed);
-                }
             }
         }
     }
@@ -14154,8 +13868,7 @@ void Ue5NteAdapter::OnCombatExecFunction(
     const std::uintptr_t function,
     const std::uintptr_t stack) noexcept {
     const auto state = state_;
-    if (function == 0 || stack == 0 ||
-        GetCurrentThreadId() != state->game_thread_id.load(std::memory_order_acquire)) {
+    if (function == 0 || stack == 0) {
         return;
     }
     const auto locals_offset = Layout(state->profile, "fstack.locals", -1);
@@ -14177,13 +13890,12 @@ void Ue5NteAdapter::OnCombatExecFunction(
         function != bindings->monster_damage &&
         function != bindings->player_damage_queue &&
         function != bindings->damage_widget &&
-        function != bindings->treatment &&
-        function != bindings->health_changed &&
         !is_buff_function) {
         return;
     }
     state->EnqueueCombatProcessEvent(
-        *bindings, receiver, function, reinterpret_cast<void*>(parameters));
+        *bindings, function, reinterpret_cast<void*>(parameters));
+    static_cast<void>(receiver);
 }
 
 void Ue5NteAdapter::OnProcessEvent(
@@ -14227,7 +13939,7 @@ void Ue5NteAdapter::OnProcessEventPre(
         state->combat_capture_bindings.load(std::memory_order_acquire);
     if (combat_bindings != nullptr) {
         state->EnqueueCombatProcessEvent(
-            *combat_bindings, object, function, parameters);
+            *combat_bindings, function, parameters);
     }
     const auto endpoint = state->process_event_endpoint.load(std::memory_order_acquire);
     if (endpoint) endpoint->Dispatch(object, function, parameters);
@@ -14281,11 +13993,6 @@ Ue5NteAdapter::CombatExecFunctionTargets() const noexcept {
     NteCombatExecFunctionTargetsSnapshot snapshot;
     snapshot.discovery_complete =
         state->combat_skill_discovery.combat_event_bindings_attempted;
-    // UFunction::ExecFunction is not a per-function isolation boundary: native
-    // and Blueprint entries can share the VM dispatcher. Detouring these
-    // addresses corrupted unrelated Blueprint bytecode (for example
-    // ReadParticleData). Keep the native CharacterOnDamaged hook below, but
-    // never publish shared ExecFunction targets to MinHook.
     return snapshot;
 }
 
@@ -14299,9 +14006,6 @@ NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {
         if (bindings->monster_damage != 0) binding_mask |= 1U << 1U;
         if (bindings->player_damage_queue != 0) binding_mask |= 1U << 2U;
         if (bindings->damage_widget != 0) binding_mask |= 1U << 3U;
-        if (bindings->treatment != 0 || bindings->health_changed != 0) {
-            binding_mask |= 1U << 4U;
-        }
         if (std::ranges::any_of(bindings->buffs,
                 [](const auto& buff) { return buff.function != 0; })) {
             binding_mask |= 1U << 5U;
@@ -14309,19 +14013,17 @@ NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {
     }
     return {
         state->combat_skill_discovery.damage_event_layout_valid,
+        state->combat_available,
+        state->combat_partial,
         binding_mask,
         state->damage_floaties_call_count.load(std::memory_order_acquire),
         state->monster_damage_call_count.load(std::memory_order_acquire),
         state->player_damage_queue_call_count.load(std::memory_order_acquire),
         state->damage_widget_call_count.load(std::memory_order_acquire),
-        state->treatment_call_count.load(std::memory_order_acquire),
-        state->treatment_direct_call_count.load(std::memory_order_acquire),
-        state->health_changed_call_count.load(std::memory_order_acquire),
         state->buff_call_count.load(std::memory_order_acquire),
         state->crit_query_call_count.load(std::memory_order_acquire),
         state->crit_query_success_count.load(std::memory_order_acquire),
         state->crit_true_count.load(std::memory_order_acquire),
-        state->heal_snapshot_published_count.load(std::memory_order_acquire),
         state->damage_native_call_count.load(std::memory_order_acquire),
         state->damage_captured_event_count,
         state->damage_capture_drop_count.load(std::memory_order_acquire),
@@ -14331,7 +14033,13 @@ NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {
         state->saved_trigger_skill_mapping_count,
         state->trigger_ability_handle_mapping_count,
         state->damage_source_mapping_failure_count,
-        state->delayed_damage_name_completion_count};
+        state->delayed_damage_name_completion_count,
+        state->combat_sample_sequence,
+        state->world_pointer,
+        state->player_pawn,
+        state->combat_character.id,
+        state->combat_character.generation,
+        state->combat_refresh_failure};
 }
 
 std::string Ue5NteAdapter::CombatEventsJson(const bool buffs_only) const {

@@ -195,13 +195,13 @@ FeatureValidationResult ValidateCombatReflectionLayout(
         "damageTextInfo.victim", "damageTextInfo.combatStatistics",
         "damageTextInfo.basicDamage", "damageTextInfo.finalDamage",
         "damageTextInfo.displayType", "damageTextInfo.reactionType",
-        "damageTextInfo.reactionDisplayType", "treatment.player",
+        "damageTextInfo.reactionDisplayType",
         "gameplayEffect.uiData", "gameplayEffectUIData.description",
-        "treatment.target", "treatment.value", "buff.specDef",
+        "buff.specDef",
         "buff.duration", "buff.stackCount", "ftext.textData",
         "ftextData.textSource", "fstring.data", "fstring.count",
         "fstring.capacity", "abilityCharacter.abilitySystemComponent",
-        "abilitySystem.lastTreatmentGEDef", "gameData.abilityDataAsset",
+        "gameData.abilityDataAsset",
         "abilityData.skillDamageDataTable", "skillDamage.gaName",
         "gameData.monsterInfoDataTable",
         "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
@@ -267,7 +267,6 @@ FeatureValidationResult ValidateCombatReflectionLayout(
         !field_fits("abilityCharacter.abilitySystemComponent", 0x1440U, 8U) ||
         !field_fits("abilityCharacter.characterConfigId", 0x1D80U, 8U) ||
         !field_fits("playerState.roleName", 0x470U, 16U) ||
-        !field_fits("abilitySystem.lastTreatmentGEDef", 0x2588U, 8U) ||
         !field_fits("gameplayAbilityTips.name", 0xB8U, 16U) ||
         !field_fits("gameplayAbilityTips.gameplayAbility", 0xB8U, 0x28U) ||
         !field_fits("gameplayEffectTips.name", 0x88U, 16U) ||
@@ -1707,12 +1706,6 @@ public:
             std::to_string(combat_diagnostics.player_damage_queue_call_count);
         json += ",\"damageWidgetCalls\":" +
             std::to_string(combat_diagnostics.damage_widget_call_count);
-        json += ",\"treatmentCalls\":" +
-            std::to_string(combat_diagnostics.treatment_call_count);
-        json += ",\"treatmentDirectCalls\":" +
-            std::to_string(combat_diagnostics.treatment_direct_call_count);
-        json += ",\"healthChangedCalls\":" +
-            std::to_string(combat_diagnostics.health_changed_call_count);
         json += ",\"buffCalls\":" +
             std::to_string(combat_diagnostics.buff_call_count);
         json += ",\"critQueryCalls\":" +
@@ -1721,8 +1714,6 @@ public:
             std::to_string(combat_diagnostics.crit_query_success_count);
         json += ",\"critTrueCount\":" +
             std::to_string(combat_diagnostics.crit_true_count);
-        json += ",\"healSnapshotsPublished\":" +
-            std::to_string(combat_diagnostics.heal_snapshot_published_count);
         json += ",\"nativeCalls\":" +
             std::to_string(combat_diagnostics.native_call_count);
         json += ",\"capturedEvents\":" +
@@ -1742,7 +1733,23 @@ public:
         json += ",\"damageSourceMappingFailures\":" +
             std::to_string(combat_diagnostics.damage_source_mapping_failure_count);
         json += ",\"delayedDamageNameCompletions\":" +
-            std::to_string(combat_diagnostics.delayed_damage_name_completion_count) + "}";
+            std::to_string(combat_diagnostics.delayed_damage_name_completion_count);
+        json += ",\"combatAvailable\":" +
+            std::string(combat_diagnostics.combat_available ? "true" : "false");
+        json += ",\"combatPartial\":" +
+            std::string(combat_diagnostics.combat_partial ? "true" : "false");
+        json += ",\"combatSampleSequence\":" +
+            std::to_string(combat_diagnostics.combat_sample_sequence);
+        json += ",\"worldPointer\":" +
+            std::to_string(combat_diagnostics.world_pointer);
+        json += ",\"playerPawn\":" +
+            std::to_string(combat_diagnostics.player_pawn);
+        json += ",\"combatCharacterId\":" +
+            std::to_string(combat_diagnostics.combat_character_id);
+        json += ",\"combatCharacterGeneration\":" +
+            std::to_string(combat_diagnostics.combat_character_generation);
+        json += ",\"combatRefreshFailure\":" +
+            std::to_string(combat_diagnostics.combat_refresh_failure) + "}";
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
                 ANOMALY_NTE_PLAYER_SERVICE_V1_ID,
