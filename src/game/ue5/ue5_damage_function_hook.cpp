@@ -170,6 +170,7 @@ private:
             }
         }
         if (original == nullptr) return;
+        original(delegate, damage_event, victim, attacker, damage_causer);
         if (self != nullptr) {
             try {
                 self->callback_(
@@ -180,7 +181,6 @@ private:
             } catch (...) {
             }
         }
-        original(delegate, damage_event, victim, attacker, damage_causer);
     }
 
     static void __fastcall Thunk(
