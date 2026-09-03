@@ -1,3 +1,14 @@
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <shobjidl.h>
+#include <combaseapi.h>
+#include <objbase.h>
+#include <shlwapi.h>
+#include <wrl/client.h>
+#include <filesystem>
+#include <fstream>
+using Microsoft::WRL::ComPtr;
 #include "anomaly/sdk/cpp.hpp"
 #include "anomaly/sdk/services/core.h"
 #include "anomaly/sdk/services/interop.h"
@@ -18,6 +29,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <new>
 #include <string>
 #include <string_view>
@@ -32,7 +44,7 @@ constexpr std::string_view kPoseSettingsSchemaId =
     "anomaly.builtin.character-pose.settings";
 constexpr std::uint32_t kPoseSettingsSchemaVersion = 1;
 constexpr std::size_t kMaximumPoseSettingsBytes = 1U << 20;
-constexpr std::string_view kPoseExportPath = "character-pose/pose-export.json";
+constexpr std::string_view kPoseExportPath = "pose-export.json";
 constexpr std::string_view kPoseProfileDirectory = "character-pose/profiles/";
 constexpr std::string_view kPoseSettingsSchema = R"json(
 {
@@ -149,6 +161,7 @@ struct Context final {
   const AnomalyHookServiceV1 *hook{};
   const AnomalyConfigServiceV1 *config{};
   const AnomalyStorageServiceV1 *storage{};
+  const AnomalySchedulerServiceV1 *scheduler{};
 
   std::mutex state_mutex;
   std::mutex pose_angles_mutex;
@@ -192,6 +205,9 @@ struct Context final {
   std::atomic<std::uint32_t> pose_file_action_requested{0};
   std::string active_character_id;
   bool character_profiles_initialized{};
+  std::array<char, 128> pose_export_name{};
+  std::string pose_export_folder;
+  std::string pose_import_file;
 };
 
 std::atomic<Context *> g_active{};
@@ -261,6 +277,10 @@ bool ConfigReady(const AnomalyConfigServiceV1 *service) noexcept {
 bool StorageReady(const AnomalyStorageServiceV1 *service) noexcept {
   return service != nullptr && service->read != nullptr &&
          service->write_atomic != nullptr;
+}
+
+bool SchedulerReady(const AnomalySchedulerServiceV1 *service) noexcept {
+  return service != nullptr && service->schedule != nullptr;
 }
 
 AnomalyByteSpanV1 Bytes(const std::string_view value) noexcept {
@@ -354,7 +374,7 @@ std::string BuildPoseDocument(Context &context) noexcept {
 }
 
 std::string PoseProfilePath(const std::string &character_id) noexcept {
-  return std::string(kPoseProfileDirectory) + character_id + ".json";
+  return "character-pose-profile-" + character_id + ".json";
 }
 
 bool PersistPoseSettings(Context &context) noexcept {
@@ -1919,69 +1939,251 @@ void SetReflectionStatus(Context &context, const std::string_view message) {
   context.reflection_status.assign(message.data(), message.size());
 }
 
-void ExecutePoseFileAction(Context &context) noexcept {
-  const std::uint32_t action =
-      context.pose_file_action_requested.exchange(0, std::memory_order_acquire);
-  if (action == 0 || !StorageReady(context.storage))
-    return;
-  try {
-    if (action == 1) {
-      const std::string document = BuildPoseDocument(context);
-      if (document.size() > kMaximumPoseSettingsBytes) {
-        SetReflectionStatus(context, "pose export failed: document too large");
-        return;
-      }
-      const auto status = context.storage->write_atomic(
-          context.storage->user, anomaly::sdk::StringView(kPoseExportPath),
-          Bytes(document));
-      SetReflectionStatus(context,
-                          status.code == ANOMALY_STATUS_V1_OK
-                              ? "pose exported"
-                              : "pose export failed");
-      return;
-    }
-    if (action == 2) {
-      std::size_t size{};
-      const auto probe = context.storage->read(
-          context.storage->user, anomaly::sdk::StringView(kPoseExportPath),
-          {nullptr, 0}, &size);
-      if (probe.code == ANOMALY_STATUS_V1_NOT_FOUND) {
-        SetReflectionStatus(context, "pose import failed: no export found");
-        return;
-      }
-      if (probe.code != ANOMALY_STATUS_V1_OK || size == 0 ||
-          size > kMaximumPoseSettingsBytes) {
-        SetReflectionStatus(context, "pose import failed: unreadable export");
-        return;
-      }
-      std::string document(size, '\0');
-      std::size_t copied = size;
-      if (context.storage
-              ->read(context.storage->user,
-                     anomaly::sdk::StringView(kPoseExportPath),
-                     {reinterpret_cast<std::uint8_t *>(document.data()),
-                      document.size()},
-                     &copied)
-              .code != ANOMALY_STATUS_V1_OK ||
-          copied == 0 || copied > document.size()) {
-        SetReflectionStatus(context, "pose import failed: unreadable export");
-        return;
-      }
-      const auto json =
-          nlohmann::json::parse(document.begin(), document.begin() + copied);
-      if (!ApplyPoseDocument(context, json)) {
-        SetReflectionStatus(context, "pose import failed: invalid document");
-        return;
-      }
-      context.pose_override_enabled.store(true, std::memory_order_release);
-      context.pose_settings_dirty.store(true, std::memory_order_release);
-      SetReflectionStatus(context, "pose imported");
-    }
-  } catch (...) {
-    SetReflectionStatus(context, "pose file action threw an exception");
-  }
+std::wstring Utf8ToWide(const std::string_view value) {
+  if (value.empty() ||
+      value.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+    return {};
+  const int required = MultiByteToWideChar(
+      CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+      nullptr, 0);
+  if (required <= 0)
+    return {};
+  std::wstring result(static_cast<std::size_t>(required), L'\0');
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(),
+                          static_cast<int>(value.size()), result.data(),
+                          required) != required)
+    return {};
+  return result;
 }
 
+std::string WideToUtf8(const std::wstring_view value) {
+  if (value.empty() ||
+      value.size() > static_cast<std::size_t>((std::numeric_limits<int>::max)()))
+    return {};
+  const int required = WideCharToMultiByte(
+      CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+      nullptr, 0, nullptr, nullptr);
+  if (required <= 0)
+    return {};
+  std::string result(static_cast<std::size_t>(required), '\0');
+  if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value.data(),
+                          static_cast<int>(value.size()), result.data(), required,
+                          nullptr, nullptr) != required)
+    return {};
+  return result;
+}
+
+class ComApartment final {
+public:
+  ComApartment() noexcept : result_(CoInitializeEx(nullptr, COINIT_MULTITHREADED)) {}
+  ~ComApartment() {
+    if (SUCCEEDED(result_))
+      CoUninitialize();
+  }
+  [[nodiscard]] bool Usable() const noexcept {
+    return SUCCEEDED(result_) || result_ == RPC_E_CHANGED_MODE;
+  }
+private:
+  HRESULT result_{};
+};
+
+std::optional<std::filesystem::path> ChooseFolder(
+    const std::string_view current_utf8) {
+  ComApartment apartment;
+  if (!apartment.Usable())
+    return std::nullopt;
+  ComPtr<IFileOpenDialog> dialog;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog))))
+    return std::nullopt;
+  DWORD options{};
+  if (SUCCEEDED(dialog->GetOptions(&options))) {
+    static_cast<void>(dialog->SetOptions(options | FOS_PICKFOLDERS |
+                                         FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST));
+  }
+  if (!current_utf8.empty()) {
+    const std::wstring current = Utf8ToWide(current_utf8);
+    if (!current.empty()) {
+      ComPtr<IShellItem> folder;
+      if (SUCCEEDED(SHCreateItemFromParsingName(
+              current.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        static_cast<void>(dialog->SetFolder(folder.Get()));
+    }
+  }
+  if (FAILED(dialog->Show(nullptr)))
+    return std::nullopt;
+  ComPtr<IShellItem> selected;
+  if (FAILED(dialog->GetResult(&selected)))
+    return std::nullopt;
+  PWSTR raw{};
+  if (FAILED(selected->GetDisplayName(SIGDN_FILESYSPATH, &raw)) || raw == nullptr)
+    return std::nullopt;
+  std::filesystem::path result(raw);
+  CoTaskMemFree(raw);
+  return result;
+}
+
+std::optional<std::filesystem::path> ChooseFile(
+    const std::string_view current_utf8) {
+  ComApartment apartment;
+  if (!apartment.Usable())
+    return std::nullopt;
+  ComPtr<IFileOpenDialog> dialog;
+  if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                              IID_PPV_ARGS(&dialog))))
+    return std::nullopt;
+  DWORD options{};
+  if (SUCCEEDED(dialog->GetOptions(&options))) {
+    static_cast<void>(dialog->SetOptions(options | FOS_FORCEFILESYSTEM |
+                                         FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST));
+  }
+  COMDLG_FILTERSPEC filters[] = {
+      {L"JSON", L"*.json"},
+      {L"All Files", L"*.*"},
+  };
+  static_cast<void>(dialog->SetFileTypes(ARRAYSIZE(filters), filters));
+  if (!current_utf8.empty()) {
+    const std::wstring current = Utf8ToWide(current_utf8);
+    if (!current.empty()) {
+      ComPtr<IShellItem> folder;
+      if (SUCCEEDED(SHCreateItemFromParsingName(
+              current.c_str(), nullptr, IID_PPV_ARGS(&folder))))
+        static_cast<void>(dialog->SetFolder(folder.Get()));
+    }
+  }
+  if (FAILED(dialog->Show(nullptr)))
+    return std::nullopt;
+  ComPtr<IShellItem> selected;
+  if (FAILED(dialog->GetResult(&selected)))
+    return std::nullopt;
+  PWSTR raw{};
+  if (FAILED(selected->GetDisplayName(SIGDN_FILESYSPATH, &raw)) || raw == nullptr)
+    return std::nullopt;
+  std::filesystem::path result(raw);
+  CoTaskMemFree(raw);
+  return result;
+}struct PoseFileTaskData final {
+  Context *context{};
+  std::uint32_t action{};
+  std::string document;
+  std::string path;
+};
+
+void ANOMALY_CALL PoseFileTask(void *value, AnomalyGenerationHandleV1) {
+  auto *data = static_cast<PoseFileTaskData *>(value);
+  if (data == nullptr)
+    return;
+  Context *context = data->context;
+  if (context == nullptr) {
+    delete data;
+    return;
+  }
+  try {
+    if (data->action == 1) {
+      std::ofstream file(Utf8ToWide(data->path), std::ios::binary);
+      if (!file) {
+        SetReflectionStatus(*context, "pose export failed: cannot open file");
+        delete data;
+        return;
+      }
+      file.write(data->document.data(), static_cast<std::streamsize>(data->document.size()));
+      file.close();
+      if (!file) {
+        SetReflectionStatus(*context, "pose export failed: write error");
+      } else {
+        SetReflectionStatus(*context, "pose exported");
+      }
+    } else if (data->action == 2) {
+      std::ifstream file(Utf8ToWide(data->path), std::ios::binary);
+      if (!file) {
+        SetReflectionStatus(*context, "pose import failed: cannot open file");
+        delete data;
+        return;
+      }
+      std::string document((std::istreambuf_iterator<char>(file)),
+                           std::istreambuf_iterator<char>());
+      if (file.bad() || document.empty() || document.size() > kMaximumPoseSettingsBytes) {
+        SetReflectionStatus(*context, "pose import failed: unreadable file");
+      } else {
+        const auto json = nlohmann::json::parse(document);
+        if (!ApplyPoseDocument(*context, json)) {
+          SetReflectionStatus(*context, "pose import failed: invalid document");
+        } else {
+          context->pose_override_enabled.store(true, std::memory_order_release);
+          context->pose_settings_dirty.store(true, std::memory_order_release);
+          SetReflectionStatus(*context, "pose imported");
+        }
+      }
+    }
+  } catch (...) {
+    SetReflectionStatus(*context, "pose file action threw an exception");
+  }
+  delete data;
+}void ExecutePoseFileAction(Context &context) noexcept {
+  const std::uint32_t action =
+      context.pose_file_action_requested.exchange(0, std::memory_order_acquire);
+  if (action == 0)
+    return;
+  if (!SchedulerReady(context.scheduler)) {
+    SetReflectionStatus(context, "pose file action failed: scheduler unavailable");
+    return;
+  }
+  auto *data = new (std::nothrow) PoseFileTaskData();
+  if (data == nullptr) {
+    SetReflectionStatus(context, "pose file action failed: out of memory");
+    return;
+  }
+  data->context = &context;
+  data->action = action;
+  if (action == 1) {
+    std::string name(context.pose_export_name.data());
+    if (name.empty())
+      name = "pose.json";
+    if (name.size() < 5 || name.substr(name.size() - 5) != ".json")
+      name += ".json";
+    const std::wstring folder = Utf8ToWide(context.pose_export_folder);
+    if (folder.empty()) {
+      delete data;
+      SetReflectionStatus(context, "pose export failed: no folder selected");
+      return;
+    }
+    std::wstring path = folder;
+    if (path.back() != L'\\' && path.back() != L'/')
+      path.push_back(L'\\');
+    path += Utf8ToWide(name);
+    data->path = WideToUtf8(path);
+    if (data->path.empty()) {
+      delete data;
+      SetReflectionStatus(context, "pose export failed: invalid path");
+      return;
+    }
+    data->document = BuildPoseDocument(context);
+    if (data->document.size() > kMaximumPoseSettingsBytes) {
+      delete data;
+      SetReflectionStatus(context, "pose export failed: document too large");
+      return;
+    }
+  } else if (action == 2) {
+    if (context.pose_import_file.empty()) {
+      delete data;
+      SetReflectionStatus(context, "pose import failed: no file selected");
+      return;
+    }
+    data->path = context.pose_import_file;
+  }
+  AnomalyGenerationHandleV1 task{};
+  const AnomalyStatusV1 status = context.scheduler->schedule(
+      context.scheduler->user, 0, PoseFileTask, data, &task);
+  if (status.code != ANOMALY_STATUS_V1_OK || task.id == 0) {
+    delete data;
+    SetReflectionStatus(context,
+                        "pose file action failed: schedule code=" +
+                            std::to_string(status.code));
+    return;
+  }
+  SetReflectionStatus(context, action == 1 ? "pose export queued"
+                                           : "pose import queued");
+}
 void EnsureActiveCharacterProfile(Context &context) noexcept {
   if (context.runtime.mesh == 0 || !StorageReady(context.storage))
     return;
@@ -2297,6 +2499,11 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1 *host,
   context->storage =
       Query<AnomalyStorageServiceV1>(host, ANOMALY_STORAGE_SERVICE_V1_ID,
                                      ANOMALY_STORAGE_SERVICE_V1_VERSION);
+  context->scheduler =
+      Query<AnomalySchedulerServiceV1>(host, ANOMALY_SCHEDULER_SERVICE_V1_ID,
+                                       ANOMALY_SCHEDULER_SERVICE_V1_VERSION);
+  if (!SchedulerReady(context->scheduler))
+    context->scheduler = nullptr;
   if (!CoreReady(context->core) || !SignatureReady(context->signature) ||
       !NamesReady(context->names) ||
       !ObjectsReady(context->objects) ||
@@ -2734,16 +2941,51 @@ void ANOMALY_CALL Draw(void *plugin_context, const AnomalyUiServiceV1 *ui) {
   if (ui->button(ui->user, anomaly::sdk::StringView(load_bones_label), 80.0F,
                  0.0F) != 0)
     context->reflection_action_requested.store(6, std::memory_order_release);
+  if (context->pose_export_name[0] == '\0') {
+    std::snprintf(context->pose_export_name.data(), context->pose_export_name.size(),
+                "pose.json");
+  }
+  ui->text(ui->user, anomaly::sdk::StringView(context->localizer.Text("pose.file.name", "File name")));
+  ui->same_line(ui->user, 0.0F, 6.0F);
+  ui->input_text(ui->user, anomaly::sdk::StringView("##pose-export-name"),
+                 context->pose_export_name.data(),
+                 context->pose_export_name.size(), 0);
+  ui->same_line(ui->user, 0.0F, 6.0F);
+  const std::string choose_folder_label =
+      context->localizer.Text("pose.choose.folder", "Choose folder");
+  if (ui->button(ui->user, anomaly::sdk::StringView(choose_folder_label), 90.0F,
+                 0.0F) != 0) {
+    const auto selected = ChooseFolder(context->pose_export_folder);
+    if (selected) {
+      const std::string folder_utf8 = WideToUtf8(selected->native());
+      if (!folder_utf8.empty())
+        context->pose_export_folder = folder_utf8;
+    }
+  }
   ui->same_line(ui->user, 0.0F, 6.0F);
   const std::string export_label =
-      context->localizer.Text("pose.export", "Export Pose");
-  if (ui->button(ui->user, anomaly::sdk::StringView(export_label), 80.0F,
+      context->localizer.Text("pose.export", "Export");
+  if (ui->button(ui->user, anomaly::sdk::StringView(export_label), 60.0F,
                  0.0F) != 0)
     context->pose_file_action_requested.store(1, std::memory_order_release);
+
+  ui->text(ui->user, anomaly::sdk::StringView(context->localizer.Text("pose.import.file", "Import file")));
+  ui->same_line(ui->user, 0.0F, 6.0F);
+  const std::string choose_file_label =
+      context->localizer.Text("pose.choose.file", "Choose file");
+  if (ui->button(ui->user, anomaly::sdk::StringView(choose_file_label), 90.0F,
+                 0.0F) != 0) {
+    const auto selected = ChooseFile(context->pose_import_file);
+    if (selected) {
+      const std::string file_utf8 = WideToUtf8(selected->native());
+      if (!file_utf8.empty())
+        context->pose_import_file = file_utf8;
+    }
+  }
   ui->same_line(ui->user, 0.0F, 6.0F);
   const std::string import_label =
-      context->localizer.Text("pose.import", "Import Pose");
-  if (ui->button(ui->user, anomaly::sdk::StringView(import_label), 80.0F,
+      context->localizer.Text("pose.import", "Import");
+  if (ui->button(ui->user, anomaly::sdk::StringView(import_label), 60.0F,
                  0.0F) != 0)
     context->pose_file_action_requested.store(2, std::memory_order_release);
 
