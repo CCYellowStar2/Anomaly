@@ -6166,6 +6166,20 @@ private:
                     message = std::move(success_message);
                     retryable = false;
                 };
+                const auto backend_rejection_message = [&]() -> std::string {
+                    if (found == after.end()) {
+                        return "plugin was not present after backend operation";
+                    }
+                    std::string detail = "backend rejected operation";
+                    detail += " (state=";
+                    detail += anomaly::ToString(state);
+                    detail += ")";
+                    if (!found->status_reason.empty()) {
+                        detail += ": ";
+                        detail += found->status_reason;
+                    }
+                    return detail;
+                };
 
                 if (!succeeded) {
                     mark_failure_or_skip(
@@ -6173,8 +6187,7 @@ private:
                             ? (found == after.end() ? anomaly::PluginOperationReason::NotFound
                                                     : anomaly::PluginOperationReason::BackendFailure)
                             : state_reason,
-                        found == after.end() ? "plugin was not present after backend operation"
-                                             : "backend rejected operation",
+                        backend_rejection_message(),
                         true);
                 } else {
                     switch (result.mutation) {

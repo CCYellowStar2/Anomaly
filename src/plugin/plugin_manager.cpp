@@ -1255,6 +1255,29 @@ anomaly::LogLevel StructuredLevel(AnomalyCoreLogLevelV1 level) noexcept {
     }
 }
 
+std::string StatusMessage(std::string_view stage, const AnomalyStatusV1& status) {
+    std::string detail = std::string(stage) + " failed: code=" + std::to_string(status.code);
+    const char* code_name = "unknown";
+    switch (status.code) {
+    case ANOMALY_STATUS_V1_OK: code_name = "ok"; break;
+    case ANOMALY_STATUS_V1_INVALID_ARGUMENT: code_name = "invalid-argument"; break;
+    case ANOMALY_STATUS_V1_UNAVAILABLE: code_name = "unavailable"; break;
+    case ANOMALY_STATUS_V1_NOT_FOUND: code_name = "not-found"; break;
+    case ANOMALY_STATUS_V1_BUFFER_TOO_SMALL: code_name = "buffer-too-small"; break;
+    case ANOMALY_STATUS_V1_FAILED: code_name = "failed"; break;
+    case ANOMALY_STATUS_V1_TIMEOUT: code_name = "timeout"; break;
+    case ANOMALY_STATUS_V1_PERMISSION_DENIED: code_name = "permission-denied"; break;
+    case ANOMALY_STATUS_V1_CONFLICT: code_name = "conflict"; break;
+    case ANOMALY_STATUS_V1_CANCELLED: code_name = "cancelled"; break;
+    default: break;
+    }
+    detail += " (" + std::string(code_name) + ")";
+    if (status.message.data != nullptr && status.message.size != 0) {
+        detail += ", message=" + std::string(status.message.data, status.message.size);
+    }
+    return detail;
+}
+
 void HostLog(AnomalyCoreLogLevelV1 level, const char* message) {
     auto callback = AcquireCurrentCallbackLease();
     if (g_callback_scope.Get() != nullptr && !callback) return;
@@ -4307,6 +4330,9 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
     if (load_status.code != ANOMALY_STATUS_V1_OK) {
         plugin.plugin_context = nullptr;
         plugin.waiting_for_service = false;
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+            "ABI v1 plugin rejected activation: plugin=" + plugin.view.id +
+                " " + StatusMessage("on_load", load_status));
         return false;
     }
     if (plugin.descriptor_v1.on_start != nullptr) {
@@ -4316,7 +4342,10 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
             ScopedPluginCallback callback_scope(plugin.scope, plugin.view.generation, false);
             RunPluginLoadStep([&] {
                 try { start_status = plugin.descriptor_v1.on_start(plugin.plugin_context); }
-                catch (...) {}
+                catch (...) {
+                    Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+                        "exception while starting ABI v1 plugin " + plugin.view.id);
+                }
             });
         }
         if (start_status.code != ANOMALY_STATUS_V1_OK) {
@@ -4336,6 +4365,9 @@ bool PluginManager::Activate(LoadedPlugin& plugin) {
                 return true;
             }
             plugin.waiting_for_service = false;
+            Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+                "ABI v1 plugin rejected activation: plugin=" + plugin.view.id +
+                    " " + StatusMessage("on_start", start_status));
             return false;
         }
     }
@@ -4441,7 +4473,12 @@ bool PluginManager::LoadBinary(
             descriptor.version.data != nullptr && descriptor.version.size != 0 &&
             descriptor.on_load != nullptr && descriptor.on_unload != nullptr;
         if (!valid) {
-            Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "invalid ABI v1 plugin metadata: " + source.string());
+            Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+                "invalid ABI v1 plugin metadata: " + source.string() +
+                    " entry_code=" + std::to_string(entry_status.code) +
+                    " struct_size=" + std::to_string(descriptor.struct_size) +
+                    " api=" + std::to_string(descriptor.api_major) + "." +
+                    std::to_string(descriptor.api_minor));
             unload_module();
             discard_shadow();
             return false;
@@ -4621,13 +4658,12 @@ bool PluginManager::SetEnabled(std::string_view plugin_id, bool enabled) {
             catalog, plugin_id, enabled, &error);
     });
     if (!updated) {
-        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "enablement update failed: " + error);
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+            "plugin enablement update failed: id=" + std::string(plugin_id) +
+                " enabled=" + (enabled ? "true" : "false") + " " + error);
         return false;
     }
     const bool reconciled = ReconcileEnablement(catalog);
-    Log(reconciled ? ANOMALY_CORE_LOG_LEVEL_V1_INFO : ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
-        "plugin enablement applied without restarting unrelated plugins: " +
-            std::string(plugin_id));
     const auto views = Plugins();
     const auto found = std::find_if(views.begin(), views.end(), [&](const auto& plugin) {
         return plugin.id == plugin_id;
@@ -4635,7 +4671,27 @@ bool PluginManager::SetEnabled(std::string_view plugin_id, bool enabled) {
     const bool target_quarantined = std::any_of(
         quarantined_plugins_.begin(), quarantined_plugins_.end(),
         [&](const auto& plugin) { return plugin->view.id == plugin_id; });
-    return !target_quarantined && found != views.end() && found->enabled == enabled;
+    const bool succeeded = !target_quarantined && found != views.end() && found->enabled == enabled;
+    if (succeeded) {
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_INFO,
+            "plugin enablement applied: id=" + std::string(plugin_id) +
+                " enabled=" + (enabled ? "true" : "false"));
+    } else {
+        std::string reason = "reconciliation=" + std::string(reconciled ? "succeeded" : "failed");
+        if (target_quarantined) {
+            reason += ", state=quarantined";
+        } else if (found == views.end()) {
+            reason += ", reason=plugin-not-present-after-reconciliation";
+        } else {
+            reason += ", state=" + found->state +
+                " enabled=" + (found->enabled ? "true" : "false");
+            if (!found->status_reason.empty()) reason += " reason=" + found->status_reason;
+        }
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR,
+            "plugin enablement rejected: id=" + std::string(plugin_id) +
+                " enabled=" + (enabled ? "true" : "false") + " " + reason);
+    }
+    return succeeded;
 }
 
 bool PluginManager::ReconcileEnablement(
