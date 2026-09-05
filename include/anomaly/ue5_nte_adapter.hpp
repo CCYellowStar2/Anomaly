@@ -57,6 +57,9 @@ struct NteCombatDiagnosticsSnapshot {
     std::uint64_t combat_character_id{};
     std::uint64_t combat_character_generation{};
     std::uint32_t combat_refresh_failure{};
+    std::uint64_t reflection_fault_count{};
+    std::uintptr_t last_reflection_fault_function{};
+    std::uint32_t last_reflection_fault_code{};
 };
 
 inline constexpr std::size_t kNteCombatExecFunctionCapacity = 14;

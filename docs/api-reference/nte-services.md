@@ -410,7 +410,11 @@ typedef struct AnomalyNteDamageEventV1 {
 
 `current_combatant` 返回当前玩家角色的 HP、最大 HP、护盾、死亡状态和攻击目标。`DEAD` 是 combatant 专用低位标志；`VALID / STALE / PARTIAL` 继续使用公共快照高位。目标对象解析失败时目标 handle 为零且快照标记 `PARTIAL`，不会暴露 UObject 地址。
 
-伤害采集只 Hook `AHTAbilityCharacter::CharacterOnDamaged` 的精确原生广播模板，不经过飘字函数、全局 `ProcessEvent` 或 Actor vtable。广播实参直接提供 `FHTDamageEvent`、受击角色、伤害发起角色和 causer；`final_damage` 是 `FHTDamageEvent::Damage` 的整数舍入值，事件带 `ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT`。`source_id` 来自同一事件的 `DamageGEDef` 弱对象并解析为精确 Gameplay Effect 对象路径；该路径没有客户端展示值、暴击或命中位置语义，因此对应字段保持 0 且不设置相关 flags。
+伤害采集使用 `AHTAbilityCharacter::CharacterOnDamaged` 的精确原生广播模板。广播实参直接提供 `FHTDamageEvent`、受击角色、伤害发起角色和 causer；`final_damage` 是 `FHTDamageEvent::Damage` 的整数舍入值，事件带 `ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT`。`source_id` 来自同一事件的 `DamageGEDef` 弱对象。客户端展示值和命中位置仍只在相应数据源可用时提供。
+
+暴击状态恢复为原生伤害回调内同步查询：通过已验证的 `K2_GetAbilitySystemComponent` 和 `CurrentDamageIsCrit` 反射绑定，先检查受击者，再检查攻击者，任一返回暴击即标记该次伤害。查询在保留队列槽位之前完成，结果随伤害数据复制入队。所有非空参与者均查询成功且返回 false 时，才标记确认非暴击；查询失败时保留未知状态，已复制的伤害标签仍可作为肯定暴击的备用来源。该路径不执行 FText 名称转换。
+
+`ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID` 和 `ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID` 表示暴击状态已知。只有该位存在时，未设置 `CRITICAL` 才表示确认非暴击；缺少有效位时不得把它计作确认非暴击。新增标志不改变服务表或事件结构布局。
 
 ```c
 typedef enum AnomalyNteCombatDirectionV1 {
@@ -450,8 +454,18 @@ typedef struct AnomalyNteCombatServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *statistics)(void*, const AnomalyNteCombatStatisticsRequestV1*, AnomalyNteCombatStatisticsV1*);
     AnomalyStatusV1 (ANOMALY_CALL *source_name_utf8)(void*, uint64_t, char*, size_t*);
     AnomalyStatusV1 (ANOMALY_CALL *participant_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
+    uint64_t (ANOMALY_CALL *latest_event_sequence)(void*);
+    AnomalyStatusV1 (ANOMALY_CALL *next_event)(void*, uint64_t, AnomalyNteCombatEventV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *event_name_utf8)(void*, const AnomalyNteCombatEventV1*, char*, size_t*);
+    AnomalyStatusV1 (ANOMALY_CALL *participant_display_name_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
 } AnomalyNteCombatServiceV1;
 ```
+
+`latest_event_sequence` / `next_event` 提供包含伤害、治疗和 Buff 的战斗事件流。`event_name_utf8` 返回事件的显示名称，`participant_display_name_utf8` 返回参与者的显示名称，与 `source_name_utf8` / `participant_path_utf8` 的来源标识和对象路径不同。显示名称在 Game 更新中延后补全；合法请求尚无缓存名称时返回 `NOT_FOUND`。名称缺失不影响伤害事件和数值，消费端应保留记录并显示路径、编号或占位符，随后在 Game 更新中适度重试名称查询。访问追加到 v1 服务表尾部的接口前，应检查 `struct_size` 是否覆盖对应字段。
+
+怪物名称优先匹配具体场景条目和专属文本键，失败后再尝试基础名称。文本键兼容 `_BP` / 场景后缀、编号补零及 `_Name` / `_name` 差异，同时保留变体编号和专属名称的优先级；多个场景条目给出不同基础名称时，不采用该场景基础名称回退。数据表名称字段必须通过 `TextProperty` 类型、大小和偏移校验，图标表不作为名称来源。
+
+FText 解码遵循 [UE5 名称服务](ue5-services.md) 的可选 `ue5.ftext` 校验与只读规则，读取已有显示缓存或已加载文本表的源文字，不调用 `Conv_TextToString`。完整名称查找仍保留角色 ID、怪物静态数据及文本表引用的已验证反射查询，因此不能把整个名称查找流程视为纯内存读取。
 
 消费端应在 Game 域 `on_update` 中查询 combat 服务：先比较 `latest_damage_sequence`，只在序列变化时有界调用 `next_damage_event`，并在接纳新事件时各解析一次 source、attacker 和 victim。HP、统计和解析结果应立即转换为插件自有、可直接绘制的不可变快照。Render 域 `on_draw` 只复制该本地快照并调用 UI 服务，不查询 combat 服务、不推进 cursor，也不解析名称。完整消费边界见 [`examples/nte_combat_demo`](../../examples/nte_combat_demo/plugin.cpp)。
 
@@ -496,7 +510,7 @@ typedef struct AnomalyNteSkillPageResultV1 {
 
 `frame` 固定当前不可变技能帧，`snapshot_at` 和 `page` 只访问 Host cache。分页首请求可使用 generation 0，后续请求必须回传结果 generation；技能重排保持同一组 spec identity 的 handle，技能移除、重新授予、角色 / World 切换或 spec identity 改变会产生新 generation，使旧 handle 返回 `NOT_FOUND`。
 
-skill handle 是宿主生成的 opaque identity，不等于 `FGameplayAbilitySpecHandle`。`ability_class` 同样是 generation handle，只能传给 `ability_path_utf8`，不能解释为 UE 地址。v1 已发布 level、input、active / input-pressed / remove 状态；冷却标签形状尚未独立验证，因此当前技能带 `PARTIAL` 且不带 `COOLDOWN_VALID`，两个冷却浮点字段为 0。
+skill handle 是宿主生成的 opaque identity，不等于 `FGameplayAbilitySpecHandle`。`ability_class` 同样是 generation handle，可传给 `ability_path_utf8` 和 `ability_display_name_utf8`，不能解释为 UE 地址。v1 已发布 level、input、active / input-pressed / remove 状态；冷却标签形状尚未独立验证，因此当前技能带 `PARTIAL` 且不带 `COOLDOWN_VALID`，两个冷却浮点字段为 0。
 
 ```c
 typedef struct AnomalyNteSkillsServiceV1 {
@@ -506,8 +520,11 @@ typedef struct AnomalyNteSkillsServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *page)(void*, const AnomalyNteSkillPageRequestV1*, AnomalyNteSkillSnapshotV1*, AnomalyNteSkillPageResultV1*);
     AnomalyStatusV1 (ANOMALY_CALL *ability_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
     AnomalyStatusV1 (ANOMALY_CALL *snapshot_by_handle)(void*, AnomalyGenerationHandleV1, AnomalyNteSkillSnapshotV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *ability_display_name_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
 } AnomalyNteSkillsServiceV1;
 ```
+
+`ability_display_name_utf8` 返回当前技能类的缓存显示名称，尚未解析时返回 `NOT_FOUND`。名称不可用不表示技能无效；消费端可先显示路径短名或技能编号，并依据当前技能快照及激活服务状态决定是否提供激活操作。该接口同样需要检查服务表的 `struct_size`。
 
 ---
 

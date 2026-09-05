@@ -258,6 +258,8 @@ std::string BuildSnapshot() {
     AppendUnsigned(output, ANOMALY_NTE_DAMAGE_V1_WEAK_UNBALANCE);
     output.append(",\n    \"ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT\": ");
     AppendUnsigned(output, ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT);
+    output.append(",\n    \"ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID\": ");
+    AppendUnsigned(output, ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL\": ");
     AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT\": ");
@@ -268,6 +270,8 @@ std::string BuildSnapshot() {
     AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID\": ");
     AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID);
+    output.append(",\n    \"ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID\": ");
+    AppendUnsigned(output, ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL\": ");
     AppendUnsigned(output, ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL);
     output.append(",\n    \"ANOMALY_NTE_COMBAT_STATISTICS_V1_OVERFLOW\": ");

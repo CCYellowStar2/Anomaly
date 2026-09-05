@@ -296,6 +296,20 @@ void ValidateReflectionFeatureContracts(
     BuildProfileParseResult& result,
     const std::filesystem::path& source) {
     ValidateReflectionFeatureContract(
+        profile, "ue5.ftext",
+        {"ue5.FTextData.GetDisplayString", "ue5.FTextDataStringTableEntry.GetSharedDisplayString",
+         "ue5.StringTableRegistry"}, {"ue5.names"}, "ue5-ftext-layout-v1",
+        {"ftext.textData", "ftextData.textSource", "ftextData.displayStringGetter",
+         "ftextData.sharedDisplayStringGetter", "ftextData.sharedDisplayString",
+         "ftextData.stringTableReference", "ftextStringTableReference.tableId",
+         "ftextStringTableReference.keyId", "ftextStringTableReference.cachedDisplayString",
+         "sharedString.value", "stringTable.entries", "stringTableEntry.sourceString",
+         "stringTable.mapElementStride", "stringTable.mapValue", "fstring.data",
+         "fstring.count", "fstring.capacity", "dataTable.rowMapData", "dataTable.rowMapNum",
+         "dataTable.rowMapMax", "dataTable.rowMapNumFree", "dataTable.rowMapInlineFlags",
+         "dataTable.rowMapFlagsData", "dataTable.rowMapFlagsNum", "dataTable.rowMapFlagsMax"},
+        result, source);
+    ValidateReflectionFeatureContract(
         profile, "ue5.process-event", {"ue5.ProcessEvent"}, {},
         "ue5-process-event-abi-v1", {}, result, source);
     ValidateReflectionFeatureContract(

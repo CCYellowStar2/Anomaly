@@ -203,7 +203,6 @@ FeatureValidationResult ValidateCombatReflectionLayout(
         "fstring.capacity", "abilityCharacter.abilitySystemComponent",
         "gameData.abilityDataAsset",
         "abilityData.skillDamageDataTable", "skillDamage.gaName",
-        "gameData.monsterInfoDataTable",
         "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
         "gameData.gameplayEffectTipsDataTable", "gameplayAbilityTips.name",
         "gameplayAbilityTips.gameplayAbility", "gameplayEffectTips.name",
@@ -260,7 +259,6 @@ FeatureValidationResult ValidateCombatReflectionLayout(
     if (!field_fits("gameData.abilityDataAsset", 0x23C0U, 8U) ||
         !field_fits("abilityData.skillDamageDataTable", 0xD58U, 8U) ||
         !field_fits("skillDamage.gaName", 0x78U, 8U) ||
-        !field_fits("gameData.monsterInfoDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.characterDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.gameplayAbilityTipsDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.gameplayEffectTipsDataTable", 0x23C0U, 8U) ||
@@ -1710,6 +1708,7 @@ public:
             std::to_string(combat_diagnostics.buff_call_count);
         json += ",\"critQueryCalls\":" +
             std::to_string(combat_diagnostics.crit_query_call_count);
+        json += ",\"critQueryMode\":\"synchronous-reflection\"";
         json += ",\"critQuerySuccesses\":" +
             std::to_string(combat_diagnostics.crit_query_success_count);
         json += ",\"critTrueCount\":" +
@@ -1749,7 +1748,13 @@ public:
         json += ",\"combatCharacterGeneration\":" +
             std::to_string(combat_diagnostics.combat_character_generation);
         json += ",\"combatRefreshFailure\":" +
-            std::to_string(combat_diagnostics.combat_refresh_failure) + "}";
+            std::to_string(combat_diagnostics.combat_refresh_failure);
+        json += ",\"reflectionFaults\":" +
+            std::to_string(combat_diagnostics.reflection_fault_count);
+        json += ",\"lastReflectionFaultFunction\":" +
+            std::to_string(combat_diagnostics.last_reflection_fault_function);
+        json += ",\"lastReflectionFaultCode\":" +
+            std::to_string(combat_diagnostics.last_reflection_fault_code) + "}";
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
                 ANOMALY_NTE_PLAYER_SERVICE_V1_ID,

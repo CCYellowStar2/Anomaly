@@ -29,7 +29,7 @@ struct CombatRow {
 struct SkillRow {
     std::array<char, 256> name{};
     std::array<char, 384> summary{};
-    std::array<char, 128> activation_label{};
+    std::array<char, 320> activation_label{};
     AnomalyGenerationHandleV1 ability_class{};
     AnomalyNteSkillInvocationRequestV1 activation{sizeof(activation)};
     std::uint64_t skill_id{};
@@ -282,16 +282,16 @@ bool FormatCompactCombatRow(
     bool& names_complete) {
     names_complete = false;
     const std::string name = ResolveCombatEventName(service, event);
-    const bool heal_without_name =
-        event.kind == ANOMALY_NTE_COMBAT_EVENT_V1_HEAL && name.empty();
-    if (name.empty() && !heal_without_name) return false;
+    const char* display_name = name.empty() ? "-" : name.c_str();
     std::string source;
     std::string target;
     bool source_resolved{};
     bool target_resolved{};
     ResolveCombatParticipantState(service, event.source, source, source_resolved);
     ResolveCombatParticipantState(service, event.target, target, target_resolved);
-    names_complete = source_resolved && target_resolved;
+    // Display numeric events immediately; localized names are optional enrichment.
+    names_complete = (event.name_id == 0 || !name.empty()) &&
+        source_resolved && target_resolved;
     row.sequence = event.sequence;
     if (event.kind == ANOMALY_NTE_COMBAT_EVENT_V1_DAMAGE) {
         std::snprintf(row.summary.data(), row.summary.size(),
@@ -300,7 +300,7 @@ bool FormatCompactCombatRow(
             static_cast<long long>(event.final_value),
             (event.flags & ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL) != 0
                 ? " \xE6\x9A\xB4\xE5\x87\xbb" : "",
-            name.c_str(),
+            display_name,
             source.empty() ? "-" : source.c_str(), target.empty() ? "-" : target.c_str());
     } else if (event.kind == ANOMALY_NTE_COMBAT_EVENT_V1_HEAL) {
         const char* skill = name.empty() ? "\xE6\xB2\xBB\xE7\x96\x97" : name.c_str();
@@ -316,7 +316,7 @@ bool FormatCompactCombatRow(
         std::snprintf(row.summary.data(), row.summary.size(),
             "#%llu %s %s \xE6\x8C\x81\xE7\xBB\xad=%.2f \xE5\xB1\x82\xE6\x95\xB0=%d  %s -> %s",
             static_cast<unsigned long long>(event.sequence), kind,
-            name.c_str(),
+            display_name,
             event.duration_seconds, event.stack_count,
             source.empty() ? "-" : source.c_str(), target.empty() ? "-" : target.c_str());
     }
@@ -469,6 +469,27 @@ std::string ResolveAbilityDisplayName(
     return value;
 }
 
+std::string ResolveAbilityFallbackName(
+    const AnomalyNteSkillsServiceV1* service,
+    const AnomalyNteSkillSnapshotV1& skill) {
+    std::size_t size{};
+    if (IsSizingStatus(service->ability_path_utf8(
+            service->user, skill.ability_class, nullptr, &size)) &&
+        size > 1 && size <= kMaximumResolvedNameBytes) {
+        std::string path(size, '\0');
+        if (service->ability_path_utf8(
+                service->user, skill.ability_class, path.data(), &size).code ==
+            ANOMALY_STATUS_V1_OK) {
+            if (const auto end = path.find('\0'); end != std::string::npos) path.resize(end);
+            if (const auto separator = path.find_last_of("/."); separator != std::string::npos) {
+                path.erase(0, separator + 1);
+            }
+            if (!path.empty()) return path;
+        }
+    }
+    return "Skill #" + std::to_string(skill.handle.id);
+}
+
 bool ReadStatistics(
     const AnomalyNteCombatServiceV1* combat,
     const AnomalyNteCombatantSnapshotV1& combatant,
@@ -580,8 +601,7 @@ void UpdateSkillActivation(
     if (combatant != nullptr) row.activation.world = combatant->world;
     row.skill_current =
         (skill.flags & ANOMALY_NTE_SKILL_V1_VALID) != 0;
-    row.can_activate = combatant != nullptr && row.skill_current && row.name[0] != '\0';
-    if (row.name[0] == '\0') return;
+    row.can_activate = combatant != nullptr && row.skill_current;
     std::snprintf(
         row.activation_label.data(), row.activation_label.size(),
         "\xE6\xBF\x80\xE6\xB4\xBB %s##skill-%llu",
@@ -622,7 +642,9 @@ void UpdateSkills(
     const bool all_names_resolved = std::all_of(
         snapshot.skill_rows.begin(),
         snapshot.skill_rows.begin() + snapshot.skill_row_count,
-        [](const SkillRow& row) { return row.name[0] != '\0'; });
+        [](const SkillRow& row) {
+            return g_context.skill_name_cache.contains(SkillNameKey(row.ability_class));
+        });
     if (snapshot.skill_generation == frame.generation &&
         snapshot.skill_sequence == frame.sequence &&
         snapshot.skill_offset == offset && all_names_resolved) {
@@ -631,8 +653,7 @@ void UpdateSkills(
             row.activation.world = combatant != nullptr
                 ? combatant->world
                 : AnomalyGenerationHandleV1{};
-            row.can_activate = combatant != nullptr && row.skill_current &&
-                row.name[0] != '\0';
+            row.can_activate = combatant != nullptr && row.skill_current;
         }
         return;
     }
@@ -689,18 +710,20 @@ void UpdateSkills(
         }
         if (!name.empty()) {
             std::snprintf(row.name.data(), row.name.size(), "%s", name.c_str());
-        } else if (previous != nullptr && previous->name[0] != '\0') {
+        } else if (previous != nullptr && previous->skill_id == skill.handle.id) {
             row.name = previous->name;
+        } else {
+            const auto fallback = ResolveAbilityFallbackName(skills, skill);
+            std::snprintf(row.name.data(), row.name.size(), "%s", fallback.c_str());
         }
-        if (row.name[0] != '\0' &&
-            (skill.flags & ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID) != 0) {
+        if ((skill.flags & ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID) != 0) {
             std::snprintf(
                 row.summary.data(), row.summary.size(),
                 "%s  level=%d input=%d cooldown=%.2f/%.2f%s",
                 row.name.data(), skill.level, skill.input_id,
                 skill.cooldown_remaining_seconds, skill.cooldown_duration_seconds,
                 (skill.flags & ANOMALY_NTE_SKILL_V1_ACTIVE) != 0 ? " ACTIVE" : "");
-        } else if (row.name[0] != '\0') {
+        } else {
             std::snprintf(
                 row.summary.data(), row.summary.size(),
                 "%s  level=%d input=%d cooldown=unavailable%s",
@@ -928,7 +951,6 @@ void ANOMALY_CALL Draw(void*, const AnomalyUiServiceV1* ui) {
     }
     for (std::size_t index{}; index < snapshot.skill_row_count; ++index) {
         const SkillRow& row = snapshot.skill_rows[index];
-        if (row.name[0] == '\0') continue;
         ui->text(ui->user, anomaly::sdk::StringView(row.summary.data()));
         if (DrawActionButton(
                 ui, row.activation_label.data(),
@@ -953,7 +975,7 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
         anomaly::sdk::StringView("anomaly.example.nte-combat-demo"),
         anomaly::sdk::StringView("NTE Combat Demo"),
-        anomaly::sdk::StringView("Anomaly"), anomaly::sdk::StringView("1.1.0"),
+        anomaly::sdk::StringView("Anomaly"), anomaly::sdk::StringView("1.1.2"),
         Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
