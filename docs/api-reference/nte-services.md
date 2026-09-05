@@ -410,7 +410,11 @@ typedef struct AnomalyNteDamageEventV1 {
 
 `current_combatant` 返回当前玩家角色的 HP、最大 HP、护盾、死亡状态和攻击目标。`DEAD` 是 combatant 专用低位标志；`VALID / STALE / PARTIAL` 继续使用公共快照高位。目标对象解析失败时目标 handle 为零且快照标记 `PARTIAL`，不会暴露 UObject 地址。
 
-伤害采集只 Hook `AHTAbilityCharacter::CharacterOnDamaged` 的精确原生广播模板，不经过飘字函数、全局 `ProcessEvent` 或 Actor vtable。广播实参直接提供 `FHTDamageEvent`、受击角色、伤害发起角色和 causer；`final_damage` 是 `FHTDamageEvent::Damage` 的整数舍入值，事件带 `ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT`。`source_id` 来自同一事件的 `DamageGEDef` 弱对象并解析为精确 Gameplay Effect 对象路径；该路径没有客户端展示值、暴击或命中位置语义，因此对应字段保持 0 且不设置相关 flags。
+伤害采集使用 `AHTAbilityCharacter::CharacterOnDamaged` 的精确原生广播模板。广播实参直接提供 `FHTDamageEvent`、受击角色、伤害发起角色和 causer；`final_damage` 是 `FHTDamageEvent::Damage` 的整数舍入值，事件带 `ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT`。`source_id` 来自同一事件的 `DamageGEDef` 弱对象。客户端展示值和命中位置仍只在相应数据源可用时提供。
+
+暴击状态恢复为原生伤害回调内同步查询：通过已验证的 `K2_GetAbilitySystemComponent` 和 `CurrentDamageIsCrit` 反射绑定，先检查受击者，再检查攻击者，任一返回暴击即标记该次伤害。查询在保留队列槽位之前完成，结果随伤害数据复制入队。所有非空参与者均查询成功且返回 false 时，才标记确认非暴击；查询失败时保留未知状态，已复制的伤害标签仍可作为肯定暴击的备用来源。该路径不执行 FText 名称转换。
+
+`ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID` 和 `ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID` 表示暴击状态已知。只有该位存在时，未设置 `CRITICAL` 才表示确认非暴击；缺少有效位时不得把它计作确认非暴击。新增标志不改变服务表或事件结构布局。
 
 ```c
 typedef enum AnomalyNteCombatDirectionV1 {

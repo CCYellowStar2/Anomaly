@@ -1,4 +1,5 @@
 #include "anomaly/ue5_nte_adapter.hpp"
+#include "anomaly/nte_damage_capture.hpp"
 #include "anomaly/thread_local_value.hpp"
 
 #include <algorithm>
@@ -357,7 +358,8 @@ bool AddAddress(std::uintptr_t base, std::int64_t offset, std::uintptr_t& result
     const std::uintptr_t receiver,
     const std::uintptr_t function,
     void* const parameters,
-    const std::size_t parameter_size) noexcept {
+    const std::size_t parameter_size,
+    std::uint32_t* const fault_code = nullptr) noexcept {
     // UE5 x64 objects and code in the active process are above the 4 GiB
     // boundary. Rejecting low values also blocks stale/truncated FText data
     // before it can become a virtual call target.
@@ -367,7 +369,8 @@ bool AddAddress(std::uintptr_t base, std::int64_t offset, std::uintptr_t& result
 #if defined(_MSC_VER)
     __try {
         return invoker(receiver, function, parameters, parameter_size);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except ((fault_code != nullptr ? *fault_code = GetExceptionCode() : 0),
+                EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 #else
@@ -687,7 +690,6 @@ struct Ue5NteAdapter::State {
         RemoveHeadUpBattleMarkBuffControl,
         AddMonsterBufferControl,
         GetMonsterStaticData,
-        GetDataTableRowFromName,
         CurrentDamageIsCrit,
         Count,
     };
@@ -741,6 +743,9 @@ struct Ue5NteAdapter::State {
     std::uint64_t damage_world_sequence_base{};
     std::uint64_t damage_dropped_count{};
     std::atomic<std::uint64_t> damage_native_call_count{};
+    mutable std::atomic<std::uint64_t> reflection_fault_count{};
+    mutable std::atomic<std::uintptr_t> last_reflection_fault_function{};
+    mutable std::atomic<std::uint32_t> last_reflection_fault_code{};
     std::uint64_t damage_captured_event_count{};
     std::atomic<std::uint64_t> damage_capture_drop_count{};
     std::uint64_t damage_attacker_resolution_failure_count{};
@@ -853,20 +858,7 @@ struct Ue5NteAdapter::State {
         std::unordered_map<std::uint64_t, std::uint64_t> ability_by_effect_fname;
         std::unordered_map<std::string, std::uint64_t> ability_by_effect_key;
     } damage_skill_index;
-    // FText source strings are empty for localized assets in this build. Keep
-    // one validated ProcessEvent bridge and reuse its FString return storage;
-    // conversion is only reached from the deferred game-thread resolver.
-    struct FTextToStringBinding {
-        std::uintptr_t function{};
-        std::uintptr_t receiver{};
-        std::uint16_t parms_size{};
-        std::uint16_t input_offset{};
-        std::uint16_t return_offset{};
-        std::uint64_t object_generation{};
-        bool attempted{};
-        std::array<std::uint8_t, 64> parameters{};
-    };
-    mutable FTextToStringBinding ftext_to_string;
+
     struct StringTableEntryBinding {
         std::uintptr_t function{};
         std::uintptr_t receiver{};
@@ -902,7 +894,8 @@ struct Ue5NteAdapter::State {
     // The ProcessEvent tap only needs the reflected fields below. Keeping the
     // queue payload bounded to the largest useful value avoids copying the
     // 0x298-byte FGameplayEffectSpec for every buff notification.
-    static constexpr std::size_t kCombatCapturePayloadBytes = 96;
+    static constexpr std::size_t kCombatCapturePayloadBytes =
+        (std::max)(std::size_t{96}, sizeof(NteCharacterDamageCapture));
     enum class CombatCaptureKind : std::uint8_t {
         CharacterDamage,
         Damage,
@@ -1309,11 +1302,6 @@ struct Ue5NteAdapter::State {
             NteFunctionParameterSpec{"ConfigID", "NameProperty", 8, false},
             NteFunctionParameterSpec{"InOutMonsterStaticData", "StructProperty", 280, false},
             NteFunctionParameterSpec{"ReturnValue", "BoolProperty", 1, true}};
-        static constexpr std::array get_data_table_row_from_name{
-            NteFunctionParameterSpec{"Table", "ObjectProperty", 8, false},
-            NteFunctionParameterSpec{"RowName", "NameProperty", 8, false},
-            NteFunctionParameterSpec{"OutRow", "StructProperty", 8, false},
-            NteFunctionParameterSpec{"ReturnValue", "BoolProperty", 1, true}};
         switch (kind) {
         case NteFunctionKind::GetAbilitySystemComponent:
             return {kind, "K2_GetAbilitySystemComponent", "HTAbilityCharacter", 8,
@@ -1372,9 +1360,6 @@ struct Ue5NteAdapter::State {
         case NteFunctionKind::GetMonsterStaticData:
             return {kind, "K2_GetMonsterStaticData", "HTSceneSolelyDataAsset", 297,
                 get_monster_static_data};
-        case NteFunctionKind::GetDataTableRowFromName:
-            return {kind, "GetDataTableRowFromName", "DataTableFunctionLibrary", 25,
-                get_data_table_row_from_name};
         case NteFunctionKind::CurrentDamageIsCrit:
             return {kind, "CurrentDamageIsCrit", "HTAttributeComponent", 1, get_bool};
         case NteFunctionKind::Count: break;
@@ -2391,6 +2376,9 @@ struct Ue5NteAdapter::State {
         InvalidateCombatSkillDiscoveryLocked();
         ResetDamageEvents();
         damage_native_call_count = 0;
+        reflection_fault_count = 0;
+        last_reflection_fault_function = 0;
+        last_reflection_fault_code = 0;
         damage_captured_event_count = 0;
         damage_capture_drop_count = 0;
         damage_attacker_resolution_failure_count = 0;
@@ -2715,8 +2703,15 @@ struct Ue5NteAdapter::State {
                 flags_address, &invocation_flags, sizeof(invocation_flags))) {
             return false;
         }
+        std::uint32_t exception_code{};
         const bool invoked = InvokeProcessEventGuarded(
-            process_event_invoker, receiver, function, parameters, parameter_size);
+            process_event_invoker, receiver, function, parameters, parameter_size,
+            &exception_code);
+        if (exception_code != 0) {
+            ++reflection_fault_count;
+            last_reflection_fault_function = function;
+            last_reflection_fault_code = exception_code;
+        }
         const bool restored = memory->Write(
             flags_address, &original_flags, sizeof(original_flags));
         return invoked && restored;
@@ -2877,170 +2872,13 @@ struct Ue5NteAdapter::State {
         return false;
     }
 
-    [[nodiscard]] bool ResolveMonsterNameFromSceneRowsByRowNameLocked(
-        const std::uint64_t config_id_key, std::string& value) noexcept {
-        value.clear();
-        if (config_id_key == 0 || world_pointer == 0 || !process_event_invoker) {
-            return false;
-        }
-        constexpr std::uint16_t kDataTableRowFunctionSize = 25;
-        constexpr std::size_t kMonsterRowCapacity = 304;
-        const auto text_offset = Layout(profile, "monsterData.textName", -1);
-        const auto persistent_level_offset =
-            Layout(profile, "world.persistentLevel", -1);
-        const auto level_settings_offset =
-            Layout(profile, "level.worldSettings", -1);
-        const auto scene_asset_offset =
-            Layout(profile, "worldSettings.htSceneSolelyDataAsset", -1);
-        const auto array_offset =
-            Layout(profile, "sceneSolelyDataAsset.monsterArrayDataTable", -1);
-        const auto count_offset = Layout(
-            profile, "sceneSolelyDataAsset.monsterArrayDataTableCount", -1);
-        const auto default_object_offset =
-            Layout(profile, "uclass.classDefaultObject", -1);
-        if (text_offset < 0 || text_offset + 16 > kMonsterRowCapacity ||
-            persistent_level_offset < 0 || level_settings_offset < 0 ||
-            scene_asset_offset < 0 || array_offset < 0 || count_offset < 0 ||
-            default_object_offset < 0) {
-            return false;
-        }
-
-        auto& binding_slot = combat_skill_discovery.functions[
-            NteIndex(NteFunctionKind::GetDataTableRowFromName)];
-        if (!binding_slot) {
-            if (!ObjectFindAvailable()) return false;
-            std::uintptr_t function{};
-            NteFunctionBinding candidate;
-            if (!FindExactObjectLocked(
-                    L"/Script/Engine.DataTableFunctionLibrary.GetDataTableRowFromName",
-                    function) ||
-                !BuildNteFunctionBindingLocked(
-                    function, NteFunctionKind::GetDataTableRowFromName, candidate)) {
-                return false;
-            }
-            binding_slot = candidate;
-        }
-        const auto& binding = binding_slot;
-        if (!binding || binding->parms_size != kDataTableRowFunctionSize ||
-            binding->offsets[0] > binding->parms_size ||
-            sizeof(std::uintptr_t) > binding->parms_size - binding->offsets[0] ||
-            binding->offsets[1] > binding->parms_size ||
-            sizeof(std::uint64_t) > binding->parms_size - binding->offsets[1] ||
-            binding->offsets[2] > binding->parms_size ||
-            sizeof(std::uintptr_t) > binding->parms_size - binding->offsets[2]) {
-            return false;
-        }
-
-        std::uintptr_t persistent_level{};
-        std::uintptr_t world_settings{};
-        std::uintptr_t scene_asset{};
-        if (!ReadPointerAt(
-                *memory, world_pointer, persistent_level_offset, persistent_level) ||
-            !ReadPointerAt(
-                *memory, persistent_level, level_settings_offset, world_settings) ||
-            !ReadPointerAt(
-                *memory, world_settings, scene_asset_offset, scene_asset)) {
-            return false;
-        }
-        std::uintptr_t array_data{};
-        std::int32_t count{};
-        if (!ReadPointerAt(*memory, scene_asset, array_offset, array_data) ||
-            !ReadValue(*memory,
-                scene_asset + static_cast<std::uintptr_t>(count_offset), count) ||
-            count <= 0 ||
-            static_cast<std::size_t>(count) > kSceneMonsterTableCapacity) {
-            return false;
-        }
-
-        std::uintptr_t receiver{};
-        if (!ReadPointerAt(
-                *memory, binding->outer_class, default_object_offset, receiver) ||
-            !ReadableRange(*memory, receiver, 0x20U) ||
-            !ReadableRange(*memory, binding->function, 0x20U)) {
-            return false;
-        }
-
-        const auto comparison_index = static_cast<std::uint32_t>(
-            config_id_key & 0xFFFFFFFFU);
-        const auto high_number = static_cast<std::uint32_t>(
-            config_id_key >> 32U);
-        const std::array<std::uint32_t, 2> row_numbers{0U, high_number};
-        for (std::size_t number_index{}; number_index < row_numbers.size();
-             ++number_index) {
-            if (number_index != 0U &&
-                row_numbers[number_index] == row_numbers[number_index - 1U]) {
-                continue;
-            }
-            const auto number = row_numbers[number_index];
-            for (std::int32_t table_index{}; table_index < count; ++table_index) {
-                std::uintptr_t table{};
-                if (!ReadValue(*memory,
-                        array_data +
-                            static_cast<std::uintptr_t>(table_index) *
-                                sizeof(std::uintptr_t),
-                        table) || table == 0) {
-                    continue;
-                }
-                alignas(std::uint64_t)
-                    std::array<std::uint8_t, kDataTableRowFunctionSize> parameters{};
-                alignas(std::uint64_t)
-                    std::array<std::uint8_t, kMonsterRowCapacity> out_row{};
-                std::memcpy(parameters.data() + binding->offsets[0],
-                    &table, sizeof(table));
-                std::memcpy(parameters.data() + binding->offsets[1],
-                    &comparison_index, sizeof(comparison_index));
-                std::memcpy(
-                    parameters.data() + binding->offsets[1] +
-                        sizeof(comparison_index),
-                    &number, sizeof(number));
-                const auto out_row_address =
-                    reinterpret_cast<std::uintptr_t>(out_row.data());
-                std::memcpy(parameters.data() + binding->offsets[2],
-                    &out_row_address, sizeof(out_row_address));
-                if (!InvokeNteFunctionLocked(
-                        NteFunctionKind::GetDataTableRowFromName, receiver,
-                        parameters)) {
-                    continue;
-                }
-                constexpr std::size_t kReturnIndex = 3;
-                const ReflectedBoolParameter& reflected =
-                    binding->bool_parameters[kReturnIndex];
-                if (reflected.byte_offset >= binding->parms_size ||
-                    (parameters[reflected.byte_offset] & reflected.field_mask) == 0) {
-                    continue;
-                }
-                std::uintptr_t row_address{};
-                std::memcpy(&row_address, out_row.data(), sizeof(row_address));
-                if (row_address == 0 ||
-                    !ReadableRange(*memory, row_address,
-                        static_cast<std::size_t>(text_offset) + 16U)) {
-                    continue;
-                }
-                std::array<std::uint8_t, 16> ftext_bytes{};
-                if (!memory->Read(
-                        row_address + static_cast<std::uintptr_t>(text_offset),
-                        ftext_bytes.data(), ftext_bytes.size())) {
-                    continue;
-                }
-                if (!ResolveFTextBytesLocked(ftext_bytes, value)) continue;
-                if (!value.empty()) return true;
-            }
-        }
-        value.clear();
-        return false;
-    }
-
     [[nodiscard]] bool ResolveMonsterStaticDataNameLocked(
         const std::uint64_t config_id_key, std::string& value) noexcept {
         value.clear();
         ++monster_static_data_resolution_calls;
         if (config_id_key != 0) {
-            if (ResolveMonsterNameFromSceneRowsByRowNameLocked(
-                    config_id_key, value) &&
-                !value.empty()) {
-                ++monster_static_data_resolution_successes;
-                return true;
-            }
+            // GetDataTableRowFromName is a custom thunk with a wildcard inline
+            // OutRow, not an output pointer. Use the validated table index.
             std::string config_text;
             static_cast<void>(ResolveFNameLocked(
                 static_cast<std::uint32_t>(config_id_key & 0xFFFFFFFFU),
@@ -5056,10 +4894,7 @@ struct Ue5NteAdapter::State {
     }
 
     [[nodiscard]] bool DamageTagsContainCriticalLocked(
-        const std::span<const std::uint8_t> bytes) noexcept {
-        static constexpr std::size_t kContainerStride = 0x10;
-        static constexpr std::size_t kMaximumTagsPerContainer = 16;
-        static constexpr std::size_t kMaximumTagCount = 4096;
+        const NteDamageTags& tags) noexcept {
         const auto is_critical = [](std::string_view tag) noexcept {
             std::string normalized(tag);
             for (char& character : normalized) {
@@ -5071,42 +4906,18 @@ struct Ue5NteAdapter::State {
                 normalized.ends_with(".critical") ||
                 normalized.ends_with(".criticalhit") || normalized.ends_with(".crit");
         };
-        for (std::size_t container_offset{}; container_offset < bytes.size();
-             container_offset += kContainerStride) {
-            NativeArrayHeader tags;
-            if (!ReadCaptureBytes(bytes, static_cast<std::int64_t>(container_offset), tags) ||
-                tags.count < 0 || tags.capacity < tags.count ||
-                static_cast<std::size_t>(tags.count) > kMaximumTagCount ||
-                (tags.count != 0 && tags.data == 0)) {
+        for (const auto key : tags.Values()) {
+            const auto cached = damage_critical_tag_cache.find(key);
+            if (cached != damage_critical_tag_cache.end()) {
+                if (cached->second) return true;
                 continue;
             }
-            const auto count = (std::min)(
-                static_cast<std::size_t>(tags.count), kMaximumTagsPerContainer);
-            for (std::size_t index{}; index < count; ++index) {
-                std::uintptr_t address{};
-                if (!AddUnsignedAddress(
-                        tags.data, static_cast<std::uint64_t>(index) * 8U, address)) {
-                    break;
-                }
-                std::uint32_t comparison_index{};
-                std::uint32_t number{};
-                if (!ReadValue(*memory, address, comparison_index) ||
-                    !ReadValue(*memory, address + sizeof(comparison_index), number)) {
-                    continue;
-                }
-                const auto key = static_cast<std::uint64_t>(comparison_index) |
-                    (static_cast<std::uint64_t>(number) << 32U);
-                const auto cached = damage_critical_tag_cache.find(key);
-                if (cached != damage_critical_tag_cache.end()) {
-                    if (cached->second) return true;
-                    continue;
-                }
-                std::string tag;
-                const bool critical = ResolveFNameLocked(
-                    comparison_index, number, tag) && is_critical(tag);
-                damage_critical_tag_cache.emplace(key, critical);
-                if (critical) return true;
-            }
+            std::string tag;
+            const bool critical = ResolveFNameLocked(
+                static_cast<std::uint32_t>(key),
+                static_cast<std::uint32_t>(key >> 32U), tag) && is_critical(tag);
+            damage_critical_tag_cache.emplace(key, critical);
+            if (critical) return true;
         }
         return false;
     }
@@ -5138,6 +4949,9 @@ struct Ue5NteAdapter::State {
             candidate.reaction_display_type = display_event.reaction_display_type;
             if ((display_event.flags & ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL) != 0) {
                 candidate.flags |= ANOMALY_NTE_DAMAGE_V1_CRITICAL;
+            }
+            if ((display_event.flags & ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID) != 0) {
+                candidate.flags |= ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID;
             }
             if ((display_event.flags & ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT) != 0) {
                 candidate.flags |= ANOMALY_NTE_DAMAGE_V1_HEAD_HIT;
@@ -5203,7 +5017,7 @@ struct Ue5NteAdapter::State {
         std::int32_t final_damage{};
         static_cast<void>(read_at(Layout(profile, "damageTextInfo.displayDamage"), display_damage));
         static_cast<void>(read_at(Layout(profile, "damageTextInfo.damageType"), damage_type));
-        static_cast<void>(read_at(Layout(profile, "damageTextInfo.critical"), critical));
+        const bool critical_valid = read_at(Layout(profile, "damageTextInfo.critical"), critical);
         static_cast<void>(read_at(Layout(profile, "damageTextInfo.headHit"), head_hit));
         static_cast<void>(read_at(Layout(profile, "damageTextInfo.weakUnbalance"), weak_unbalance));
         static_cast<void>(read_at(Layout(profile, "damageTextInfo.displayType"), display_type));
@@ -5220,6 +5034,7 @@ struct Ue5NteAdapter::State {
         event.reaction_display_type = reaction_display_type;
         event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID;
         if (critical != 0) event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL;
+        if (critical_valid) event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID;
         if (head_hit != 0) event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_HEAD_HIT;
         if (weak_unbalance != 0) event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_WEAK_UNBALANCE;
         std::uint32_t source_name_id{};
@@ -5501,8 +5316,7 @@ struct Ue5NteAdapter::State {
         const std::uintptr_t damage_event,
         const std::uintptr_t victim,
         const std::uintptr_t attacker,
-        const std::uintptr_t damage_causer,
-        const bool synchronous_critical) noexcept {
+        const std::uintptr_t damage_causer) noexcept {
         damage_native_call_count.fetch_add(1, std::memory_order_relaxed);
         const auto drop = [this]() noexcept {
             damage_capture_drop_count.fetch_add(1, std::memory_order_relaxed);
@@ -5516,6 +5330,32 @@ struct Ue5NteAdapter::State {
             drop();
             return;
         }
+        NteDamageCriticalState synchronous_critical;
+        bool query_failed{};
+        for (const std::uintptr_t candidate : {victim, attacker}) {
+            if (candidate == 0 || synchronous_critical.critical) continue;
+            std::uintptr_t ability_system{};
+            if (!CurrentAbilitySystemLocked(candidate, ability_system)) {
+                query_failed = true;
+                continue;
+            }
+            bool candidate_critical{};
+            crit_query_call_count.fetch_add(1, std::memory_order_relaxed);
+            if (InvokeNteBoolReturnLocked(
+                    NteFunctionKind::CurrentDamageIsCrit, ability_system, candidate_critical)) {
+                synchronous_critical.valid = true;
+                crit_query_success_count.fetch_add(1, std::memory_order_relaxed);
+                if (candidate_critical) {
+                    synchronous_critical.critical = true;
+                    crit_true_count.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                query_failed = true;
+            }
+        }
+        synchronous_critical.valid = synchronous_critical.critical ||
+            (synchronous_critical.valid && !query_failed);
+        // Query before reserving the queue slot: ProcessEvent can reenter capture.
         const auto write = combat_capture_write.load(std::memory_order_relaxed);
         const auto read = combat_capture_read.load(std::memory_order_acquire);
         if (static_cast<std::uint32_t>(write - read) >= kCombatCaptureQueueCapacity) {
@@ -5524,16 +5364,18 @@ struct Ue5NteAdapter::State {
         }
         auto& capture = combat_capture_queue[write % kCombatCaptureQueueCapacity];
         capture.kind = CombatCaptureKind::CharacterDamage;
-        capture.payload_size = 81;
+        capture.payload_size = sizeof(NteCharacterDamageCapture);
         capture.info_offset = 0;
         capture.tick_sequence = tick_sequence.load(std::memory_order_relaxed);
-        std::memset(capture.payload.data(), 0, capture.payload_size);
+        NteCharacterDamageCapture damage;
         const auto* const source = static_cast<const std::uint8_t*>(
             reinterpret_cast<const void*>(damage_event));
-        std::memcpy(capture.payload.data(), source + bindings.damage_value_offset, sizeof(float));
-        std::memcpy(capture.payload.data() + 8, source + bindings.damage_source_offset, 8);
-        std::memcpy(capture.payload.data() + 16, &victim, sizeof(victim));
-        std::memcpy(capture.payload.data() + 24, &attacker, sizeof(attacker));
+        std::memcpy(&damage.damage, source + bindings.damage_value_offset, sizeof(float));
+        std::memcpy(&damage.source_index, source + bindings.damage_source_offset, 4);
+        std::memcpy(&damage.source_serial, source + bindings.damage_source_offset + 4, 4);
+        damage.victim = victim;
+        damage.attacker = attacker;
+        damage.critical = synchronous_critical;
         std::uintptr_t saved_skill_cdo{};
         std::int32_t active_spec_handle{};
         const auto trigger_handle_offset = Layout(
@@ -5551,13 +5393,13 @@ struct Ue5NteAdapter::State {
             static_cast<void>(ReadPointerAt(
                 *memory, damage_causer, saved_skill_offset, saved_skill_cdo));
         }
-        std::memcpy(
-            capture.payload.data() + 32, &saved_skill_cdo, sizeof(saved_skill_cdo));
-        std::memcpy(capture.payload.data() + 40,
-            &active_spec_handle, sizeof(active_spec_handle));
-        std::memcpy(capture.payload.data() + 48,
-            source + bindings.damage_tags_offset, 32);
-        capture.payload.data()[80] = synchronous_critical ? 1U : 0U;
+        damage.saved_skill_cdo = saved_skill_cdo;
+        damage.active_spec_handle = active_spec_handle;
+        damage.tags = CaptureNteDamageTags(damage_event + bindings.damage_tags_offset,
+            [this](std::uintptr_t address, void* destination, std::size_t size) {
+                return memory->Read(address, destination, size);
+            });
+        std::memcpy(capture.payload.data(), &damage, sizeof(damage));
         combat_capture_write.store(write + 1U, std::memory_order_release);
     }
 
@@ -5899,6 +5741,8 @@ struct Ue5NteAdapter::State {
         const std::uintptr_t saved_skill_cdo,
         const std::int32_t active_spec_handle,
         const bool critical,
+        const bool critical_valid,
+        const bool partial,
         const std::uint64_t capture_tick_sequence) noexcept {
         const auto drop = [this]() noexcept {
             ++damage_dropped_count;
@@ -5916,6 +5760,7 @@ struct Ue5NteAdapter::State {
             AnomalyNteDamageEventV1 event{};
             event.flags = ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT;
             if (is_critical) event.flags |= ANOMALY_NTE_DAMAGE_V1_CRITICAL;
+            if (critical_valid) event.flags |= ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID;
             event.tick_sequence = capture_tick_sequence;
             event.world = {1, world_generation};
             if (attacker != 0 && !ObjectHandleLocked(attacker, event.attacker)) {
@@ -5948,6 +5793,8 @@ struct Ue5NteAdapter::State {
             combat_event.final_value = event.final_damage;
             combat_event.value = event.final_damage;
             combat_event.name_id = event.source_id;
+            if (partial) combat_event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_PARTIAL;
+            if (critical_valid) combat_event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID;
             if (is_critical) {
                 combat_event.flags |= ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL;
             }
@@ -5968,33 +5815,18 @@ struct Ue5NteAdapter::State {
     void CaptureCharacterDamageBytesLocked(
         const std::span<const std::uint8_t> parameters,
         const std::uint64_t capture_tick_sequence) noexcept {
-        float damage{};
-        std::int32_t source_index{-1};
-        std::int32_t source_serial{};
-        std::uintptr_t victim{};
-        std::uintptr_t attacker{};
-        std::uintptr_t saved_skill_cdo{};
-        std::int32_t active_spec_handle{};
-        std::array<std::uint8_t, 32> damage_tags{};
-        std::uint8_t synchronous_critical{};
-        if (!ReadCaptureBytes(parameters, 0, damage) ||
-            !ReadCaptureBytes(parameters, 8, source_index) ||
-            !ReadCaptureBytes(parameters, 12, source_serial) ||
-            !ReadCaptureBytes(parameters, 16, victim) ||
-            !ReadCaptureBytes(parameters, 24, attacker) ||
-            !ReadCaptureBytes(parameters, 32, saved_skill_cdo) ||
-            !ReadCaptureBytes(parameters, 40, active_spec_handle) ||
-            !ReadCaptureBytes(parameters, 48, damage_tags)) {
+        NteCharacterDamageCapture damage;
+        if (!ReadCaptureBytes(parameters, 0, damage)) {
             damage_capture_drop_count.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        static_cast<void>(ReadCaptureBytes(
-            parameters, 80, synchronous_critical));
+        const bool critical = damage.critical.critical ||
+            DamageTagsContainCriticalLocked(damage.tags);
+        const bool critical_valid = damage.critical.valid || critical;
         ProcessCharacterDamageLocked(
-            damage, source_index, source_serial, victim, attacker,
-            saved_skill_cdo, active_spec_handle,
-            synchronous_critical != 0 ||
-                DamageTagsContainCriticalLocked(damage_tags),
+            damage.damage, damage.source_index, damage.source_serial,
+            damage.victim, damage.attacker, damage.saved_skill_cdo, damage.active_spec_handle,
+            critical, critical_valid, damage.tags.partial || !critical_valid,
             capture_tick_sequence);
     }
 
@@ -6386,88 +6218,43 @@ struct Ue5NteAdapter::State {
         return value;
     }
 
-    [[nodiscard]] bool EnsureFTextToStringBindingLocked() const noexcept {
-        auto& binding = ftext_to_string;
-        if (binding.object_generation != object_generation) {
-            binding = {};
-            binding.object_generation = object_generation;
-        }
-        if (binding.attempted) {
-            return binding.function != 0 && binding.receiver != 0;
-        }
-        if (!ObjectFindAvailable() || !process_event_invoker) return false;
-        try {
-            std::uintptr_t function{};
-            std::uintptr_t library_class{};
-            if (!FindExactObjectLocked(
-                    L"/Script/Engine.KismetTextLibrary.Conv_TextToString", function) ||
-                !ReadPointerAt(*memory, function, Layout(profile, "object.outer"), library_class) ||
-                !ReadPointerAt(*memory, library_class,
-                    Layout(profile, "uclass.classDefaultObject"), binding.receiver) ||
-                binding.receiver == 0) {
-                return false;
-            }
-            std::uint8_t num_parms{};
-            std::uint16_t parms_size{};
-            std::uint16_t return_offset{};
-            if (!ReadValue(*memory, function + Layout(profile, "ufunction.numParms"), num_parms) ||
-                !ReadValue(*memory, function + Layout(profile, "ufunction.parmsSize"), parms_size) ||
-                !ReadValue(*memory, function + Layout(profile, "ufunction.returnValueOffset"), return_offset) ||
-                num_parms != 2 || parms_size == 0 || parms_size > binding.parameters.size()) {
-                binding.receiver = 0;
-                return false;
-            }
-            constexpr std::uint16_t kFTextSize = 16;
-            if (return_offset < kFTextSize ||
-                return_offset + kFTextSize > parms_size) {
-                binding.receiver = 0;
-                return false;
-            }
-            binding.input_offset = 0;
-            binding.return_offset = return_offset;
-            binding.function = function;
-            binding.parms_size = parms_size;
-            binding.attempted = true;
-            return true;
-        } catch (...) {
-            binding.function = 0;
-            binding.receiver = 0;
-            binding.attempted = false;
-            return false;
-        }
-    }
-
     [[nodiscard]] bool ResolveFTextBytesLocked(
         const std::array<std::uint8_t, 16>& ftext_bytes,
         std::string& value) const {
         value.clear();
-        if (GetCurrentThreadId() != game_thread_id.load(std::memory_order_acquire) ||
-            !EnsureFTextToStringBindingLocked()) {
+        const auto data_offset = Layout(profile, "ftext.textData", -1);
+        const auto source_offset = Layout(profile, "ftextData.textSource", -1);
+        std::uintptr_t text_data{};
+        if (data_offset < 0 || source_offset < 0 ||
+            !ReadCaptureBytes(ftext_bytes, data_offset, text_data)) {
             return false;
         }
-        auto& binding = ftext_to_string;
-        if (binding.input_offset > binding.parameters.size() ||
-            16U > binding.parameters.size() - binding.input_offset ||
-            binding.parms_size > binding.parameters.size()) {
+        std::uintptr_t source{};
+        std::uintptr_t data_address{};
+        std::uintptr_t count_address{};
+        std::uintptr_t capacity_address{};
+        NativeUtf16StringHeader native;
+        if (!AddAddress(text_data, source_offset, source) ||
+            !AddAddress(source, Layout(profile, "fstring.data", 0), data_address) ||
+            !AddAddress(source, Layout(profile, "fstring.count", 8), count_address) ||
+            !AddAddress(source, Layout(profile, "fstring.capacity", 12), capacity_address) ||
+            !ReadValue(*memory, data_address, native.data) ||
+            !ReadValue(*memory, count_address, native.count) ||
+            !ReadValue(*memory, capacity_address, native.capacity)) {
             return false;
         }
-        std::memcpy(binding.parameters.data() + binding.input_offset,
-            ftext_bytes.data(), ftext_bytes.size());
-        try {
-            if (!ReadableRange(*memory, binding.receiver, 0x20U) ||
-                !ReadableRange(*memory, binding.function, 0x20U) ||
-                !InvokeNativeProcessEventLocked(
-                    binding.receiver, binding.function,
-                    binding.parameters.data(), binding.parms_size)) {
-                return false;
-            }
-        } catch (...) {
+        // A readable FText header does not establish an engine-owned ITextData
+        // object. Never materialize unverified history through ProcessEvent.
+        if (!DecodeUtf16StringLocked(native, value) || value.empty()) return false;
+        // History storage has been observed to resemble a string header. Do not
+        // cache binary control bytes as a successfully resolved display name.
+        if (std::any_of(value.begin(), value.end(), [](const unsigned char ch) {
+                return (ch < 0x20 && ch != '\t' && ch != '\n' && ch != '\r') || ch == 0x7F;
+            })) {
+            value.clear();
             return false;
         }
-        NativeUtf16StringHeader converted;
-        std::memcpy(&converted,
-            binding.parameters.data() + binding.return_offset, sizeof(converted));
-        return DecodeUtf16StringLocked(converted, value) && !value.empty();
+        return true;
     }
 
     [[nodiscard]] bool EnsureRegisteredStringTablesBindingLocked() const noexcept {
@@ -6844,54 +6631,11 @@ struct Ue5NteAdapter::State {
 
     [[nodiscard]] bool ResolveFTextLocked(
         const std::uintptr_t ftext_address, std::string& value) const {
+        std::array<std::uint8_t, 16> bytes{};
         value.clear();
-        if (ftext_address == 0) return false;
-        const auto text_data_offset = Layout(profile, "ftext.textData", 0);
-        const auto string_data_offset = Layout(profile, "fstring.data", 0);
-        const auto string_count_offset = Layout(profile, "fstring.count", 8);
-        const auto string_capacity_offset = Layout(profile, "fstring.capacity", 12);
-        std::uintptr_t text_data{};
-        if (!ReadableRange(*memory, ftext_address, 16U) ||
-            !ReadValue(*memory, ftext_address + text_data_offset, text_data) ||
-            !ReadableRange(*memory, text_data, 0x40U)) {
-            return false;
-        }
-        // FTextData keeps the source/display FString at the profile-provided
-        // slot (0x20 for this build). Probe neighbouring legacy slots only
-        // when the profile does not provide that layout; otherwise each row
-        // costs one bounded header read instead of seven speculative probes.
-        const auto configured_source = Layout(profile, "ftextData.textSource", -1);
-        const auto try_source = [&](const std::int64_t source_offset) {
-            if (source_offset < 0) return false;
-            NativeUtf16StringHeader native;
-            const auto source = text_data + static_cast<std::uintptr_t>(source_offset);
-            if (!ReadValue(*memory, source + string_data_offset, native.data) ||
-                !ReadValue(*memory, source + string_count_offset, native.count) ||
-                !ReadValue(*memory, source + string_capacity_offset, native.capacity)) {
-                return false;
-            }
-            if (native.count <= 0 || native.data == nullptr ||
-                native.capacity < native.count || native.capacity > 4096) {
-                return false;
-            }
-            return DecodeUtf16StringLocked(native, value) && !value.empty();
-        };
-        if (try_source(configured_source)) return true;
-        if (configured_source < 0) {
-            for (const auto source_offset : {40LL, 48LL, 24LL, 16LL, 0LL, 56LL}) {
-                if (try_source(source_offset)) return true;
-            }
-        }
-        // Localized FText values intentionally keep an empty TextSource and
-        // carry the display text in FTextHistory. Let UE materialize that
-        // history through its own converter, but only on the game thread and
-        // through the one cached, reflection-validated binding.
-        std::array<std::uint8_t, 16> ftext_bytes{};
-        if (!memory->Read(ftext_address, ftext_bytes.data(), ftext_bytes.size())) {
-            value.clear();
-            return false;
-        }
-        return ResolveFTextBytesLocked(ftext_bytes, value);
+        return ftext_address != 0 &&
+            memory->Read(ftext_address, bytes.data(), bytes.size()) &&
+            ResolveFTextBytesLocked(bytes, value);
     }
 
     AnomalyStatusV1 ResolveFTextAddress(
@@ -6973,8 +6717,13 @@ struct Ue5NteAdapter::State {
                 storage.data(), storage.size() * sizeof(wchar_t))) {
             return false;
         }
-        std::size_t length = storage.size();
-        if (length != 0 && storage[length - 1] == L'\0') --length;
+        // FString counts include the terminator; the public UTF-8 ABI cannot
+        // represent embedded nulls without silently truncating the result.
+        if (storage.back() != L'\0' ||
+            std::find(storage.begin(), storage.end() - 1, L'\0') != storage.end() - 1) {
+            return false;
+        }
+        const std::size_t length = storage.size() - 1;
         if (length == 0) return true;
         const int required = WideCharToMultiByte(
             CP_UTF8, WC_ERR_INVALID_CHARS, storage.data(), static_cast<int>(length),
@@ -7728,6 +7477,7 @@ struct Ue5NteAdapter::State {
             return false;
         }
     }
+
 
     [[nodiscard]] bool ValidateSkillLayoutLocked(
         const std::uintptr_t ability_system_class) const {
@@ -11401,6 +11151,9 @@ struct Ue5NteAdapter::State {
                 }
             }
             SaturatingAdd(result.hit_count, std::uint64_t{1}, result.flags);
+            if ((event.flags & ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID) == 0) {
+                result.flags |= ANOMALY_NTE_COMBAT_STATISTICS_V1_PARTIAL;
+            }
             if ((event.flags & ANOMALY_NTE_DAMAGE_V1_CRITICAL) != 0) {
                 SaturatingAdd(result.critical_count, std::uint64_t{1}, result.flags);
             }
@@ -13357,10 +13110,6 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             semantic_lifetime)) {
         return false;
     }
-    if (publish_combat_service) {
-        player_demand.store(true, std::memory_order_release);
-        combat_demand.store(true, std::memory_order_release);
-    }
     const bool publish_skills_service = framework_hook_ready &&
         NteSkillsProfileAvailable() &&
         !IsPublished(ANOMALY_NTE_SKILLS_SERVICE_V1_ID);
@@ -13381,10 +13130,6 @@ bool Ue5NteAdapter::State::PublishAvailableServices(const std::weak_ptr<State>& 
             },
             semantic_lifetime)) {
         return false;
-    }
-    if (publish_skills_service) {
-        player_demand.store(true, std::memory_order_release);
-        skill_demand.store(true, std::memory_order_release);
     }
     if (framework_hook_ready && SemanticFeatureAvailable("nte.skill-invocation") &&
         !PublishIfMissing(
@@ -13835,32 +13580,9 @@ void Ue5NteAdapter::OnDamageEvent(
         state->damage_capture_drop_count.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    bool synchronous_critical{};
-    for (const std::uintptr_t candidate : {victim, attacker}) {
-        if (candidate == 0 || synchronous_critical) {
-            continue;
-        }
-        std::uintptr_t ability_system{};
-        if (!state->CurrentAbilitySystemLocked(candidate, ability_system)) {
-            continue;
-        }
-        bool candidate_critical{};
-        state->crit_query_call_count.fetch_add(1, std::memory_order_relaxed);
-        if (state->InvokeNteBoolReturnLocked(
-                State::NteFunctionKind::CurrentDamageIsCrit,
-                ability_system, candidate_critical)) {
-            state->crit_query_success_count.fetch_add(
-                1, std::memory_order_relaxed);
-            if (candidate_critical) {
-                synchronous_critical = true;
-                state->crit_true_count.fetch_add(
-                    1, std::memory_order_relaxed);
-            }
-        }
-    }
+    // Capture the synchronous critical query result with owned damage/tag values.
     state->EnqueueCharacterDamage(
-        *bindings, damage_event, victim, attacker, damage_causer,
-        synchronous_critical);
+        *bindings, damage_event, victim, attacker, damage_causer);
 }
 
 void Ue5NteAdapter::OnCombatExecFunction(
@@ -14039,7 +13761,10 @@ NteCombatDiagnosticsSnapshot Ue5NteAdapter::CombatDiagnostics() const noexcept {
         state->player_pawn,
         state->combat_character.id,
         state->combat_character.generation,
-        state->combat_refresh_failure};
+        state->combat_refresh_failure,
+        state->reflection_fault_count,
+        state->last_reflection_fault_function,
+        state->last_reflection_fault_code};
 }
 
 std::string Ue5NteAdapter::CombatEventsJson(const bool buffs_only) const {

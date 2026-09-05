@@ -1710,6 +1710,7 @@ public:
             std::to_string(combat_diagnostics.buff_call_count);
         json += ",\"critQueryCalls\":" +
             std::to_string(combat_diagnostics.crit_query_call_count);
+        json += ",\"critQueryMode\":\"synchronous-reflection\"";
         json += ",\"critQuerySuccesses\":" +
             std::to_string(combat_diagnostics.crit_query_success_count);
         json += ",\"critTrueCount\":" +
@@ -1749,7 +1750,13 @@ public:
         json += ",\"combatCharacterGeneration\":" +
             std::to_string(combat_diagnostics.combat_character_generation);
         json += ",\"combatRefreshFailure\":" +
-            std::to_string(combat_diagnostics.combat_refresh_failure) + "}";
+            std::to_string(combat_diagnostics.combat_refresh_failure);
+        json += ",\"reflectionFaults\":" +
+            std::to_string(combat_diagnostics.reflection_fault_count);
+        json += ",\"lastReflectionFaultFunction\":" +
+            std::to_string(combat_diagnostics.last_reflection_fault_function);
+        json += ",\"lastReflectionFaultCode\":" +
+            std::to_string(combat_diagnostics.last_reflection_fault_code) + "}";
         const bool player_service_published = adapter_ &&
             ProcessAdapterServices().Query(
                 ANOMALY_NTE_PLAYER_SERVICE_V1_ID,

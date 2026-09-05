@@ -393,6 +393,8 @@ typedef uint32_t AnomalyNteDamageFlagsV1;
 // final_damage is the rounded FHTDamageEvent::Damage value. Display-only
 // metadata is unavailable unless a separate flag says otherwise.
 #define ANOMALY_NTE_DAMAGE_V1_CHARACTER_EVENT (1u << 4u)
+// Without CRITICAL_VALID, an unset CRITICAL bit means unknown, not non-critical.
+#define ANOMALY_NTE_DAMAGE_V1_CRITICAL_VALID (1u << 5u)
 typedef struct AnomalyNteDamageEventV1 {
     uint32_t struct_size; uint32_t flags;
     uint64_t sequence; uint64_t tick_sequence;
@@ -423,6 +425,7 @@ typedef uint32_t AnomalyNteCombatEventFlagsV1;
 #define ANOMALY_NTE_COMBAT_EVENT_V1_DISPLAY_VALID (1u << 3u)
 #define ANOMALY_NTE_COMBAT_EVENT_V1_NAME_VALID (1u << 4u)
 #define ANOMALY_NTE_COMBAT_EVENT_V1_PARTIAL (1u << 5u)
+#define ANOMALY_NTE_COMBAT_EVENT_V1_CRITICAL_VALID (1u << 6u)
 typedef struct AnomalyNteCombatEventV1 {
     uint32_t struct_size; uint32_t kind; uint32_t flags; uint32_t reserved;
     uint64_t sequence; uint64_t tick_sequence;
