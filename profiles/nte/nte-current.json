@@ -45,6 +45,30 @@
         "anomaly.nte.skill-invocation"
       ]
     },
+    "ue5.FTextData.GetDisplayString": {
+      "module": "HTGame.exe",
+      "section": ".text",
+      "pattern": "48 8B 51 30 48 83 C1 20 48 85 D2 48 8D 42 08 48 0F 44 C1 C3",
+      "resolve": {"kind": "direct"},
+      "validators": ["address-in-module", "executable"],
+      "requiredBy": ["anomaly.ue5.names"]
+    },
+    "ue5.FTextDataStringTableEntry.GetSharedDisplayString": {
+      "module": "HTGame.exe",
+      "section": ".text",
+      "pattern": "48 89 5C 24 18 57 48 83 EC 20 48 8B 49 18 33 DB 48 8B FA 48 85 C9 74 5F 45 33 C0 48 8D 54 24 30 E8 ?? ?? ?? ??",
+      "resolve": {"kind": "direct"},
+      "validators": ["address-in-module", "executable"],
+      "requiredBy": ["anomaly.ue5.names"]
+    },
+    "ue5.StringTableRegistry": {
+      "module": "HTGame.exe",
+      "section": ".text",
+      "pattern": "48 83 EC 28 8B 0D ?? ?? ?? ?? 65 48 8B 04 25 58 00 00 00 BA 08 17 00 00 48 8B 04 C8 8B 04 02 39 05 ?? ?? ?? ?? 7F 0C 48 8D 05 ?? ?? ?? ?? 48 83 C4 28 C3 48 8D 0D ?? ?? ?? ?? E8 ?? ?? ?? ?? 83 3D ?? ?? ?? ?? FF 75 DF 48 8D 0D ?? ?? ?? ?? FF 15 ?? ?? ?? ?? BA A0 0F 00 00 48 8D 0D ?? ?? ?? ?? FF 15 ?? ?? ?? ?? 66 0F 6F 05 ?? ?? ?? ?? 48 8D 0D ?? ?? ?? ?? 33 C0 66 0F 7F 05 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? 48 89 05 ?? ?? ?? ?? 89 05 ?? ?? ?? ?? FF 15 ?? ?? ?? ?? BA A0 0F 00 00 48 8D 0D ?? ?? ?? ?? FF 15 ?? ?? ?? ??",
+      "resolve": {"kind": "rip-rel32", "offset": 42, "instructionSize": 46},
+      "validators": ["address-in-module", "readable"],
+      "requiredBy": ["anomaly.ue5.names"]
+    },
     "ue5.GObjects": {
       "module": "HTGame.exe",
       "section": ".text",
@@ -168,6 +192,11 @@
     }
   },
   "features": {
+    "ue5.ftext": [
+      "ue5.FTextData.GetDisplayString",
+      "ue5.FTextDataStringTableEntry.GetSharedDisplayString",
+      "ue5.StringTableRegistry"
+    ],
     "ue5.framework": ["ue5.GameTick"],
     "ue5.world": ["ue5.GWorld", "ue5.GameTick"],
     "ue5.names": ["ue5.FNamePool"],
@@ -225,6 +254,7 @@
     ]
   },
   "optionalFeatures": [
+    "ue5.ftext",
     "ue5.actors",
     "ue5.functions",
     "ue5.object-find",
@@ -242,6 +272,7 @@
     "nte.skill-invocation"
   ],
   "featureLayoutValidators": {
+    "ue5.ftext": ["ue5-ftext-layout-v1"],
     "ue5.actors": ["ue5-actors-reflection-v1"],
     "ue5.functions": ["ue5-functions-reflection-v1"],
     "ue5.object-find": ["ue5-static-find-object-abi-v1"],
@@ -261,6 +292,7 @@
     "nte.skill-invocation": ["nte-skill-invocation-v1"]
   },
   "featureDependencies": {
+    "ue5.ftext": ["ue5.names"],
     "ue5.actors": ["ue5.world", "ue5.names"],
     "ue5.functions": ["ue5.objects", "ue5.names"],
     "ue5.object-find": ["ue5.objects"],
@@ -419,6 +451,18 @@
     "buff.stackCount": 668,
     "ftext.textData": 0,
     "ftextData.textSource": 32,
+    "ftextData.displayStringGetter": 40,
+    "ftextData.sharedDisplayStringGetter": 48,
+    "ftextData.sharedDisplayString": 48,
+    "ftextData.stringTableReference": 24,
+    "ftextStringTableReference.tableId": 16,
+    "ftextStringTableReference.keyId": 24,
+    "ftextStringTableReference.cachedDisplayString": 48,
+    "sharedString.value": 8,
+    "stringTable.entries": 32,
+    "stringTableEntry.sourceString": 16,
+    "stringTable.mapElementStride": 32,
+    "stringTable.mapValue": 8,
     "fstring.data": 0,
     "fstring.count": 8,
     "fstring.capacity": 12,

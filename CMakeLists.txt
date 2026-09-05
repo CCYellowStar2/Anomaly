@@ -378,12 +378,17 @@ target_compile_options(anomaly_symbol_resolver PRIVATE /W4 /permissive- /EHsc)
 target_link_libraries(
     anomaly_symbol_resolver PUBLIC anomaly_build_profile anomaly_internal_memory_services)
 
+add_library(anomaly_ue5_ftext STATIC src/game/ue5/ue5_ftext.cpp)
+target_include_directories(anomaly_ue5_ftext PUBLIC include)
+target_compile_options(anomaly_ue5_ftext PRIVATE /W4 /permissive- /EHsc)
+target_link_libraries(anomaly_ue5_ftext PUBLIC anomaly_symbol_resolver)
+
 add_library(anomaly_ue5_reflection_query STATIC src/game/ue5/ue5_reflection_query.cpp)
 target_include_directories(anomaly_ue5_reflection_query PUBLIC include)
 target_compile_definitions(
     anomaly_ue5_reflection_query PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 target_compile_options(anomaly_ue5_reflection_query PRIVATE /W4 /permissive- /EHsc)
-target_link_libraries(anomaly_ue5_reflection_query PUBLIC anomaly_symbol_resolver)
+target_link_libraries(anomaly_ue5_reflection_query PUBLIC anomaly_symbol_resolver anomaly_ue5_ftext)
 
 add_library(anomaly_ue5_network_profile STATIC src/game/ue5/ue5_network_profile.cpp)
 target_include_directories(anomaly_ue5_network_profile PUBLIC include)
@@ -411,7 +416,7 @@ target_compile_definitions(
 target_compile_options(anomaly_adapter_services PRIVATE /W4 /permissive- /EHsc)
 target_link_libraries(
     anomaly_adapter_services
-    PUBLIC anomaly_symbol_resolver anomaly_hook_manager anomaly_minhook_backend)
+    PUBLIC anomaly_symbol_resolver anomaly_hook_manager anomaly_minhook_backend anomaly_ue5_ftext)
 
 add_library(anomaly_websocket_server STATIC src/platform/windows/websocket_server.cpp)
 target_include_directories(anomaly_websocket_server PUBLIC include)

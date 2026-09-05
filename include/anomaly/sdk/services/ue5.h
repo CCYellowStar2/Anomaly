@@ -86,8 +86,8 @@ typedef struct AnomalyUe5NamesServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *resolve_utf8)(void* user, uint32_t name_id, char* destination, size_t* inout_size);
     // Resolves an in-process UE FText value to UTF-8. The address is valid only
     // for the current Game-thread snapshot and is never retained by the Host.
-    // Reads Profile-supported source text only. Unsupported or unavailable
-    // text history returns NOT_FOUND; the Host does not materialize it via UE.
+    // Reads Profile-validated cached display text or loaded string-table source
+    // text. Unsupported history returns NOT_FOUND; no UE text function is called.
     AnomalyStatusV1 (ANOMALY_CALL *resolve_ftext_utf8)(
         void* user, uintptr_t ftext_address, char* destination, size_t* inout_size);
 } AnomalyUe5NamesServiceV1;

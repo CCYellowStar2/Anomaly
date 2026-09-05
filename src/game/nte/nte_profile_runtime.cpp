@@ -203,7 +203,6 @@ FeatureValidationResult ValidateCombatReflectionLayout(
         "fstring.capacity", "abilityCharacter.abilitySystemComponent",
         "gameData.abilityDataAsset",
         "abilityData.skillDamageDataTable", "skillDamage.gaName",
-        "gameData.monsterInfoDataTable",
         "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
         "gameData.gameplayEffectTipsDataTable", "gameplayAbilityTips.name",
         "gameplayAbilityTips.gameplayAbility", "gameplayEffectTips.name",
@@ -260,7 +259,6 @@ FeatureValidationResult ValidateCombatReflectionLayout(
     if (!field_fits("gameData.abilityDataAsset", 0x23C0U, 8U) ||
         !field_fits("abilityData.skillDamageDataTable", 0xD58U, 8U) ||
         !field_fits("skillDamage.gaName", 0x78U, 8U) ||
-        !field_fits("gameData.monsterInfoDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.characterDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.gameplayAbilityTipsDataTable", 0x23C0U, 8U) ||
         !field_fits("gameData.gameplayEffectTipsDataTable", 0x23C0U, 8U) ||

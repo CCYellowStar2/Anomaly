@@ -111,10 +111,14 @@ callback 内允许使用自身 handle 调用 `unsubscribe`。这种 self-unsubsc
 typedef struct AnomalyUe5NamesServiceV1 {
     uint32_t struct_size; uint32_t service_version; void* user;
     AnomalyStatusV1 (ANOMALY_CALL *resolve_utf8)(void* user, uint32_t name_id, char* destination, size_t* inout_size);
+    AnomalyStatusV1 (ANOMALY_CALL *resolve_ftext_utf8)(
+        void* user, uintptr_t ftext_address, char* destination, size_t* inout_size);
 } AnomalyUe5NamesServiceV1;
 ```
 
 把 `FName` 的 `name_id` 解码为 UTF-8 字符串（两段式缓冲）。
+
+`resolve_ftext_utf8` 接受当前 Game 快照中有效的 `FText` 地址，需要可选的 `ue5.ftext` 布局校验通过。它优先复制已有的本地化显示文字；对于文本表引用，尚无显示缓存时读取已加载文本表的源文字，源文字不保证与当前语言的翻译一致。该操作不调用 UE 文本函数、不加载资源、不重建文本历史，也不保留输入地址。未知类型、无效字符串或未加载的文本表返回 `NOT_FOUND`；普通 `FName` 解析独立可用。
 
 ## `anomaly.ue5.objects`
 

@@ -1,4 +1,5 @@
 #include "anomaly/ue5_reflection_query.hpp"
+#include "anomaly/ue5_ftext.hpp"
 
 #include <Windows.h>
 
@@ -307,52 +308,7 @@ public:
     }
 
     [[nodiscard]] std::string ResolveFText(const std::uintptr_t address) const noexcept {
-        const auto text_data_offset = Layout(profile_, "ftext.textData").value_or(0);
-        const auto data_offset = Layout(profile_, "fstring.data").value_or(0);
-        const auto count_offset = Layout(profile_, "fstring.count").value_or(8);
-        const auto capacity_offset = Layout(profile_, "fstring.capacity").value_or(12);
-        std::uintptr_t text_data{};
-        if (address == 0 || !ReadValue(memory_, address + static_cast<std::uintptr_t>(text_data_offset), text_data) || text_data == 0) {
-            return {};
-        }
-        std::string value;
-        const auto configured_source = Layout(profile_, "ftextData.textSource");
-        const auto try_source = [&](const std::int64_t source_offset) {
-            if (source_offset < 0) return false;
-            const auto source = text_data + static_cast<std::uintptr_t>(source_offset);
-            std::uintptr_t data{};
-            std::int32_t count{};
-            std::int32_t capacity{};
-            if (!ReadValue(memory_, source + static_cast<std::uintptr_t>(data_offset), data) ||
-                !ReadValue(memory_, source + static_cast<std::uintptr_t>(count_offset), count) ||
-                !ReadValue(memory_, source + static_cast<std::uintptr_t>(capacity_offset), capacity) ||
-                data == 0 || count <= 0 || count > 4096 || capacity < count || capacity > 8192) {
-                return false;
-            }
-            std::vector<wchar_t> wide(static_cast<std::size_t>(count));
-            if (!memory_.Read(data, wide.data(), wide.size() * sizeof(wchar_t))) return false;
-            if (!wide.empty() && wide.back() == L'\0') wide.pop_back();
-            if (wide.empty()) return false;
-            const int required = WideCharToMultiByte(
-                CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), static_cast<int>(wide.size()),
-                nullptr, 0, nullptr, nullptr);
-            if (required <= 0) return false;
-            std::string result(static_cast<std::size_t>(required), '\0');
-            if (WideCharToMultiByte(
-                    CP_UTF8, WC_ERR_INVALID_CHARS, wide.data(), static_cast<int>(wide.size()),
-                    result.data(), required, nullptr, nullptr) == required) {
-                value = std::move(result);
-                return true;
-            }
-            return false;
-        };
-        if (configured_source && try_source(*configured_source)) return value;
-        if (!configured_source) {
-            for (const auto source_offset : {40LL, 48LL, 24LL, 16LL, 0LL, 56LL}) {
-                if (try_source(source_offset)) return value;
-            }
-        }
-        return {};
+        return ReadUe5FTextUtf8(profile_, resolution_, memory_, address);
     }
 
 private:

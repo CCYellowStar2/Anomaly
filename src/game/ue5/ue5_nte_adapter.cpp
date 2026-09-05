@@ -1,5 +1,7 @@
 #include "anomaly/ue5_nte_adapter.hpp"
 #include "anomaly/nte_damage_capture.hpp"
+#include "anomaly/nte_monster_names.hpp"
+#include "anomaly/ue5_ftext.hpp"
 #include "anomaly/thread_local_value.hpp"
 
 #include <algorithm>
@@ -1588,7 +1590,6 @@ struct Ue5NteAdapter::State {
                  "fstring.capacity", "abilityCharacter.abilitySystemComponent",
                  "gameData.abilityDataAsset",
                  "abilityData.skillDamageDataTable", "skillDamage.gaName",
-                 "gameData.monsterInfoDataTable",
                  "gameData.characterDataTable", "gameData.gameplayAbilityTipsDataTable",
                  "gameData.gameplayEffectTipsDataTable", "gameplayAbilityTips.name",
                  "gameplayAbilityTips.gameplayAbility", "gameplayEffectTips.name",
@@ -2810,7 +2811,7 @@ struct Ue5NteAdapter::State {
                 continue;
             }
             if (BuildDisplayTableIndexLocked(
-                    table, text_offset, -1, true,
+                    table, "TextName", text_offset, -1, true,
                     scene_monster_table_indexes[built])) {
                 ++built;
             }
@@ -2823,7 +2824,8 @@ struct Ue5NteAdapter::State {
     [[nodiscard]] bool ResolveMonsterNameFromSceneTablesLocked(
         const std::uint64_t key,
         const std::string_view supplied_key_text,
-        std::string& value) noexcept {
+        std::string& value,
+        const bool base_only = false) noexcept {
         value.clear();
         if (!EnsureSceneMonsterTableIndexLocked()) return false;
         std::string normalized(supplied_key_text);
@@ -2842,7 +2844,7 @@ struct Ue5NteAdapter::State {
                 AddAddress(row, index.text_offset, ftext_address) &&
                 ResolveFTextLocked(ftext_address, value) && !value.empty();
         };
-        for (std::size_t index{}; index < scene_monster_table_count; ++index) {
+        for (std::size_t index{}; !base_only && index < scene_monster_table_count; ++index) {
             const auto& table_index = scene_monster_table_indexes[index];
             if (table_index.rows_by_fname.empty()) continue;
             std::uintptr_t row{};
@@ -2868,8 +2870,38 @@ struct Ue5NteAdapter::State {
                 }
             }
         }
+        if (!base_only) return false;
+        const auto base_identity = NteMonsterBaseIdentity(identity);
+        if (!base_identity.empty() && base_identity != identity) {
+            std::string fallback;
+            std::unordered_set<std::uintptr_t> visited;
+            for (std::size_t index{}; index < scene_monster_table_count; ++index) {
+                const auto& table_index = scene_monster_table_indexes[index];
+                for (const auto& [candidate, row] : table_index.rows_by_key) {
+                    if (MonsterDisplayIdentity(candidate) != base_identity ||
+                        !visited.insert(row).second || !try_row(table_index, row)) continue;
+                    if (!MergeNteMonsterFallbackName(fallback, value)) {
+                        value.clear();
+                        return false;
+                    }
+                }
+            }
+            value = std::move(fallback);
+            return !value.empty();
+        }
         value.clear();
         return false;
+    }
+
+    [[nodiscard]] bool ResolveMonsterNameWithFallbackLocked(
+        const std::uint64_t key, const std::string_view key_text, std::string& value) {
+        if (ResolveMonsterNameFromSceneTablesLocked(key, key_text, value) ||
+            ResolveActorMonsterNameLocked(key_text, value)) return true;
+        const auto abyss_key = AbyssStringTableMonsterKey(key_text);
+        if (!abyss_key.empty() && ResolveAbyssStringTableEntryLocked(abyss_key, value)) return true;
+        // A specific text-table entry takes precedence over a broad scene alias.
+        return ResolveMonsterNameFromSceneTablesLocked(key, key_text, value, true) ||
+            ResolveActorMonsterNameLocked(key_text, value, true);
     }
 
     [[nodiscard]] bool ResolveMonsterStaticDataNameLocked(
@@ -3790,7 +3822,7 @@ struct Ue5NteAdapter::State {
     }
 
     void ResolveNextCombatParticipantNameLocked() noexcept {
-        if ((display_table_loaded_mask & 0x03U) != 0x03U ||
+        if ((display_table_loaded_mask & 0x01U) == 0 ||
             pending_combat_participant_names.empty()) {
             return;
         }
@@ -3825,39 +3857,12 @@ struct Ue5NteAdapter::State {
             if (!pending.player_participant) {
                 for (std::size_t index{}; index < pending.key_count; ++index) {
                     std::string value;
-                    if (ResolveDisplayNameFromTableLocked(
-                            1U, pending.keys[index], pending.key_texts[index], value) &&
-                        !value.empty()) {
-                        combat_participant_names.emplace(
-                            pending.participant.id, std::move(value));
-                        return;
-                    }
-                    if (ResolveMonsterNameFromSceneTablesLocked(
+                    if (ResolveMonsterNameWithFallbackLocked(
                             pending.keys[index], pending.key_texts[index], value) &&
                         !value.empty()) {
                         combat_participant_names.emplace(
                             pending.participant.id, std::move(value));
                         return;
-                    }
-                    if (!pending.key_texts[index].empty()) {
-                        const auto string_key =
-                            StringTableMonsterNameKey(pending.key_texts[index]);
-                        if (!string_key.empty() &&
-                            ResolveStringTableEntryLocked(string_key, value) &&
-                            !value.empty()) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
-                        const auto abyss_key =
-                            AbyssStringTableMonsterKey(pending.key_texts[index]);
-                        if (!abyss_key.empty() &&
-                            ResolveAbyssStringTableEntryLocked(abyss_key, value) &&
-                            !value.empty()) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
                     }
                 }
             }
@@ -3919,32 +3924,8 @@ struct Ue5NteAdapter::State {
                         AppendParticipantNameCandidate(
                             pending, class_key, class_text);
                         std::string value;
-                        if (ResolveDisplayNameFromTableLocked(
-                                1, class_key, class_text, value) &&
-                            !value.empty()) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
-                        if (ResolveMonsterNameFromSceneTablesLocked(
+                        if (ResolveMonsterNameWithFallbackLocked(
                                 class_key, class_text, value) &&
-                            !value.empty()) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
-                        const auto string_key =
-                            StringTableMonsterNameKey(class_text);
-                        if (!string_key.empty() &&
-                            ResolveStringTableEntryLocked(string_key, value) &&
-                            !value.empty()) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
-                        const auto abyss_key = AbyssStringTableMonsterKey(class_text);
-                        if (!abyss_key.empty() &&
-                            ResolveAbyssStringTableEntryLocked(abyss_key, value) &&
                             !value.empty()) {
                             combat_participant_names.emplace(
                                 pending.participant.id, std::move(value));
@@ -3975,29 +3956,9 @@ struct Ue5NteAdapter::State {
                         AppendParticipantNameCandidate(
                             pending, config_key, config_text);
                         std::string value;
-                        if (ResolveDisplayNameFromTableLocked(
-                                1, config_key, config_text, value)) {
-                            combat_participant_names.emplace(
-                                pending.participant.id, std::move(value));
-                            return;
-                        }
                         if (!config_text.empty()) {
-                            const auto string_key =
-                                StringTableMonsterNameKey(config_text);
-                            if (!string_key.empty() &&
-                                ResolveStringTableEntryLocked(
-                                    string_key, value) &&
-                                !value.empty()) {
-                                combat_participant_names.emplace(
-                                    pending.participant.id,
-                                    std::move(value));
-                                return;
-                            }
-                            const auto abyss_key =
-                                AbyssStringTableMonsterKey(config_text);
-                            if (!abyss_key.empty() &&
-                                ResolveAbyssStringTableEntryLocked(
-                                    abyss_key, value) &&
+                            if (ResolveMonsterNameWithFallbackLocked(
+                                    config_key, config_text, value) &&
                                 !value.empty()) {
                                 combat_participant_names.emplace(
                                     pending.participant.id,
@@ -4209,6 +4170,7 @@ struct Ue5NteAdapter::State {
 
     [[nodiscard]] bool BuildDisplayTableIndexLocked(
         const std::uintptr_t table,
+        const std::string_view text_property,
         const std::int64_t text_offset,
         const std::int64_t alias_offset,
         const bool add_monster_identity_alias,
@@ -4217,6 +4179,13 @@ struct Ue5NteAdapter::State {
         if (index.table == table && index.text_offset == text_offset &&
             !index.rows_by_fname.empty()) {
             return true;
+        }
+        std::uintptr_t row_struct{};
+        if (text_offset > (std::numeric_limits<std::int32_t>::max)() ||
+            !ReadPointerAt(*memory, table, Layout(profile, "dataTable.rowStruct", -1), row_struct) ||
+            !ValidateStructFieldLocked(row_struct,
+                {text_property, "TextProperty", {}, static_cast<std::int32_t>(text_offset), 16}, true)) {
+            return false;
         }
         const auto row_map_offset = Layout(profile, "dataTable.rowMap", -1);
         SparseMapView map;
@@ -4442,29 +4411,7 @@ struct Ue5NteAdapter::State {
 
     [[nodiscard]] static std::string MonsterDisplayIdentity(
         const std::string_view source) {
-        std::string identity(source);
-        if (identity.starts_with("Default__")) identity.erase(0, 9U);
-        if (identity.ends_with("_C")) identity.resize(identity.size() - 2U);
-        for (char& value : identity) {
-            if (value >= 'A' && value <= 'Z') {
-                value = static_cast<char>(value - 'A' + 'a');
-            }
-        }
-        const auto blueprint_marker = identity.find("_bp_");
-        if (blueprint_marker != std::string::npos) {
-            identity.resize(blueprint_marker);
-            return identity;
-        }
-        // Data-table rows may use a short variant suffix (for example
-        // Boss_07_Abyss) while the live class carries a BP suffix. Keep the
-        // shared runtime prefix as the identity in that representation too.
-        const auto first_separator = identity.find('_');
-        if (first_separator == std::string::npos) return {};
-        const auto second_separator = identity.find('_', first_separator + 1U);
-        if (second_separator != std::string::npos) {
-            identity.resize(second_separator);
-        }
-        return identity;
+        return NteMonsterDisplayIdentity(source);
     }
 
     [[nodiscard]] static bool MonsterIdentityMatches(
@@ -4474,13 +4421,13 @@ struct Ue5NteAdapter::State {
         return MonsterDisplayIdentity(candidate) == identity;
     }
 
-    [[nodiscard]] static std::string StringTableMonsterNameKey(
-        const std::string_view source) {
-        const auto identity = MonsterDisplayIdentity(source);
-        if (identity.empty() || identity.size() > 64) return {};
-        std::string key(identity);
-        key += "_Name";
-        return key;
+    [[nodiscard]] bool ResolveActorMonsterNameLocked(
+        const std::string_view source, std::string& value, const bool base_only = false) const {
+        value.clear();
+        for (const auto& key : NteMonsterStringTableKeys(source, base_only)) {
+            if (ResolveStringTableEntryLocked(key, value) && !value.empty()) return true;
+        }
+        return false;
     }
 
     [[nodiscard]] static std::string AbyssStringTableMonsterKey(
@@ -4701,23 +4648,24 @@ struct Ue5NteAdapter::State {
             }
             if (display_game_data == 0 && !ResolveGameDataLocked(display_game_data)) return;
             struct TableSpec {
+                std::size_t slot;
                 std::string_view table_key;
+                std::string_view text_property;
                 std::string_view text_key;
                 std::string_view alias_key;
                 std::int64_t alias_additional{};
                 std::uint8_t bit;
             };
             static constexpr std::array specs{
-                TableSpec{"gameData.characterDataTable", "staticItemData.itemName",
+                TableSpec{0, "gameData.characterDataTable", "ItemName", "staticItemData.itemName",
                     {}, 0, 0x01U},
-                TableSpec{"gameData.monsterInfoDataTable", "monsterData.textName", {}, 0, 0x02U},
-                TableSpec{"gameData.gameplayAbilityTipsDataTable", "gameplayAbilityTips.name",
+                // Slot 1 was an icon-only StaticMonsterInfo table, not a name source.
+                TableSpec{2, "gameData.gameplayAbilityTipsDataTable", "Name", "gameplayAbilityTips.name",
                     "gameplayAbilityTips.gameplayAbility", 24, 0x04U},
-                TableSpec{"gameData.gameplayEffectTipsDataTable", "gameplayEffectTips.name",
+                TableSpec{3, "gameData.gameplayEffectTipsDataTable", "Name", "gameplayEffectTips.name",
                     "gameplayEffectTips.geParamName", 0, 0x08U},
             };
-            for (std::size_t index{}; index < specs.size(); ++index) {
-                const auto& spec = specs[index];
+            for (const auto& spec : specs) {
                 if ((display_table_loaded_mask & spec.bit) != 0) continue;
                 std::uintptr_t table{};
                 const auto table_offset = Layout(profile, spec.table_key, -1);
@@ -4729,9 +4677,8 @@ struct Ue5NteAdapter::State {
                     !ReadPointerAt(*memory, display_game_data, table_offset, table) ||
                     table == 0 ||
                     !BuildDisplayTableIndexLocked(
-                        table, Layout(profile, spec.text_key, -1), alias_offset,
-                        index == 1U,
-                        display_table_indexes[index])) {
+                        table, spec.text_property, Layout(profile, spec.text_key, -1), alias_offset,
+                        false, display_table_indexes[spec.slot])) {
                     continue;
                 }
                 display_table_loaded_mask |= spec.bit;
@@ -4751,7 +4698,7 @@ struct Ue5NteAdapter::State {
                     display_table_loaded_mask |= 0x10U;
                 }
             }
-            display_table_scan_complete = display_table_loaded_mask == 0x1FU;
+            display_table_scan_complete = display_table_loaded_mask == 0x1DU;
         } catch (...) {
         }
     }
@@ -6221,40 +6168,8 @@ struct Ue5NteAdapter::State {
     [[nodiscard]] bool ResolveFTextBytesLocked(
         const std::array<std::uint8_t, 16>& ftext_bytes,
         std::string& value) const {
-        value.clear();
-        const auto data_offset = Layout(profile, "ftext.textData", -1);
-        const auto source_offset = Layout(profile, "ftextData.textSource", -1);
-        std::uintptr_t text_data{};
-        if (data_offset < 0 || source_offset < 0 ||
-            !ReadCaptureBytes(ftext_bytes, data_offset, text_data)) {
-            return false;
-        }
-        std::uintptr_t source{};
-        std::uintptr_t data_address{};
-        std::uintptr_t count_address{};
-        std::uintptr_t capacity_address{};
-        NativeUtf16StringHeader native;
-        if (!AddAddress(text_data, source_offset, source) ||
-            !AddAddress(source, Layout(profile, "fstring.data", 0), data_address) ||
-            !AddAddress(source, Layout(profile, "fstring.count", 8), count_address) ||
-            !AddAddress(source, Layout(profile, "fstring.capacity", 12), capacity_address) ||
-            !ReadValue(*memory, data_address, native.data) ||
-            !ReadValue(*memory, count_address, native.count) ||
-            !ReadValue(*memory, capacity_address, native.capacity)) {
-            return false;
-        }
-        // A readable FText header does not establish an engine-owned ITextData
-        // object. Never materialize unverified history through ProcessEvent.
-        if (!DecodeUtf16StringLocked(native, value) || value.empty()) return false;
-        // History storage has been observed to resemble a string header. Do not
-        // cache binary control bytes as a successfully resolved display name.
-        if (std::any_of(value.begin(), value.end(), [](const unsigned char ch) {
-                return (ch < 0x20 && ch != '\t' && ch != '\n' && ch != '\r') || ch == 0x7F;
-            })) {
-            value.clear();
-            return false;
-        }
-        return true;
+        value = ReadUe5FTextUtf8(profile, resolution, *memory, ftext_bytes);
+        return !value.empty();
     }
 
     [[nodiscard]] bool EnsureRegisteredStringTablesBindingLocked() const noexcept {

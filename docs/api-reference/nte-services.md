@@ -454,8 +454,18 @@ typedef struct AnomalyNteCombatServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *statistics)(void*, const AnomalyNteCombatStatisticsRequestV1*, AnomalyNteCombatStatisticsV1*);
     AnomalyStatusV1 (ANOMALY_CALL *source_name_utf8)(void*, uint64_t, char*, size_t*);
     AnomalyStatusV1 (ANOMALY_CALL *participant_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
+    uint64_t (ANOMALY_CALL *latest_event_sequence)(void*);
+    AnomalyStatusV1 (ANOMALY_CALL *next_event)(void*, uint64_t, AnomalyNteCombatEventV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *event_name_utf8)(void*, const AnomalyNteCombatEventV1*, char*, size_t*);
+    AnomalyStatusV1 (ANOMALY_CALL *participant_display_name_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
 } AnomalyNteCombatServiceV1;
 ```
+
+`latest_event_sequence` / `next_event` 提供包含伤害、治疗和 Buff 的战斗事件流。`event_name_utf8` 返回事件的显示名称，`participant_display_name_utf8` 返回参与者的显示名称，与 `source_name_utf8` / `participant_path_utf8` 的来源标识和对象路径不同。显示名称在 Game 更新中延后补全；合法请求尚无缓存名称时返回 `NOT_FOUND`。名称缺失不影响伤害事件和数值，消费端应保留记录并显示路径、编号或占位符，随后在 Game 更新中适度重试名称查询。访问追加到 v1 服务表尾部的接口前，应检查 `struct_size` 是否覆盖对应字段。
+
+怪物名称优先匹配具体场景条目和专属文本键，失败后再尝试基础名称。文本键兼容 `_BP` / 场景后缀、编号补零及 `_Name` / `_name` 差异，同时保留变体编号和专属名称的优先级；多个场景条目给出不同基础名称时，不采用该场景基础名称回退。数据表名称字段必须通过 `TextProperty` 类型、大小和偏移校验，图标表不作为名称来源。
+
+FText 解码遵循 [UE5 名称服务](ue5-services.md) 的可选 `ue5.ftext` 校验与只读规则，读取已有显示缓存或已加载文本表的源文字，不调用 `Conv_TextToString`。完整名称查找仍保留角色 ID、怪物静态数据及文本表引用的已验证反射查询，因此不能把整个名称查找流程视为纯内存读取。
 
 消费端应在 Game 域 `on_update` 中查询 combat 服务：先比较 `latest_damage_sequence`，只在序列变化时有界调用 `next_damage_event`，并在接纳新事件时各解析一次 source、attacker 和 victim。HP、统计和解析结果应立即转换为插件自有、可直接绘制的不可变快照。Render 域 `on_draw` 只复制该本地快照并调用 UI 服务，不查询 combat 服务、不推进 cursor，也不解析名称。完整消费边界见 [`examples/nte_combat_demo`](../../examples/nte_combat_demo/plugin.cpp)。
 
@@ -500,7 +510,7 @@ typedef struct AnomalyNteSkillPageResultV1 {
 
 `frame` 固定当前不可变技能帧，`snapshot_at` 和 `page` 只访问 Host cache。分页首请求可使用 generation 0，后续请求必须回传结果 generation；技能重排保持同一组 spec identity 的 handle，技能移除、重新授予、角色 / World 切换或 spec identity 改变会产生新 generation，使旧 handle 返回 `NOT_FOUND`。
 
-skill handle 是宿主生成的 opaque identity，不等于 `FGameplayAbilitySpecHandle`。`ability_class` 同样是 generation handle，只能传给 `ability_path_utf8`，不能解释为 UE 地址。v1 已发布 level、input、active / input-pressed / remove 状态；冷却标签形状尚未独立验证，因此当前技能带 `PARTIAL` 且不带 `COOLDOWN_VALID`，两个冷却浮点字段为 0。
+skill handle 是宿主生成的 opaque identity，不等于 `FGameplayAbilitySpecHandle`。`ability_class` 同样是 generation handle，可传给 `ability_path_utf8` 和 `ability_display_name_utf8`，不能解释为 UE 地址。v1 已发布 level、input、active / input-pressed / remove 状态；冷却标签形状尚未独立验证，因此当前技能带 `PARTIAL` 且不带 `COOLDOWN_VALID`，两个冷却浮点字段为 0。
 
 ```c
 typedef struct AnomalyNteSkillsServiceV1 {
@@ -510,8 +520,11 @@ typedef struct AnomalyNteSkillsServiceV1 {
     AnomalyStatusV1 (ANOMALY_CALL *page)(void*, const AnomalyNteSkillPageRequestV1*, AnomalyNteSkillSnapshotV1*, AnomalyNteSkillPageResultV1*);
     AnomalyStatusV1 (ANOMALY_CALL *ability_path_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
     AnomalyStatusV1 (ANOMALY_CALL *snapshot_by_handle)(void*, AnomalyGenerationHandleV1, AnomalyNteSkillSnapshotV1*);
+    AnomalyStatusV1 (ANOMALY_CALL *ability_display_name_utf8)(void*, AnomalyGenerationHandleV1, char*, size_t*);
 } AnomalyNteSkillsServiceV1;
 ```
+
+`ability_display_name_utf8` 返回当前技能类的缓存显示名称，尚未解析时返回 `NOT_FOUND`。名称不可用不表示技能无效；消费端可先显示路径短名或技能编号，并依据当前技能快照及激活服务状态决定是否提供激活操作。该接口同样需要检查服务表的 `struct_size`。
 
 ---
 
