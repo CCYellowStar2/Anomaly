@@ -8,6 +8,7 @@
 #include <chrono>
 #include <charconv>
 #include <cmath>
+#include <cwchar>
 #include <cstring>
 #include <cstdlib>
 #include <filesystem>
@@ -45,6 +46,53 @@ std::pair<std::string_view, std::string_view> Shift(std::string_view value) {
     return {value.substr(0, split), Trim(value.substr(split + 1))};
 }
 
+std::filesystem::path AbsolutePluginRoot(
+    const AnalyzerConfig& config, const std::filesystem::path& root) {
+    const auto configured = config.plugin_directory.is_absolute()
+        ? config.plugin_directory : root / config.plugin_directory;
+    std::error_code error;
+    auto normalized = std::filesystem::weakly_canonical(configured, error);
+    if (error) {
+        normalized = std::filesystem::absolute(configured, error);
+    }
+    return error ? configured.lexically_normal() : normalized.lexically_normal();
+}
+
+bool StartsWithPathInsensitive(std::wstring_view value, const std::wstring& prefix) {
+    if (prefix.empty() || prefix.size() > value.size()) return false;
+    if (_wcsnicmp(value.data(), prefix.c_str(), prefix.size()) != 0) return false;
+    return value.size() == prefix.size() ||
+        value[prefix.size()] == L'\\' || value[prefix.size()] == L'/';
+}
+
+bool AddressIntersectsPluginModule(
+    const anomaly::CoreMemoryServices& services,
+    const std::filesystem::path& root,
+    const AnalyzerConfig& config,
+    const std::uintptr_t address,
+    const std::size_t size) {
+    if (services.memory == nullptr || size == 0) return false;
+    const auto modules = services.memory->EnumerateModules();
+    if (modules.empty()) return false;
+    const std::wstring plugin_root = AbsolutePluginRoot(config, root).wstring();
+    const auto end = address + size;
+    for (const auto& module : modules) {
+        if (!StartsWithPathInsensitive(module.path, plugin_root)) continue;
+        if (module.base > (std::numeric_limits<std::uintptr_t>::max)() - module.size) {
+            continue;
+        }
+        const auto module_end = module.base + module.size;
+        if (address < module_end && module.base < end) return true;
+    }
+    return false;
+}
+
+bool IsPluginModule(
+    const ue5mem::ModuleInfo& module, const std::filesystem::path& root,
+    const AnalyzerConfig& config) {
+    const std::wstring plugin_root = AbsolutePluginRoot(config, root).wstring();
+    return StartsWithPathInsensitive(module.path, plugin_root);
+}
 std::wstring WideUtf8(std::string_view value) {
     if (value.empty() || value == ".") return {};
     const int size = MultiByteToWideChar(
@@ -351,6 +399,9 @@ std::string Analyzer::ScanJson(
     std::string_view pattern_text) const {
     const auto module = memory_services_.memory->FindModule(module_name);
     if (!module) return Error("module not found");
+    if (IsPluginModule(*module, root_, config_)) {
+        return Error("plugin module is not readable through diagnostics");
+    }
     try {
         const auto pattern = memory_services_.patterns->Parse(pattern_text);
         const auto matches = memory_services_.patterns->ScanSection(
@@ -375,6 +426,9 @@ std::string Analyzer::XrefsJson(
     std::uintptr_t target) const {
     const auto module = memory_services_.memory->FindModule(module_name);
     if (!module) return Error("module not found");
+    if (IsPluginModule(*module, root_, config_)) {
+        return Error("plugin module is not readable through diagnostics");
+    }
 
     constexpr std::size_t chunk_size = 1024 * 1024;
     constexpr std::size_t overlap = 15;
@@ -508,20 +562,30 @@ std::string Analyzer::Execute(std::string_view command_line) const {
         if (!address || !size || *size > kMaximumReadBytes) {
             return Error("usage: read <address> <size<=1048576>");
         }
+        const auto target = static_cast<std::uintptr_t>(*address);
+        const auto byte_count = static_cast<std::size_t>(*size);
+        if (target > (std::numeric_limits<std::uintptr_t>::max)() - byte_count ||
+            AddressIntersectsPluginModule(memory_services_, root_, config_, target, byte_count)) {
+            return Error("plugin memory is not readable through diagnostics");
+        }
         return ReadJson(
             *memory_services_.memory,
-            static_cast<std::uintptr_t>(*address),
-            static_cast<std::size_t>(*size));
+            target, byte_count);
     }
     if (command == "write" || command == "patch") {
         const auto [address_text, bytes_text] = Shift(arguments);
         const auto address = ParseInteger(address_text);
         const auto bytes = ParseHexBytes(bytes_text);
         if (!address || !bytes) return Error("usage: write|patch <address> <hex bytes>");
+        const auto target = static_cast<std::uintptr_t>(*address);
+        if (target > (std::numeric_limits<std::uintptr_t>::max)() - bytes->size() ||
+            AddressIntersectsPluginModule(
+                memory_services_, root_, config_, target, bytes->size())) {
+            return Error("plugin memory is not writable through diagnostics");
+        }
         return MutationJson(
             *memory_services_.memory,
-            static_cast<std::uintptr_t>(*address),
-            *bytes,
+            target, *bytes,
             command == "patch");
     }
     if (command == "protect") {
@@ -533,13 +597,19 @@ std::string Analyzer::Execute(std::string_view command_line) const {
         if (!address || !size || !protection) {
             return Error("usage: protect <address> <size> <r|rw|x|rx|rwx>");
         }
+        const auto target = static_cast<std::uintptr_t>(*address);
+        const auto byte_count = static_cast<std::size_t>(*size);
+        if (target > (std::numeric_limits<std::uintptr_t>::max)() - byte_count ||
+            AddressIntersectsPluginModule(memory_services_, root_, config_, target, byte_count)) {
+            return Error("plugin memory is not modifiable through diagnostics");
+        }
         DWORD previous{};
         if (!memory_services_.memory->ProtectMemory(
-                static_cast<std::uintptr_t>(*address), static_cast<std::size_t>(*size),
+                target, byte_count,
                 *protection, previous)) {
             return Error("VirtualProtect failed");
         }
-        return Ok("\"address\":" + json::Hex(static_cast<std::uintptr_t>(*address)) +
+        return Ok("\"address\":" + json::Hex(target) +
                   ",\"previous\":" + std::to_string(previous) +
                   ",\"protection\":" + std::to_string(*protection));
     }
@@ -578,20 +648,30 @@ std::string Analyzer::Execute(std::string_view command_line) const {
             offsets.push_back(static_cast<std::ptrdiff_t>(*offset));
             remaining = next;
         }
+        const auto base_address = static_cast<std::uintptr_t>(*base);
+        if (AddressIntersectsPluginModule(
+                memory_services_, root_, config_, base_address, sizeof(std::uintptr_t))) {
+            return Error("plugin memory is not readable through diagnostics");
+        }
         const auto result = memory_services_.memory->ResolvePointerChain(
-            static_cast<std::uintptr_t>(*base), offsets.data(), offsets.size());
+            base_address, offsets.data(), offsets.size());
         return result ? Ok("\"address\":" + json::Hex(*result))
                       : Error("pointer chain could not be resolved");
     }
     if (command == "ptr") {
         const auto address = ParseInteger(arguments);
         if (!address) return Error("usage: ptr <address>");
+        const auto target = static_cast<std::uintptr_t>(*address);
+        if (AddressIntersectsPluginModule(
+                memory_services_, root_, config_, target, sizeof(std::uintptr_t))) {
+            return Error("plugin memory is not readable through diagnostics");
+        }
         const auto bytes = memory_services_.memory->ReadMemory(
-            static_cast<std::uintptr_t>(*address), sizeof(std::uintptr_t));
+            target, sizeof(std::uintptr_t));
         if (!bytes) return Error("address is unreadable");
         std::uintptr_t pointer{};
         std::memcpy(&pointer, bytes->data(), sizeof(pointer));
-        return Ok("\"address\":" + json::Hex(static_cast<std::uintptr_t>(*address)) +
+        return Ok("\"address\":" + json::Hex(target) +
                   ",\"pointer\":" + json::Hex(pointer));
     }
     if (command == "rip") {
@@ -601,11 +681,22 @@ std::string Analyzer::Execute(std::string_view command_line) const {
         const auto offset = ParseInteger(offset_text);
         const auto size = ParseInteger(size_text);
         if (!instruction || !offset || !size) return Error("usage: rip <instruction> <disp_offset> <instruction_size>");
+        const auto instruction_address = static_cast<std::uintptr_t>(*instruction);
+        const auto instruction_size = static_cast<std::size_t>(*size);
+        if (instruction_address > (std::numeric_limits<std::uintptr_t>::max)() - instruction_size ||
+            AddressIntersectsPluginModule(
+                memory_services_, root_, config_, instruction_address, instruction_size)) {
+            return Error("plugin memory is not readable through diagnostics");
+        }
         const auto target = memory_services_.memory->ResolveRipRelative(
-            static_cast<std::uintptr_t>(*instruction), static_cast<std::size_t>(*offset),
-            static_cast<std::size_t>(*size), 0);
+            instruction_address, static_cast<std::size_t>(*offset),
+            instruction_size, 0);
         if (!target) return Error("failed to read RIP displacement");
-        std::string payload = "\"instruction\":" + json::Hex(static_cast<std::uintptr_t>(*instruction)) +
+        if (AddressIntersectsPluginModule(
+                memory_services_, root_, config_, *target, sizeof(std::uintptr_t))) {
+            return Error("plugin memory is not readable through diagnostics");
+        }
+        std::string payload = "\"instruction\":" + json::Hex(instruction_address) +
                               ",\"target\":" + json::Hex(*target);
         const auto pointer_bytes = memory_services_.memory->ReadMemory(
             *target, sizeof(std::uintptr_t));
