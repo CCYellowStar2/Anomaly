@@ -5,7 +5,7 @@
   "description": "Customizes the UID displayed by the NTE client without changing account data.",
   "author": "Anomaly",
   "license": "AGPL-3.0-only",
-  "version": "1.1.5",
+  "version": "1.1.9",
   "entry": "plugin.dll",
   "api": {"major": 1, "minMinor": 0, "maxMinor": 0},
   "games": ["nte"],
@@ -14,6 +14,7 @@
   "services": [
     {"id": "anomaly.config", "minVersion": 1},
     {"id": "anomaly.interop.signature", "minVersion": 1},
+    {"id": "anomaly.interop.hook", "minVersion": 1},
     {"id": "anomaly.scheduler", "minVersion": 1},
     {"id": "anomaly.ui", "minVersion": 1, "optional": true},
     {"id": "anomaly.window", "minVersion": 1, "optional": true},
@@ -21,7 +22,7 @@
     {"id": "anomaly.ue5.objects", "minVersion": 1}
   ],
   "capabilities": [
-    "configuration", "interop-signature", "scheduler", "ui", "ui-window",
+    "configuration", "interop-signature", "interop-hook", "scheduler", "ui", "ui-window",
     "ue5-names", "ue5-objects"
   ]
 }

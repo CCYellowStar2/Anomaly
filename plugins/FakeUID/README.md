@@ -1,6 +1,6 @@
 # Custom UID
 
-`Custom UID 1.1.5` 只修改 NTE 左下角 UID 的本地显示文本，不修改账号数据、网络请求或
+`Custom UID 1.1.9` 只修改 NTE 左下角 UID 的本地显示文本，不修改账号数据、网络请求或
 服务器状态。
 
 ## 使用
@@ -36,8 +36,10 @@ Y 坐标。UID 值始终按完整字符串处理，英文、数字、中文和�
 
 ## 生命周期与安全边界
 
-持久化配置会在 RoleID 控件创建并稳定后自动应用；点击 `Apply` 会提高设置 revision，让当前
-控件立即更新。BigMap、HUD 重建、传送和重新登录产生新控件时会重新发现并应用。写入前始终
+启用覆盖后，插件在游戏线程每次更新中持续复核已发现的 `TextBlock_RoleID` 文本；发现原始
+UID、新控件或控件刚完成构造时，会立即通过现有 `SetText` 路径重写，并在写入失败时于
+下一次更新重试。这样不依赖 UE 全局 `ProcessEvent` 订阅，也不会在场景加载调用链中插入
+回调。点击 `Apply` 会提高设置 revision，让当前控件立即更新。BigMap、HUD 重建、传送和重新登录产生新控件时会重新发现并应用。写入前始终
 复核 generation、serial、WidgetTree 和 CanvasPanel；不修改 Visibility，只在读取实时位置后按
 开关改变 CanvasPanelSlot 的 X 坐标并保留 Y 坐标。
 
