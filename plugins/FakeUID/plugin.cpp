@@ -24,6 +24,11 @@
 namespace {
 
 constexpr std::string_view kDefaultDisplayUid = "000000000000";
+// UE's empty FText is not accepted consistently by every cooked
+// UTextBlock/Slate path. A zero-width separator keeps the FText valid while
+// producing no visible glyph, so hiding the label does not depend on the
+// widget accepting a null/empty text payload.
+constexpr std::wstring_view kHiddenPrefixText = L"\u200B";
 constexpr std::size_t kMaximumUidCharacters = 256;
 constexpr std::size_t kMaximumUidUtf8Bytes = kMaximumUidCharacters * 4;
 constexpr std::string_view kSettingsSchemaId = "fake-uid-settings-v2";
@@ -88,7 +93,16 @@ static_assert(sizeof(wchar_t) == 2);
 static_assert(sizeof(UnrealString) == 16);
 static_assert(sizeof(UnrealText) == 16);
 
+struct SetTextHookSnapshot final {
+    std::uint32_t target_name_id{};
+    std::uint32_t prefix_name_id{};
+    std::uintptr_t roleid_outer{};
+    std::uintptr_t roleid_panel{};
+};
+
 using FreeStringFn = void(ANOMALY_CALL*)(void* allocation);
+using AssignStringFn = UnrealString*(ANOMALY_CALL*)(
+    UnrealString* destination, const wchar_t* source);
 using TextToStringFn = UnrealString*(ANOMALY_CALL*)(UnrealString*, const UnrealText*);
 using SetTextFn = void(ANOMALY_CALL*)(void* widget, const UnrealText* text);
 using ProcessEventFn = void(ANOMALY_CALL*)(void* object, void* function, void* parameters);
@@ -165,6 +179,7 @@ struct Context final {
     std::uint32_t text_field_offset{};
     struct RuntimeBindings final {
         std::uintptr_t set_text{};
+        std::uintptr_t assign_string{};
         std::uintptr_t free_string{};
         std::uintptr_t text_to_string{};
         std::uintptr_t gobjects_accessor{};
@@ -172,6 +187,7 @@ struct Context final {
     } runtime_bindings;
     std::string runtime_missing_bindings;
     FreeStringFn free_string{};
+    AssignStringFn assign_string{};
     TextToStringFn text_to_string{};
     SetTextFn set_text{};
     ProcessEventFn process_event{};
@@ -183,10 +199,9 @@ struct Context final {
     AnomalyGenerationHandleV1 set_text_hook{};
     std::uintptr_t set_text_original{};
     std::uintptr_t set_text_target{};
-    UnrealText replacement_text{};
-    std::uint64_t replacement_text_revision{};
+    std::uint64_t text_override_revision{};
     std::uint32_t value_name_id_hint{};
-    std::atomic_bool hook_override_enabled{false};
+    std::atomic<std::shared_ptr<const SetTextHookSnapshot>> text_override;
     bool text_write_binding_diagnostic_emitted{};
     std::uintptr_t set_visibility_function{};
     std::uint64_t set_visibility_generation{};
@@ -220,6 +235,9 @@ struct Context final {
 
 std::atomic<Context*> g_active_context{nullptr};
 std::atomic<std::uintptr_t> g_set_text_original{0};
+std::atomic<const AnomalyHookServiceV1*> g_set_text_hook_api{nullptr};
+std::atomic<std::uint64_t> g_set_text_hook_id{0};
+std::atomic<std::uint64_t> g_set_text_hook_generation{0};
 
 std::uintptr_t ReadObjectOuter(const std::uintptr_t object) noexcept;
 std::uintptr_t ReadWidgetPanel(const std::uintptr_t widget) noexcept;
@@ -712,6 +730,13 @@ bool ReadUnrealText(
     Context& context, const UnrealText* value, std::wstring& text) noexcept;
 bool BuildUnrealText(
     Context& context, const std::wstring_view value, UnrealText& result) noexcept;
+bool IsUsableUnrealText(
+    const UnrealText& value, bool allow_empty = false) noexcept;
+void ReleaseUnrealString(Context& context, UnrealString& value) noexcept;
+bool SetNativeFunctionFlag(
+    std::uintptr_t function, std::uint32_t& previous_flags) noexcept;
+bool RestoreFunctionFlags(
+    std::uintptr_t function, std::uint32_t previous_flags) noexcept;
 bool IsRoleIdValueObject(
     const Context& context, std::uintptr_t object,
     std::uint32_t& name_id) noexcept;
@@ -723,11 +748,15 @@ bool InvokeProcessEvent(
     Context& context, std::uintptr_t object, std::uintptr_t function,
     void* parameters) noexcept;
 bool ResolveTextWriteBindings(Context& context) noexcept;
-bool EnsureReplacementText(
+bool EnsureTextHookSnapshot(
     Context& context, const SettingsSnapshot& settings,
     std::uint64_t revision) noexcept;
 bool IsHookTargetWidget(
-    const Context& context, std::uintptr_t widget) noexcept;
+    const Context& context, std::uintptr_t widget,
+    const SetTextHookSnapshot& override) noexcept;
+bool IsHookPrefixWidget(
+    const Context& context, std::uintptr_t widget,
+    const SetTextHookSnapshot& override) noexcept;
 void ANOMALY_CALL SetTextDetour(
     void* widget, const UnrealText* text) noexcept;
 bool EnsureSetTextHook(Context& context) noexcept;
@@ -1393,6 +1422,55 @@ bool ReadWidgetText(
     return ReadUnrealText(context, value, text);
 }
 
+bool IsReadableUnrealString(
+    const wchar_t* const data, const std::int32_t count) noexcept {
+    if (data == nullptr || count <= 0) return false;
+    const auto begin = reinterpret_cast<std::uintptr_t>(data);
+    const auto bytes = static_cast<std::uintptr_t>(count) * sizeof(wchar_t);
+    if (begin == 0 ||
+        bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+        return false;
+    }
+    __try {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(data, &info, sizeof(info)) != sizeof(info) ||
+            info.State != MEM_COMMIT ||
+            (info.Protect & PAGE_GUARD) != 0 ||
+            (info.Protect & 0xFFU) == PAGE_NOACCESS) {
+            return false;
+        }
+        const auto region_begin = reinterpret_cast<std::uintptr_t>(
+            info.BaseAddress);
+        if (info.RegionSize >
+            std::numeric_limits<std::uintptr_t>::max() - region_begin) {
+            return false;
+        }
+        const auto region_end = region_begin +
+            static_cast<std::uintptr_t>(info.RegionSize);
+        return begin >= region_begin && begin + bytes <= region_end;
+    } __except (1) {
+        return false;
+    }
+}
+
+void ReleaseReadbackString(
+    Context& context, UnrealString& value) noexcept {
+    const auto allocation = value.data;
+    const auto count = value.count;
+    value = {};
+    if (allocation == nullptr ||
+        count <= 0 ||
+        count > static_cast<std::int32_t>(kMaximumUidCharacters + 1U) ||
+        !IsReadableUnrealString(allocation, count) ||
+        context.free_string == nullptr) {
+        return;
+    }
+    __try {
+        context.free_string(allocation);
+    } __except (1) {
+    }
+}
+
 bool ReadUnrealText(
     Context& context, const UnrealText* const value, std::wstring& text) noexcept {
     text.clear();
@@ -1404,20 +1482,26 @@ bool ReadUnrealText(
     __try {
         if (context.text_to_string(&current, value) == nullptr ||
             current.count < 0 || current.capacity < current.count ||
+            current.count > static_cast<std::int32_t>(kMaximumUidCharacters + 1U) ||
             (current.count > 0 && current.data == nullptr)) {
-            if (current.data != nullptr) context.free_string(current.data);
+            ReleaseReadbackString(context, current);
             return false;
         }
         // An intentionally hidden prefix is a valid empty FString. UE may
         // expose it as {nullptr,0,0} or as a single terminator; accepting both
         // lets an unchecked hide-prefix option restore the original label.
+        if (current.count > 0 &&
+            !IsReadableUnrealString(current.data, current.count)) {
+            ReleaseReadbackString(context, current);
+            return false;
+        }
         if (current.count > 0) {
             text.assign(current.data, static_cast<std::size_t>(current.count - 1));
         }
-        if (current.data != nullptr) context.free_string(current.data);
+        ReleaseReadbackString(context, current);
         return true;
     } __except (1) {
-        if (current.data != nullptr) context.free_string(current.data);
+        ReleaseReadbackString(context, current);
         return false;
     }
 }
@@ -1425,61 +1509,128 @@ bool ReadUnrealText(
 bool BuildUnrealText(
     Context& context, const std::wstring_view value, UnrealText& result) noexcept {
     result = {};
-    // An empty FText is required when the optional UID prefix is hidden.
-    // Conv_StringToText accepts an empty FString (one terminating wchar_t);
-    // rejecting it here made the prefix path silently leave "UID：" visible.
+    // Use a valid zero-width FText for the hidden prefix. Some cooked
+    // UTextBlock paths keep the old label when passed UE's canonical empty
+    // text, which is why the hidden state must not depend on a null payload.
     if (value.size() > kMaximumUidCharacters ||
         context.process_event == nullptr ||
         context.kismet_text_library_cdo == 0 ||
-        context.string_to_text_function == 0) {
+        context.string_to_text_function == 0 ||
+        context.assign_string == nullptr || context.free_string == nullptr) {
         return false;
     }
     struct StringToTextParameters final {
         UnrealString input{};
         UnrealText result{};
-    } conversion{{
-        const_cast<wchar_t*>(value.data()),
-        static_cast<std::int32_t>(value.size() + 1U),
-        static_cast<std::int32_t>(value.size() + 1U)}};
+    } conversion{};
     static_assert(sizeof(StringToTextParameters) == 32U);
+    if (context.assign_string(
+            &conversion.input, value.data()) == nullptr) {
+        return false;
+    }
     if (!InvokeProcessEvent(
             context, context.kismet_text_library_cdo,
             context.string_to_text_function, &conversion) ||
-        conversion.result.data == nullptr) {
+        !IsUsableUnrealText(conversion.result, value.empty())) {
+        ReleaseUnrealString(context, conversion.input);
         return false;
     }
+    ReleaseUnrealString(context, conversion.input);
     result = conversion.result;
     return true;
 }
 
-bool EnsureReplacementText(
+void ReleaseUnrealString(
+    Context& context, UnrealString& value) noexcept {
+    auto* const allocation = value.data;
+    value = {};
+    if (allocation == nullptr || context.free_string == nullptr) return;
+    __try {
+        context.free_string(allocation);
+    } __except (1) {
+    }
+}
+
+bool IsUsableUnrealText(
+    const UnrealText& value, const bool allow_empty) noexcept {
+    constexpr std::uintptr_t kMinimumX64ProcessAddress = 0x100000000ULL;
+    __try {
+        // UE represents FText::GetEmpty() with a null text-data pointer. It is
+        // a valid value for the prefix-clearing path, so do not reject the
+        // canonical empty representation as malformed.
+        if (value.data == nullptr) return allow_empty;
+        if (reinterpret_cast<std::uintptr_t>(value.data) <
+            kMinimumX64ProcessAddress) {
+            return false;
+        }
+        MEMORY_BASIC_INFORMATION data_info{};
+        if (VirtualQuery(
+                value.data, &data_info, sizeof(data_info)) !=
+                sizeof(data_info) ||
+            data_info.State != MEM_COMMIT ||
+            (data_info.Protect & 0xFFU) == PAGE_NOACCESS ||
+            (data_info.Protect & PAGE_GUARD) != 0) {
+            return false;
+        }
+        const auto vtable = *reinterpret_cast<const std::uintptr_t*>(value.data);
+        if (vtable < kMinimumX64ProcessAddress) return false;
+        MEMORY_BASIC_INFORMATION vtable_info{};
+        return VirtualQuery(
+                   reinterpret_cast<const void*>(vtable), &vtable_info,
+                   sizeof(vtable_info)) == sizeof(vtable_info) &&
+            vtable_info.State == MEM_COMMIT &&
+            (vtable_info.Protect & 0xFFU) != PAGE_NOACCESS &&
+            (vtable_info.Protect & PAGE_GUARD) == 0;
+    } __except (1) {
+        return false;
+    }
+}
+
+bool EnsureTextHookSnapshot(
     Context& context, const SettingsSnapshot& settings,
     const std::uint64_t revision) noexcept {
     if (!settings.enabled) {
-        context.hook_override_enabled.store(false, std::memory_order_release);
-        context.replacement_text_revision = 0;
+        context.text_override.store({}, std::memory_order_release);
+        context.text_override_revision = 0;
         return true;
     }
-    if (context.replacement_text.data != nullptr &&
-        context.replacement_text_revision == revision) {
-        context.hook_override_enabled.store(true, std::memory_order_release);
+    try {
+        auto current = context.text_override.load(std::memory_order_acquire);
+        if (current != nullptr && context.text_override_revision == revision) {
+            if (current->target_name_id == context.target_name_id &&
+                current->prefix_name_id == context.target_prefix_name_id &&
+                current->roleid_outer == context.roleid_outer &&
+                current->roleid_panel == context.roleid_panel) {
+                return true;
+            }
+            auto updated = std::make_shared<SetTextHookSnapshot>(*current);
+            updated->target_name_id = context.target_name_id;
+            updated->prefix_name_id = context.target_prefix_name_id;
+            updated->roleid_outer = context.roleid_outer;
+            updated->roleid_panel = context.roleid_panel;
+            context.text_override.store(std::move(updated), std::memory_order_release);
+            return true;
+        }
+
+        auto updated = std::make_shared<SetTextHookSnapshot>();
+        updated->target_name_id = context.target_name_id;
+        updated->prefix_name_id = context.target_prefix_name_id;
+        updated->roleid_outer = context.roleid_outer;
+        updated->roleid_panel = context.roleid_panel;
+        context.text_override.store(std::move(updated), std::memory_order_release);
+        context.text_override_revision = revision;
         return true;
-    }
-    UnrealText replacement{};
-    if (!BuildUnrealText(context, settings.display_wide, replacement)) {
-        context.hook_override_enabled.store(false, std::memory_order_release);
+    } catch (...) {
+        context.text_override.store({}, std::memory_order_release);
         return false;
     }
-    context.replacement_text = replacement;
-    context.replacement_text_revision = revision;
-    context.hook_override_enabled.store(true, std::memory_order_release);
-    return true;
 }
 
 bool IsHookTargetWidget(
-    const Context& context, const std::uintptr_t widget) noexcept {
+    const Context& context, const std::uintptr_t widget,
+    const SetTextHookSnapshot& override) noexcept {
     if (widget == 0 || context.set_text == nullptr ||
-        context.target_name_id == 0) {
+        override.target_name_id == 0) {
         return false;
     }
     __try {
@@ -1491,61 +1642,186 @@ bool IsHookTargetWidget(
                 reinterpret_cast<std::uintptr_t>(context.set_text) ||
             *reinterpret_cast<const std::uint32_t*>(
                 widget + fake_uid_profile::kObjectNameOffset) !=
-                context.target_name_id) {
+                override.target_name_id) {
             return false;
         }
-        if (context.roleid_outer == 0 || context.roleid_panel == 0) {
+        if (override.roleid_outer == 0 || override.roleid_panel == 0) {
             return true;
         }
-        return ReadObjectOuter(widget) == context.roleid_outer &&
-            ReadWidgetPanel(widget) == context.roleid_panel;
+        return ReadObjectOuter(widget) == override.roleid_outer &&
+            ReadWidgetPanel(widget) == override.roleid_panel;
     } __except (1) {
         return false;
     }
 }
 
-void ANOMALY_CALL SetTextDetour(
-    void* widget, const UnrealText* text) noexcept {
-    const auto original_address = g_set_text_original.load(
-        std::memory_order_acquire);
-    auto* const context = g_active_context.load(std::memory_order_acquire);
-    if (original_address == 0) return;
-
-    AnomalyGenerationHandleV1 callback_lease{};
-    bool leased = false;
-    if (context != nullptr && context->set_text_hook.id != 0 &&
-        HookReady(context->hook)) {
-        leased = context->hook->begin_callback(
-            context->hook->user, context->set_text_hook,
-            &callback_lease).code == ANOMALY_STATUS_V1_OK;
+bool IsHookPrefixWidget(
+    const Context& context, const std::uintptr_t widget,
+    const SetTextHookSnapshot& override) noexcept {
+    if (widget == 0 || context.set_text == nullptr ||
+        override.prefix_name_id == 0) {
+        return false;
     }
-
-    using Function = SetTextFn;
-    const auto original = reinterpret_cast<Function>(original_address);
-    const UnrealText* replacement = text;
-    thread_local bool forwarding = false;
-    if (!forwarding && context != nullptr &&
-        context->hook_override_enabled.load(std::memory_order_acquire) &&
-        IsHookTargetWidget(*context, reinterpret_cast<std::uintptr_t>(widget)) &&
-        context->replacement_text.data != nullptr) {
-        replacement = &context->replacement_text;
-    }
-    forwarding = true;
-    original(widget, replacement);
-    forwarding = false;
-
-    if (leased && context != nullptr && HookReady(context->hook)) {
-        static_cast<void>(context->hook->end_callback(
-            context->hook->user, callback_lease));
+    __try {
+        const std::uintptr_t vtable =
+            *reinterpret_cast<const std::uintptr_t*>(widget);
+        if (vtable == 0 ||
+            *reinterpret_cast<const std::uintptr_t*>(
+                vtable + fake_uid_profile::kSetTextVtableOffset) !=
+                reinterpret_cast<std::uintptr_t>(context.set_text) ||
+            *reinterpret_cast<const std::uint32_t*>(
+                widget + fake_uid_profile::kObjectNameOffset) !=
+                override.prefix_name_id) {
+            return false;
+        }
+        if (override.roleid_outer == 0 || override.roleid_panel == 0) {
+            return true;
+        }
+        return ReadObjectOuter(widget) == override.roleid_outer &&
+            ReadWidgetPanel(widget) == override.roleid_panel;
+    } __except (1) {
+        return false;
     }
 }
 
+void CallSetTextOriginal(
+    const SetTextFn original, void* const widget,
+    const UnrealText* const text) noexcept {
+    if (original == nullptr) return;
+    __try {
+        original(widget, text);
+    } __except (1) {
+    }
+}
+
+bool BeginSetTextCallback(
+    const AnomalyHookServiceV1* const hook_api,
+    const AnomalyGenerationHandleV1 hook,
+    AnomalyGenerationHandleV1* const callback_lease) noexcept {
+    if (hook_api == nullptr || hook_api->begin_callback == nullptr ||
+        callback_lease == nullptr) {
+        return false;
+    }
+    __try {
+        return hook_api->begin_callback(
+                   hook_api->user, hook, callback_lease).code ==
+            ANOMALY_STATUS_V1_OK;
+    } __except (1) {
+        return false;
+    }
+}
+
+void EndSetTextCallback(
+    const AnomalyHookServiceV1* const hook_api,
+    const AnomalyGenerationHandleV1 callback_lease) noexcept {
+    if (hook_api == nullptr || hook_api->end_callback == nullptr ||
+        callback_lease.id == 0) {
+        return;
+    }
+    __try {
+        static_cast<void>(hook_api->end_callback(
+            hook_api->user, callback_lease));
+    } __except (1) {
+    }
+}
+
+void ANOMALY_CALL SetTextDetour(
+    void* widget, const UnrealText* text) noexcept {
+    const auto* const hook_api =
+        g_set_text_hook_api.load(std::memory_order_acquire);
+    const AnomalyGenerationHandleV1 hook_handle{
+        g_set_text_hook_id.load(std::memory_order_acquire),
+        g_set_text_hook_generation.load(std::memory_order_acquire)};
+    AnomalyGenerationHandleV1 callback_lease{};
+    if (hook_api == nullptr || hook_handle.id == 0 ||
+        hook_handle.generation == 0) {
+        // A hook entry without a published lease source is a setup/teardown
+        // window. Do not call a trampoline whose lifetime is unknown.
+        return;
+    }
+
+    if (!BeginSetTextCallback(hook_api, hook_handle, &callback_lease) ||
+        callback_lease.id == 0) {
+        // The hook is being drained. The trampoline may already have been
+        // removed, so do not call the stale original address.
+        return;
+    }
+
+    auto* const context = g_active_context.load(std::memory_order_acquire);
+    const auto original_address =
+        g_set_text_original.load(std::memory_order_acquire);
+    if (context != nullptr && original_address != 0) {
+        using Function = SetTextFn;
+        const auto original = reinterpret_cast<Function>(original_address);
+        thread_local bool forwarding = false;
+        const auto override =
+            context->text_override.load(std::memory_order_acquire);
+        const auto settings = context->settings.load(std::memory_order_acquire);
+        const auto widget_address = reinterpret_cast<std::uintptr_t>(widget);
+        const bool is_value_widget = !forwarding && settings != nullptr &&
+            settings->enabled && override != nullptr &&
+            IsHookTargetWidget(*context, widget_address, *override);
+        bool is_hidden_prefix = !forwarding && settings != nullptr &&
+            settings->enabled && settings->hide_prefix && override != nullptr &&
+            IsHookPrefixWidget(*context, widget_address, *override);
+        if (!is_hidden_prefix && !is_value_widget &&
+            !forwarding && settings != nullptr && settings->enabled &&
+            settings->hide_prefix && override != nullptr) {
+            // TextBlock_90 is not guaranteed to be exposed as a named
+            // variable. During a HUD rebuild its FName and slot can therefore
+            // be unknown even though the engine is about to write the
+            // localized prefix. The prefix text is the stable discriminator
+            // for this call; the value widget is excluded above so a complete
+            // "UID: <number>" value cannot be mistaken for the label.
+            std::wstring incoming_text;
+            is_hidden_prefix = text != nullptr &&
+                ReadUnrealText(*context, text, incoming_text) &&
+                LooksLikeUidPrefix(incoming_text);
+        }
+        if (is_value_widget || is_hidden_prefix) {
+            // FText owns shared engine data. Never retain a raw FText copy in
+            // the plugin: a copy made from Conv_StringToText can outlive the
+            // ProcessEvent parameter storage and later leave a stale
+            // TextData pointer in UTextBlock. Construct it on this callback
+            // stack and hand it to the original only during this invocation.
+            UnrealText replacement{};
+            const std::wstring_view replacement_value = is_hidden_prefix
+                ? kHiddenPrefixText
+                : std::wstring_view(settings->display_wide);
+            if (BuildUnrealText(*context, replacement_value, replacement)) {
+                forwarding = true;
+                CallSetTextOriginal(original, widget, &replacement);
+                forwarding = false;
+                EndSetTextCallback(hook_api, callback_lease);
+                return;
+            }
+            // If the incoming value is already malformed, do not feed it back
+            // into UTextBlock::SetText after a failed replacement build. This
+            // is the exact failure mode behind the observed
+            // 0x000000060000000D read: forwarding that FText only turns the
+            // bad input into a later Slate crash.
+            if (text == nullptr || !IsUsableUnrealText(*text)) {
+                EndSetTextCallback(hook_api, callback_lease);
+                return;
+            }
+        }
+        forwarding = true;
+        CallSetTextOriginal(original, widget, text);
+        forwarding = false;
+    }
+
+    EndSetTextCallback(hook_api, callback_lease);
+}
+
 bool ReleaseSetTextHook(Context& context) noexcept {
-    context.hook_override_enabled.store(false, std::memory_order_release);
+    context.text_override.store({}, std::memory_order_release);
     Context* expected = &context;
     static_cast<void>(g_active_context.compare_exchange_strong(
         expected, nullptr, std::memory_order_acq_rel));
     if (context.set_text_hook.id == 0) {
+        g_set_text_hook_api.store(nullptr, std::memory_order_release);
+        g_set_text_hook_id.store(0, std::memory_order_release);
+        g_set_text_hook_generation.store(0, std::memory_order_release);
         g_set_text_original.store(0, std::memory_order_release);
         return true;
     }
@@ -1559,6 +1835,9 @@ bool ReleaseSetTextHook(Context& context) noexcept {
     context.set_text_hook = {};
     context.set_text_original = 0;
     context.set_text_target = 0;
+    g_set_text_hook_api.store(nullptr, std::memory_order_release);
+    g_set_text_hook_id.store(0, std::memory_order_release);
+    g_set_text_hook_generation.store(0, std::memory_order_release);
     g_set_text_original.store(0, std::memory_order_release);
     return true;
 }
@@ -1591,6 +1870,9 @@ bool EnsureSetTextHook(Context& context) noexcept {
     context.set_text_original = original;
     context.set_text_target = target;
     context.set_text_hook = handle;
+    g_set_text_hook_api.store(context.hook, std::memory_order_release);
+    g_set_text_hook_id.store(handle.id, std::memory_order_release);
+    g_set_text_hook_generation.store(handle.generation, std::memory_order_release);
     g_set_text_original.store(original, std::memory_order_release);
     g_active_context.store(&context, std::memory_order_release);
     Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
@@ -1772,17 +2054,9 @@ bool InvokeWidgetVisibility(
         return false;
     }
     std::uint8_t parameters[1] = {visibility};
-    // ProcessEvent faults are isolated inside InvokeProcessEvent so the
-    // original global UFunction flags are restored on every return path.
-    std::uint32_t previous_flags{};
-    if (!SetNativeFunctionFlag(context.set_visibility_function, previous_flags)) {
-        return false;
-    }
-    const bool invoked = InvokeProcessEvent(
-        context, widget, context.set_visibility_function, parameters);
-    const bool restored = RestoreFunctionFlags(
-        context.set_visibility_function, previous_flags);
-    return invoked && restored && WriteWidgetVisibility(widget, visibility);
+    return InvokeProcessEvent(
+               context, widget, context.set_visibility_function, parameters) &&
+        WriteWidgetVisibility(widget, visibility);
 }
 
 // Reads the UFunction header fields used to validate the SetVisibility layout.
@@ -1908,14 +2182,22 @@ bool InvokeProcessEvent(
     Context& context, const std::uintptr_t object, const std::uintptr_t function,
     void* const parameters) noexcept {
     if (object == 0 || function == 0 || context.process_event == nullptr) return false;
+    // The generated SDK wrappers set FUNC_Native (0x400) before every
+    // ProcessEvent call. Without it, this build can enter the reflected
+    // dispatch path with a native UFunction and leave FText output in an
+    // invalid state (the observed bad pointer was 0x000000060000000D).
+    std::uint32_t previous_flags{};
+    if (!SetNativeFunctionFlag(function, previous_flags)) return false;
+    bool invoked = false;
     __try {
         context.process_event(
             reinterpret_cast<void*>(object),
             reinterpret_cast<void*>(function), parameters);
-        return true;
+        invoked = true;
     } __except (1) {
-        return false;
     }
+    const bool restored = RestoreFunctionFlags(function, previous_flags);
+    return invoked && restored;
 }
 
 // Resolves the CanvasPanelSlot call chain used to align the RoleID value:
@@ -1989,16 +2271,9 @@ void AlignRoleIdSlot(
         const double target_x = prefix_hidden ? 1.0 : 43.0;
         if (current[0] == target_x) return;
         double parameters[2] = {target_x, current[1]};
-        std::uint32_t previous_flags{};
-        if (!SetNativeFunctionFlag(
-                context.slot_set_position_function, previous_flags)) {
-            return;
-        }
         const bool invoked = InvokeProcessEvent(
             context, slot, context.slot_set_position_function, parameters);
-        const bool restored = RestoreFunctionFlags(
-            context.slot_set_position_function, previous_flags);
-        if (!invoked || !restored) {
+        if (!invoked) {
             if (!context.slot_binding_failed_emitted) {
                 context.slot_binding_failed_emitted = true;
                 Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
@@ -2175,20 +2450,29 @@ ApplyResult ApplyToWidget(
         }
         const bool hide_prefix = settings.enabled && settings.hide_prefix;
         const std::wstring_view target_prefix = hide_prefix
-            ? std::wstring_view(L"")
+            ? kHiddenPrefixText
             : std::wstring_view(context.original_prefix);
         if (current_prefix == target_prefix) return ApplyResult::Applied;
         const wchar_t* const prefix_text = hide_prefix
-            ? L""
+            ? kHiddenPrefixText.data()
             : context.original_prefix.c_str();
         if (!SetWidgetText(context, widget, prefix_text)) {
+            return ApplyResult::Deferred;
+        }
+        std::wstring readback_prefix;
+        if (!ReadWidgetText(context, widget, readback_prefix) ||
+            readback_prefix != target_prefix) {
+            // SetText can return while the UTextBlock still exposes its
+            // previous cached text during widget construction. Do not mark
+            // the prefix applied until the game-side FText readback confirms
+            // that the visible label has actually changed.
             return ApplyResult::Deferred;
         }
         if (hide_prefix && !context.prefix_cleared_diagnostic_emitted) {
             context.prefix_apply_failure_stage = 0U;
             context.prefix_cleared_diagnostic_emitted = true;
             Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
-                "FakeUID: TextBlock_90 cleared via SetText (layout untouched)");
+                "FakeUID: TextBlock_90 hidden via zero-width SetText (layout untouched)");
         } else if (!hide_prefix) {
             Log(context, ANOMALY_CORE_LOG_LEVEL_V1_INFO,
                 "FakeUID: TextBlock_90 prefix restored via SetText");
@@ -2271,13 +2555,13 @@ void ANOMALY_CALL Update(void* user, double) {
         if (!current_settings) return;
         const std::uint64_t current_revision =
             context->settings_revision.load(std::memory_order_acquire);
-        static_cast<void>(EnsureReplacementText(
-            *context, *current_settings, current_revision));
         if (context->scan_active ||
             context->update_tick % kAnchorVerifyInterval == 0) {
             ValidateRoleIDAnchor(*context);
         }
         ScanForWidgets(*context);
+        static_cast<void>(EnsureTextHookSnapshot(
+            *context, *current_settings, current_revision));
         for (std::size_t index = 0; index < context->widget_count;) {
             auto& widget = context->widgets[index];
             const bool revision_pending = widget.applied_revision < current_revision;
@@ -2442,6 +2726,9 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* user) {
     };
     ResolveDirect("SetText", fake_uid_profile::kSetTextPattern, bindings.set_text);
     ResolveDirect(
+        "AssignString", fake_uid_profile::kAssignStringPattern,
+        bindings.assign_string);
+    ResolveDirect(
         "FreeString", fake_uid_profile::kFreeStringPattern,
         bindings.free_string);
     ResolveDirect(
@@ -2492,6 +2779,8 @@ AnomalyStatusV1 ANOMALY_CALL Start(void* user) {
         bindings.gobjects_accessor + fake_uid_profile::kGObjectsInstructionSize +
         registry_displacement + fake_uid_profile::kGObjectsAddend;
     context->free_string = reinterpret_cast<FreeStringFn>(bindings.free_string);
+    context->assign_string =
+        reinterpret_cast<AssignStringFn>(bindings.assign_string);
     context->text_to_string =
         reinterpret_cast<TextToStringFn>(bindings.text_to_string);
     context->set_text = reinterpret_cast<SetTextFn>(bindings.set_text);
