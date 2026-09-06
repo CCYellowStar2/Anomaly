@@ -39,19 +39,11 @@ constexpr std::size_t kMaximumTrackedWidgets = 64;
 // Discovery must keep retrying while HUD widgets are created asynchronously.
 constexpr std::uint64_t kObjectRescanInterval = 30;
 constexpr std::uint64_t kRuntimeBindingRetryInterval = 300;
-constexpr std::uint64_t kWidgetVerifyInterval = 1;
 constexpr std::uint64_t kAnchorVerifyInterval = 5;
 // A widget can enter the object registry one update before its FText/Slate
 // state is writable. Retry transient write failures on the next game update
 // instead of leaving the original UID visible for the normal rescan interval.
 constexpr std::uint64_t kWidgetApplyRetryInterval = 1;
-// The prefix TextBlock can be recreated by the HUD. Re-verify at a bounded
-// cadence and apply only to the exact live RoleID widget tree.
-constexpr std::uint64_t kPrefixVerifyInterval = 30;
-// Fallback-captured prefixes (empty-sibling heuristic) carry no name signal,
-// so a wrong candidate must be re-verified sooner: about one second instead
-// of three. A wrong capture fails the apply-time outer check and untracks.
-constexpr std::uint64_t kSiblingVerifyInterval = 10;
 constexpr std::string_view kTargetWidgetName = "TextBlock_RoleID";
 constexpr std::string_view kTargetPrefixWidgetName = "TextBlock_90";
 constexpr std::string_view kTargetWidgetTemplatePath =
@@ -108,21 +100,10 @@ struct SettingsSnapshot final {
     std::wstring display_wide;
 };
 
-// How a tracked entry was captured. The empty-sibling fallback is the only
-// source without an explicit name signal, so its entries re-verify sooner.
-enum class TrackSource : std::uint8_t {
-    kValueWidget = 0,
-    kByName = 1,
-    kByContent = 2,
-    kBySiblingFallback = 3,
-};
-
 struct TrackedWidget final {
     AnomalyGenerationHandleV1 handle{};
     bool prefix{};
-    TrackSource source{TrackSource::kValueWidget};
     std::uint64_t applied_revision{};
-    std::uint64_t last_verified_tick{};
     std::uint64_t retry_tick{};
 };
 
@@ -770,7 +751,7 @@ void DropMismatchedPrefixWidgets(Context& context) noexcept {
 
 bool TrackWidget(
     Context& context, const AnomalyUe5ObjectSnapshotV1& snapshot,
-    const bool prefix, const TrackSource source) noexcept {
+    const bool prefix) noexcept {
     if (prefix) {
         std::uintptr_t widget{};
         if (!ResolveTextBlockAddress(context, snapshot.handle, widget) ||
@@ -847,7 +828,7 @@ bool TrackWidget(
         if (oldest_index == context.widgets.size()) return false;
         const bool evicted_value_widget = !context.widgets[oldest_index].prefix;
         context.widgets[oldest_index] = {
-            snapshot.handle, prefix, source, 0, 0, 0};
+            snapshot.handle, prefix, 0, 0};
         if (evicted_value_widget) {
             // The only surviving RoleID layer was evicted to make room: its
             // tree address must go stale immediately.
@@ -857,7 +838,7 @@ bool TrackWidget(
         }
     } else {
         context.widgets[context.widget_count++] = {
-            snapshot.handle, prefix, source, 0, 0, 0};
+            snapshot.handle, prefix, 0, 0};
     }
     if (prefix) context.target_prefix_name_id = snapshot.name_id;
     else context.target_name_id = snapshot.name_id;
@@ -1115,8 +1096,8 @@ void ScanForWidgets(Context& context) {
     }
     const auto Track = [&context, &prefix_tracked, &roleid_tracked](
                            const AnomalyUe5ObjectSnapshotV1& snapshot,
-                           const bool prefix, const TrackSource source) {
-        if (!TrackWidget(context, snapshot, prefix, source)) return false;
+                           const bool prefix) {
+        if (!TrackWidget(context, snapshot, prefix)) return false;
         if (prefix) prefix_tracked = true;
         else roleid_tracked = true;
         return prefix_tracked && roleid_tracked;
@@ -1127,15 +1108,15 @@ void ScanForWidgets(Context& context) {
         [&context, &Track, &prefix_tracked, &roleid_tracked,
          &neighborhood_requested, &neighborhood_anchor](
             const AnomalyUe5ObjectSnapshotV1& snapshot,
-            const std::uint32_t object_index, const TrackSource source) {
-            const bool complete = Track(snapshot, false, source);
-            if (roleid_tracked && !prefix_tracked &&
-                !context.neighborhood_scan_active) {
-                neighborhood_requested = true;
-                neighborhood_anchor = object_index;
-            }
-            return complete;
-        };
+            const std::uint32_t object_index) {
+        const bool complete = Track(snapshot, false);
+        if (roleid_tracked && !prefix_tracked &&
+            !context.neighborhood_scan_active) {
+            neighborhood_requested = true;
+            neighborhood_anchor = object_index;
+        }
+        return complete;
+    };
     const std::uint32_t available = context.object_cursor - context.scan_start;
     const std::uint32_t begin = context.object_cursor -
         (std::min)(available, context.scan_batch_size);
@@ -1157,7 +1138,7 @@ void ScanForWidgets(Context& context) {
             snapshot.handle.generation == context.prefix_template_handle.generation;
         if (is_value_template || is_prefix_template) continue;
         if (context.target_name_id != 0 && snapshot.name_id == context.target_name_id) {
-            if (TrackValue(snapshot, index, TrackSource::kValueWidget)) {
+            if (TrackValue(snapshot, index)) {
                 context.object_cursor = context.scan_start;
                 break;
             }
@@ -1178,7 +1159,7 @@ void ScanForWidgets(Context& context) {
             std::uintptr_t named{};
             if (ResolveTextBlockAddress(context, snapshot.handle, named) &&
                 IsRoleIdPrefixInstance(context, named)) {
-                if (Track(snapshot, true, TrackSource::kByName)) {
+                if (Track(snapshot, true)) {
                     context.object_cursor = context.scan_start;
                     break;
                 }
@@ -1204,7 +1185,7 @@ void ScanForWidgets(Context& context) {
             const bool readable = ReadWidgetText(context, candidate, text);
             if (readable && LooksLikeUidPrefix(text) &&
                 IsRoleIdPrefixInstance(context, candidate)) {
-                if (Track(snapshot, true, TrackSource::kByContent)) {
+                if (Track(snapshot, true)) {
                     context.object_cursor = context.scan_start;
                     break;
                 }
@@ -1224,7 +1205,7 @@ void ScanForWidgets(Context& context) {
             // generation already cleared to an empty string.
             if (IsRoleIdPrefixInstance(context, candidate) &&
                 text.empty() && snapshot.name_id != context.target_name_id) {
-                if (Track(snapshot, true, TrackSource::kBySiblingFallback)) {
+                if (Track(snapshot, true)) {
                     context.object_cursor = context.scan_start;
                     break;
                 }
@@ -1234,7 +1215,7 @@ void ScanForWidgets(Context& context) {
         std::string name;
         if (ResolveName(*context.names, snapshot.name_id, name)) {
             if (name == kTargetWidgetName || name.starts_with("TextBlock_RoleID_")) {
-                if (TrackValue(snapshot, index, TrackSource::kByName)) {
+                if (TrackValue(snapshot, index)) {
                     context.object_cursor = context.scan_start;
                     break;
                 }
@@ -1248,7 +1229,7 @@ void ScanForWidgets(Context& context) {
                 std::uintptr_t named{};
                 if (ResolveTextBlockAddress(context, snapshot.handle, named) &&
                     IsRoleIdPrefixInstance(context, named)) {
-                    if (Track(snapshot, true, TrackSource::kByName)) {
+                    if (Track(snapshot, true)) {
                         context.object_cursor = context.scan_start;
                         break;
                     }
@@ -2215,15 +2196,15 @@ ApplyResult ApplyToWidget(
         return ApplyResult::Applied;
     }
 
-    UnrealString current{};
-    const auto* const current_text = reinterpret_cast<const UnrealText*>(
-        widget + context.text_field_offset);
-    if (context.text_to_string(&current, current_text) == nullptr ||
-        current.data == nullptr || current.count <= 1 || current.capacity < current.count) {
-        if (current.data != nullptr) context.free_string(current.data);
+    std::wstring current_value;
+    if (!ReadWidgetText(context, widget, current_value)) {
         LogValueApplyFailure(context, revision, 3, "TextToString");
         return ApplyResult::Deferred;
     }
+    UnrealString current{
+        current_value.data(),
+        static_cast<std::int32_t>(current_value.size() + 1U),
+        static_cast<std::int32_t>(current_value.size() + 1U)};
     std::wstring replacement;
     std::uint64_t detected{};
     bool changed{};
@@ -2233,7 +2214,6 @@ ApplyResult ApplyToWidget(
         const std::uint64_t known_uid =
             context.detected_uid.load(std::memory_order_acquire);
         if (known_uid == 0) {
-            context.free_string(current.data);
             return ApplyResult::Applied;
         }
         restored_uid = std::to_wstring(known_uid);
@@ -2241,7 +2221,6 @@ ApplyResult ApplyToWidget(
     }
     const bool built = BuildValueReplacement(
         &current, target_uid, replacement, detected, changed);
-    context.free_string(current.data);
     if (!built) {
         LogValueApplyFailure(context, revision, 4, "replacement construction");
         return ApplyResult::Deferred;
@@ -2302,16 +2281,17 @@ void ANOMALY_CALL Update(void* user, double) {
         for (std::size_t index = 0; index < context->widget_count;) {
             auto& widget = context->widgets[index];
             const bool revision_pending = widget.applied_revision < current_revision;
-            const std::uint64_t prefix_interval =
-                widget.source == TrackSource::kBySiblingFallback
-                    ? kSiblingVerifyInterval
-                    : kPrefixVerifyInterval;
-            const bool verification_due = widget.prefix
-                ? context->update_tick - widget.last_verified_tick >= prefix_interval
-                : context->update_tick - widget.last_verified_tick >= kWidgetVerifyInterval;
+            // Once a widget has been applied, do not periodically call
+            // TextToString on its embedded FText. During world transitions a
+            // UObject can still pass the serial/vtable checks while its FText
+            // payload is already being torn down; TextToString then follows a
+            // stale text-data vtable and can jump to an invalid address. The
+            // native SetText hook maintains the steady-state value, while
+            // revision-pending, newly tracked, and deferred widgets still
+            // take the normal apply path below.
             const bool retry_due =
                 widget.retry_tick == 0 || context->update_tick >= widget.retry_tick;
-            if ((!revision_pending && !verification_due) || !retry_due) {
+            if (!revision_pending || !retry_due) {
                 ++index;
                 continue;
             }
@@ -2319,11 +2299,9 @@ void ANOMALY_CALL Update(void* user, double) {
                 *context, widget.handle, *current_settings, current_revision);
             if (result == ApplyResult::Applied) {
                 widget.applied_revision = current_revision;
-                widget.last_verified_tick = context->update_tick;
                 widget.retry_tick = 0;
                 ++index;
             } else if (result == ApplyResult::Deferred) {
-                widget.last_verified_tick = context->update_tick;
                 widget.retry_tick = context->update_tick + kWidgetApplyRetryInterval;
                 ++index;
             } else {
