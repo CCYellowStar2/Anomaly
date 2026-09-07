@@ -7035,7 +7035,7 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     }
     if (ui == nullptr || ui->text == nullptr || ui->button == nullptr) return;
     int open = 1;
-    anomaly::sdk::UiWindow window(ui, "进副本", &open);
+    anomaly::sdk::UiWindow window(ui, "自动副本", &open);
     if (!window) return;
 
     std::size_t cur_di = context.display_index;
@@ -7146,9 +7146,9 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
     *descriptor = {
         sizeof(*descriptor), ANOMALY_PLUGIN_API_V1_MAJOR, ANOMALY_PLUGIN_API_V1_MINOR,
         anomaly::sdk::StringView("local.clone-enter"),
-        anomaly::sdk::StringView("Clone Enter"),
+        anomaly::sdk::StringView("自动副本"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.2.12"),
+        anomaly::sdk::StringView("0.2.13"),
         Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }

@@ -1,11 +1,11 @@
 {
   "schemaVersion": 2,
   "id": "local.clone-enter",
-  "name": "Clone Enter",
+  "name": "自动副本",
   "description": "Enter clone dungeons and kill nearby monsters.",
   "author": "CCYellowStar",
   "license": "MIT",
-  "version": "0.2.12",
+  "version": "0.2.13",
   "entry": "plugin.dll",
   "api": {"major": 1, "minMinor": 0, "maxMinor": 0},
   "games": ["nte"],
