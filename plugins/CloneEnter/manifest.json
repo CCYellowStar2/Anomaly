@@ -1,7 +1,7 @@
 {
   "schemaVersion": 2,
   "id": "local.clone-enter",
-  "name": "自动副本",
+  "name": "Clone Enter",
   "description": "Enter clone dungeons and kill nearby monsters.",
   "author": "CCYellowStar",
   "license": "MIT",
