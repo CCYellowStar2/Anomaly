@@ -1140,6 +1140,11 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         MANIFEST plugins/CombatBox/manifest.json
         PACKAGE_NAME CombatBox
         OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/CombatBox")
+    anomaly_add_plugin(anomaly_builtin_clone_enter
+        SOURCES plugins/CloneEnter/plugin.cpp
+        MANIFEST plugins/CloneEnter/manifest.json
+        PACKAGE_NAME CloneEnter
+        OUTPUT_DIRECTORY "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/builtin-plugins/CloneEnter")
     anomaly_add_plugin(anomaly_builtin_dll_loader
         SOURCES plugins/DllLoader/plugin.cpp
         MANIFEST plugins/DllLoader/manifest.json
@@ -1158,7 +1163,8 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
             anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
             anomaly_builtin_teleport_landmarks_probe
             anomaly_builtin_map_spawn_exporter
-            anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box anomaly_builtin_dll_loader)
+            anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box
+            anomaly_builtin_clone_enter anomaly_builtin_dll_loader)
         target_include_directories(${builtin_target} PRIVATE "${CMAKE_SOURCE_DIR}")
         target_compile_definitions(${builtin_target} PRIVATE
             UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
@@ -1183,6 +1189,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     anomaly_copy_builtin_locales(anomaly_builtin_wallet_collector WalletCollector)
     anomaly_copy_builtin_locales(anomaly_builtin_box_auto BoxAuto)
     anomaly_copy_builtin_locales(anomaly_builtin_combat_box CombatBox)
+    anomaly_copy_builtin_locales(anomaly_builtin_clone_enter CloneEnter)
     set_target_properties(anomaly_builtin_nte_position PROPERTIES PDB_NAME NtePosition)
     set_target_properties(anomaly_builtin_nte_teleport PROPERTIES PDB_NAME NteTeleport)
     set_target_properties(anomaly_builtin_nte_navigation PROPERTIES PDB_NAME NteNavmeshDemo)
@@ -1198,11 +1205,13 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     set_target_properties(anomaly_builtin_wallet_collector PROPERTIES PDB_NAME WalletCollector)
     set_target_properties(anomaly_builtin_box_auto PROPERTIES PDB_NAME BoxAuto)
     set_target_properties(anomaly_builtin_combat_box PROPERTIES PDB_NAME CombatBox)
+    set_target_properties(anomaly_builtin_clone_enter PROPERTIES PDB_NAME CloneEnter)
     set_target_properties(anomaly_builtin_dll_loader PROPERTIES PDB_NAME DllLoader)
     if(MSVC)
         target_compile_options(anomaly_builtin_pink_paw_heist_esp PRIVATE /utf-8)
         target_compile_options(anomaly_builtin_box_auto PRIVATE /utf-8)
         target_compile_options(anomaly_builtin_combat_box PRIVATE /utf-8)
+        target_compile_options(anomaly_builtin_clone_enter PRIVATE /utf-8)
     endif()
     add_dependencies(anomaly_test_host
         anomaly_builtin_nte_position anomaly_builtin_nte_teleport
@@ -1212,7 +1221,8 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
         anomaly_builtin_teleport_landmarks_probe
         anomaly_builtin_map_spawn_exporter
-        anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box anomaly_builtin_dll_loader)
+        anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box
+        anomaly_builtin_clone_enter anomaly_builtin_dll_loader)
     add_dependencies(anomaly-platform-preview
         anomaly_builtin_nte_position anomaly_builtin_nte_teleport
         anomaly_builtin_nte_navigation anomaly_builtin_nte_pickup_demo
@@ -1220,7 +1230,8 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
         anomaly_builtin_fake_uid anomaly_builtin_camera_tools
         anomaly_builtin_camera_blur_fix anomaly_builtin_better_pose
         anomaly_builtin_map_spawn_exporter
-        anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box anomaly_builtin_dll_loader)
+        anomaly_builtin_wallet_collector anomaly_builtin_box_auto anomaly_builtin_combat_box
+        anomaly_builtin_clone_enter anomaly_builtin_dll_loader)
 endif()
 
 function(anomaly_stage_platform_preview_plugin target package_name)
@@ -1263,6 +1274,7 @@ anomaly_stage_platform_preview_plugin(
 anomaly_stage_platform_preview_plugin(anomaly_builtin_wallet_collector WalletCollector)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_box_auto BoxAuto)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_combat_box CombatBox)
+anomaly_stage_platform_preview_plugin(anomaly_builtin_clone_enter CloneEnter)
 anomaly_stage_platform_preview_plugin(anomaly_builtin_dll_loader DllLoader)
 
 add_custom_command(TARGET anomaly-platform-preview POST_BUILD
@@ -1513,6 +1525,15 @@ if(TARGET anomaly_builtin_combat_box)
         DESTINATION Anomaly/plugins/CombatBox COMPONENT GameRuntime)
     install(DIRECTORY plugins/CombatBox/locales/
         DESTINATION Anomaly/plugins/CombatBox/locales COMPONENT GameRuntime)
+endif()
+if(TARGET anomaly_builtin_clone_enter)
+    install(TARGETS anomaly_builtin_clone_enter
+        RUNTIME DESTINATION Anomaly/plugins/CloneEnter COMPONENT GameRuntime
+        LIBRARY DESTINATION Anomaly/plugins/CloneEnter COMPONENT GameRuntime)
+    install(FILES plugins/CloneEnter/manifest.json
+        DESTINATION Anomaly/plugins/CloneEnter COMPONENT GameRuntime)
+    install(DIRECTORY plugins/CloneEnter/locales/
+        DESTINATION Anomaly/plugins/CloneEnter/locales COMPONENT GameRuntime)
 endif()
 if(TARGET anomaly_builtin_dll_loader)
     install(TARGETS anomaly_builtin_dll_loader
