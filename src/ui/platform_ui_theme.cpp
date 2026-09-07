@@ -2,6 +2,8 @@
 
 #include <imgui.h>
 
+#include "platform_ui_gb2312.hpp"
+
 #include <array>
 #include <cmath>
 #include <cstdio>
@@ -231,41 +233,20 @@ bool IsPlatformFont(const ImFont& font, const float scale) noexcept {
 }
 
 const ImWchar* PlatformChineseGlyphRanges(ImFontAtlas& atlas) noexcept {
-    // Host and bundled-plugin text outside ImGui's common 2500 glyphs.
-    static constexpr ImWchar kSupplementalRanges[] = {
-        0x4F59, 0x4F59,
-        0x5149, 0x5149,
-        0x55B5, 0x55B5,
-        0x5E27, 0x5E27,
-        0x5ED3, 0x5ED3,
-        0x5F20, 0x5F20,
-        0x62DF, 0x62DF,
-        0x6781, 0x6781,
-        0x6D4F, 0x6D4F,
-        0x70EC, 0x70EC,
-        0x72E9, 0x72E9,
-        0x76C2, 0x76C2,
-        0x7948, 0x7948,
-        0x7EB8, 0x7EB8,
-        0x7EEF, 0x7EEF,
-        0x7FE1, 0x7FE1,
-        0x82D4, 0x82D4,
-        0x83B9, 0x83B9,
-        0x85D3, 0x85D3,
-        0x8D26, 0x8D26,
-        0x8F91, 0x8F91,
-        0x91C9, 0x91C9,
-        0x938F, 0x938F,
-        0x9608, 0x9608,
-        0x9891, 0x9891,
-        0x9EDB, 0x9EDB,
-        0,
-    };
+    // Host and plugin windows draw localized text with the default font. Bake
+    // every GB2312 ideograph plus general punctuation so characters outside
+    // ImGui's common 2500 glyphs do not render as the missing-glyph '?'.
+    static constexpr ImWchar kGeneralPunctuation[] = {0x2000, 0x206F, 0};
     static ImVector<ImWchar> ranges;
     if (ranges.empty()) {
         ImFontGlyphRangesBuilder builder;
         builder.AddRanges(atlas.GetGlyphRangesChineseSimplifiedCommon());
-        builder.AddRanges(kSupplementalRanges);
+        builder.AddRanges(kGeneralPunctuation);
+        ImWchar codepoint = 0x4E00;
+        for (const ImWchar offset : kGb2312IdeographOffsets) {
+            codepoint = static_cast<ImWchar>(codepoint + offset);
+            builder.AddChar(codepoint);
+        }
         builder.BuildRanges(&ranges);
     }
     return ranges.Data;
