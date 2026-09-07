@@ -1189,6 +1189,7 @@ if(ANOMALY_BUILD_BUILTIN_PLUGINS)
     anomaly_copy_builtin_locales(anomaly_builtin_wallet_collector WalletCollector)
     anomaly_copy_builtin_locales(anomaly_builtin_box_auto BoxAuto)
     anomaly_copy_builtin_locales(anomaly_builtin_combat_box CombatBox)
+    anomaly_copy_builtin_locales(anomaly_builtin_clone_enter CloneEnter)
     set_target_properties(anomaly_builtin_nte_position PROPERTIES PDB_NAME NtePosition)
     set_target_properties(anomaly_builtin_nte_teleport PROPERTIES PDB_NAME NteTeleport)
     set_target_properties(anomaly_builtin_nte_navigation PROPERTIES PDB_NAME NteNavmeshDemo)
@@ -1531,6 +1532,8 @@ if(TARGET anomaly_builtin_clone_enter)
         LIBRARY DESTINATION Anomaly/plugins/CloneEnter COMPONENT GameRuntime)
     install(FILES plugins/CloneEnter/manifest.json
         DESTINATION Anomaly/plugins/CloneEnter COMPONENT GameRuntime)
+    install(DIRECTORY plugins/CloneEnter/locales/
+        DESTINATION Anomaly/plugins/CloneEnter/locales COMPONENT GameRuntime)
 endif()
 if(TARGET anomaly_builtin_dll_loader)
     install(TARGETS anomaly_builtin_dll_loader
