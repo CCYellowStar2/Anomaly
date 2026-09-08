@@ -100,7 +100,7 @@ constexpr double kProgressThresholdCentimeters = 80.0;
 constexpr double kReissueDelaySeconds = 4.0;
 constexpr std::uint32_t kNavigationMaxAttempts = 2;
 constexpr double kApproachRadiusCentimeters = 100.0;
-constexpr double kFallOutThresholdCentimeters = 1500.0;
+constexpr double kFallOutThresholdCentimeters = 1000.0;
 constexpr double kScanActorRadiusCentimeters = 1500.0;
 constexpr std::string_view kLandmarkWorld = "XL_map_bigworld_test";
 constexpr double kLandmarkArrivalRadiusCentimeters = 500.0;
@@ -256,6 +256,7 @@ struct Context final {
     std::atomic_bool developer_mode{};
     std::atomic_bool stop_movement_pending{};
     double manual_teleport_x{}, manual_teleport_y{}, manual_teleport_z{};
+    std::atomic<double> teleport_z_offset{kTeleportZOffset};
     bool manual_landmark_pending{};
     double manual_landmark_target[3]{};
     bool manual_navigating{};
@@ -2062,7 +2063,7 @@ bool Teleport(Context& context, const Point& p) noexcept {
     request.player = ps.handle;
     request.position[0] = p.x;
     request.position[1] = p.y;
-    request.position[2] = p.z + kTeleportZOffset;
+    request.position[2] = p.z + context.teleport_z_offset.load(std::memory_order_relaxed);
     return context.teleport->teleport(context.teleport->user, &request).code ==
         ANOMALY_STATUS_V1_OK;
 }
@@ -2321,7 +2322,8 @@ bool PrepareShopStealth(Context& context, const Point& target, const std::chrono
         double position[3]{};
         const bool arrived = SnapshotPlayerPosition(context, position) &&
             PlanarDistanceSquared(position[0], position[1], kShopSafePoint[0], kShopSafePoint[1]) <= 500.0 * 500.0 &&
-            std::abs(position[2] - (kShopSafePoint[2] + kTeleportZOffset)) <= 1500.0;
+            std::abs(position[2] - (kShopSafePoint[2] +
+                context.teleport_z_offset.load(std::memory_order_relaxed))) <= 1500.0;
         if (arrived && context.shop_safe_arrival == std::chrono::steady_clock::time_point{}) {
             context.shop_safe_arrival = now;
             context.shop_safe_deadline = now + kShopSafeDeadline;
@@ -2597,7 +2599,7 @@ void TickPickup(Context& context, const Point& p,
         (snapshot.flags & ANOMALY_NTE_PICKUP_V1_VALID) != 0 &&
         snapshot.sequence > context.pickup_baseline_sequence &&
         snapshot.state == ANOMALY_NTE_PICKUP_V1_COMPLETE) {
-        if (snapshot.confirmed > 0 || snapshot.triggered > 0) {
+        if (snapshot.confirmed > 0) {
             ++context.picked;
             ++context.current_index;
             ResetPointState(context);
@@ -2766,26 +2768,20 @@ void TickFoodPickup(Context& context, const Point& p,
         }
         if (context.target_actor == 0) {
             ++context.retry_count;
-            if (context.retry_count < 6) {
+            if (context.retry_count < 15) {
                 context.due = now + std::chrono::milliseconds(1000);
                 context.status = "等待加载 " + p.row_name + " (" +
                     std::to_string(context.retry_count) + ")";
             } else if (context.teleport_retry == 0) {
                 std::uintptr_t verify_actor =
                     ScanForActor(context, p, ActorPrefixForCategory(p.category));
-                if (verify_actor == 0) {
-                    ++context.skipped;
-                    ++context.current_index;
-                    ResetPointState(context);
-                    context.due = now;
-                    context.status = "箱子不存在，跳过 " + p.row_name;
-                    return;
-                }
                 context.teleport_retry = 1;
                 context.teleported = false;
                 context.retry_count = 0;
                 context.due = now + std::chrono::milliseconds(2000);
-                context.status = "重传 " + p.row_name;
+                context.status = verify_actor == 0
+                    ? "箱子未加载，重传 " + p.row_name
+                    : "重传 " + p.row_name;
             } else {
                 ++context.skipped;
                 ++context.current_index;
@@ -2910,6 +2906,36 @@ void TickFoodPickup(Context& context, const Point& p,
             context.status = "拾取不可用 " + p.row_name;
             return;
         }
+        {
+            double actor_pos3[3]{};
+            double player_pos3[3]{};
+            if (ReadActorLocation(context, context.target_actor, actor_pos3) &&
+                SnapshotPlayerPosition(context, player_pos3)) {
+                const double dx3 = player_pos3[0] - actor_pos3[0];
+                const double dy3 = player_pos3[1] - actor_pos3[1];
+                const double dz3 = player_pos3[2] - actor_pos3[2];
+                const double dist3 =
+                    std::sqrt(dx3 * dx3 + dy3 * dy3 + dz3 * dz3);
+                if (dist3 > kTargetActorMaxDistanceCentimeters) {
+                    Point ap;
+                    ap.x = actor_pos3[0];
+                    ap.y = actor_pos3[1];
+                    ap.z = actor_pos3[2];
+                    if (Teleport(context, ap)) {
+                        context.due =
+                            now + std::chrono::milliseconds(1000);
+                        context.status = "距离过远，传送到物品 " + p.row_name;
+                        return;
+                    }
+                    ++context.skipped;
+                    ++context.current_index;
+                    ResetPointState(context);
+                    context.due = now;
+                    context.status = "距离过远传送失败，跳过 " + p.row_name;
+                    return;
+                }
+            }
+        }
         if (!context.pickup_started) {
             AnomalyNtePickupSnapshotV1 baseline{sizeof(baseline)};
             if (context.pickup->snapshot(context.pickup->user, &baseline).code !=
@@ -2950,7 +2976,7 @@ void TickFoodPickup(Context& context, const Point& p,
             (snapshot.flags & ANOMALY_NTE_PICKUP_V1_VALID) != 0 &&
             snapshot.sequence > context.pickup_baseline_sequence &&
             snapshot.state == ANOMALY_NTE_PICKUP_V1_COMPLETE) {
-            if (snapshot.confirmed > 0 || snapshot.triggered > 0) {
+            if (snapshot.confirmed > 0) {
                 ++context.picked;
                 ++context.current_index;
                 ResetPointState(context);
@@ -3019,6 +3045,19 @@ void TickFoodPickup(Context& context, const Point& p,
                 context.status = "拾取重试 " + p.row_name;
                 return;
             }
+            if (context.teleport_retry == 0) {
+                context.teleport_retry = 1;
+                context.teleported = false;
+                context.target_actor = 0;
+                context.retry_count = 0;
+                context.pickup_retries = 0;
+                context.pickup_started = false;
+                context.food_approaching = false;
+                context.food_has_last_pos = false;
+                context.due = now + std::chrono::milliseconds(2000);
+                context.status = "拾取失败，重传 " + p.row_name;
+                return;
+            }
             ++context.skipped;
             ++context.current_index;
             ResetPointState(context);
@@ -3027,6 +3066,19 @@ void TickFoodPickup(Context& context, const Point& p,
             return;
         }
         if (now >= context.pickup_deadline) {
+            if (context.teleport_retry == 0) {
+                context.teleport_retry = 1;
+                context.teleported = false;
+                context.target_actor = 0;
+                context.retry_count = 0;
+                context.pickup_retries = 0;
+                context.pickup_started = false;
+                context.food_approaching = false;
+                context.food_has_last_pos = false;
+                context.due = now + std::chrono::milliseconds(2000);
+                context.status = "拾取超时，重传 " + p.row_name;
+                return;
+            }
             ++context.skipped;
             ++context.current_index;
             ResetPointState(context);
@@ -3985,6 +4037,15 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     const std::string current_mode = context.localizer.Format(
         "label.current_mode", "Mode: {0}", mode_args);
     ui->text(ui->user, anomaly::sdk::StringView(current_mode));
+    if (ui->input_double != nullptr) {
+        double z_offset = context.teleport_z_offset.load(std::memory_order_relaxed);
+        const std::string z_offset_label =
+            context.localizer.Text("label.z_offset", "Z Offset (cm)");
+        if (ui->input_double(ui->user, anomaly::sdk::StringView(z_offset_label),
+                             &z_offset, 10.0, 100.0)) {
+            context.teleport_z_offset.store(z_offset, std::memory_order_relaxed);
+        }
+    }
     const std::string start_index_label =
         context.localizer.Text("label.start_index", "Start Index");
     ui->input_uint32(ui->user, anomaly::sdk::StringView(start_index_label),
@@ -4151,6 +4212,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         anomaly::sdk::StringView("anomaly.local.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.1.14"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("0.1.15"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
