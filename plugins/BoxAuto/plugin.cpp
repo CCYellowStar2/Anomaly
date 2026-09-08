@@ -18,7 +18,6 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <new>
@@ -116,6 +115,16 @@ constexpr std::uint32_t kPickupMaximumItems = 1;
 constexpr double kPickupTimeoutSeconds = 8.0;
 constexpr std::uint32_t kPickupMaximumRetries = 3;
 constexpr double kFallbackVerifyRadiusCentimeters = 600.0;
+constexpr double kShopSafePoint[3]{-129487.089561, 166235.911261, 6708.454053};
+constexpr std::string_view kShopExcludedPointB018 = "HTTargetPoint_StealGoods_Item_B_018";
+constexpr std::string_view kShopExcludedPointA033 = "HTTargetPoint_StealGoods_Item_A_033";
+constexpr std::chrono::seconds kShopSafeRetryDelay{8};
+constexpr std::chrono::seconds kShopSafeRetryInterval{2};
+constexpr std::chrono::seconds kShopSafeDeadline{60};
+constexpr std::uint32_t kShopSafeMaximumTransferAttempts = 3;
+constexpr double kShopExitRecoveryDistance = 1800.0;
+constexpr std::chrono::milliseconds kShopExitRecoverySettle{1200};
+constexpr std::uint32_t kShopExitRecoveryAttempts = 3;
 
 struct RawName final {
     std::int32_t comparison_index{};
@@ -129,6 +138,11 @@ struct Point final {
     double z{};
     std::string category;
 };
+
+bool IsExcludedShopPoint(const std::string_view row_name) noexcept {
+    return row_name == kShopExcludedPointB018 ||
+        row_name == kShopExcludedPointA033;
+}
 
 struct MapLandmark final {
     std::uint64_t sequence{};
@@ -224,6 +238,19 @@ struct Context final {
     char filter[128]{};
     std::string type_prefix;
     std::atomic_bool read_pending{};
+    const AnomalyNteSkillsServiceV1* skills{};
+    const AnomalyNteSkillInvocationServiceV1* skill_invocation{};
+    bool shop_stealth_ready{};
+    bool shop_safe_transfer_pending{};
+    std::uint32_t shop_safe_transfer_attempts{};
+    std::chrono::steady_clock::time_point shop_safe_arrival{};
+    std::chrono::steady_clock::time_point shop_safe_deadline{};
+    std::chrono::steady_clock::time_point shop_safe_retry_at{};
+    std::uint32_t shop_take_retries{};
+    bool shop_exit_recovery_active{};
+    bool shop_exit_transfer_pending{};
+    std::uint32_t shop_exit_transfer_attempts{};
+    std::chrono::steady_clock::time_point shop_exit_ready_at{};
     std::atomic_bool begin_pending{};
     std::atomic_bool manual_teleport_pending{};
     std::atomic_bool developer_mode{};
@@ -297,7 +324,7 @@ bool UsesPickupService(const std::string_view category) noexcept {
 
 bool IsRelaxedPrefix(const std::string_view prefix) noexcept {
     return prefix == "PropBox_Yahaha" || prefix == "PropBox_Once" ||
-        prefix == "Prison" || prefix == "InteractBox";
+        prefix == "Prison" || prefix == "InteractBox" || prefix == "ShopStealGoods_";
 }
 
 bool DeveloperModeEnabled(const AnomalyUiServiceV1* ui) noexcept {
@@ -417,6 +444,32 @@ bool TryBeginLandmarkTransfer(Context& context, const Point& target,
     return true;
 }
 
+void ResetShopStealthSession(Context& context) noexcept {
+    context.shop_stealth_ready = false;
+    context.shop_safe_transfer_pending = false;
+    context.shop_safe_transfer_attempts = 0;
+    context.shop_safe_arrival = std::chrono::steady_clock::time_point{};
+    context.shop_safe_deadline = std::chrono::steady_clock::time_point{};
+    context.shop_safe_retry_at = std::chrono::steady_clock::time_point{};
+    context.shop_exit_recovery_active = false;
+    context.shop_exit_transfer_pending = false;
+    context.shop_exit_transfer_attempts = 0;
+    context.shop_exit_ready_at = std::chrono::steady_clock::time_point{};
+}
+
+void BeginShopExitRecovery(Context& context) noexcept {
+    context.shop_stealth_ready = false;
+    context.shop_safe_transfer_pending = false;
+    context.shop_safe_transfer_attempts = 0;
+    context.shop_safe_arrival = std::chrono::steady_clock::time_point{};
+    context.shop_safe_deadline = std::chrono::steady_clock::time_point{};
+    context.shop_safe_retry_at = std::chrono::steady_clock::time_point{};
+    context.shop_exit_recovery_active = true;
+    context.shop_exit_transfer_pending = false;
+    context.shop_exit_transfer_attempts = 0;
+    context.shop_exit_ready_at = std::chrono::steady_clock::time_point{};
+}
+
 void ResetPointState(Context& context) noexcept {
     context.teleported = false;
     context.moving = false;
@@ -438,6 +491,7 @@ void ResetPointState(Context& context) noexcept {
     context.pickup_deadline = std::chrono::steady_clock::time_point{};
     context.pickup_retries = 0;
     context.interact_verify_deadline = std::chrono::steady_clock::time_point{};
+    context.shop_take_retries = 0;
 }
 
 // Caller must hold context.mutex.
@@ -1342,6 +1396,7 @@ constexpr std::string_view CategoryForChoice(const std::uint32_t choice) noexcep
         case 7: return "item_food";
         case 8: return "prison";
         case 9: return "wallet";
+        case 11: return "shop_steal";
         default: return "";
     }
 }
@@ -1357,6 +1412,7 @@ constexpr std::string_view ActorPrefixForChoice(const std::uint32_t choice) noex
         case 7: return "PropBox_Once";
         case 8: return "Prison";
         case 9: return "InteractBox";
+        case 11: return "ShopStealGoods_";
         default: return "";
     }
 }
@@ -1372,6 +1428,7 @@ constexpr std::string_view ActorPrefixForCategory(
     if (category == "item_food") return "PropBox_Once";
     if (category == "prison") return "PropBox_Once";
     if (category == "wallet") return "InteractBox";
+    if (category == "shop_steal") return "ShopStealGoods_";
     return "";
 }
 
@@ -1449,12 +1506,15 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points) {
             category = "prison";
         } else if (type.find("InteractBox") == 0) {
             category = "wallet";
+        } else if (type.starts_with("ShopSteal_")) {
+            category = "shop_steal";
         } else {
             continue;
         }
         Point p;
         p.row_name = ResolveName(
             context.names, static_cast<std::uint32_t>(row_id.comparison_index));
+        if (category == "shop_steal" && IsExcludedShopPoint(p.row_name)) continue;
         p.x = x;
         p.y = y;
         p.z = z;
@@ -1467,7 +1527,7 @@ void ReadRandomItemTable(Context& context, std::vector<Point>& points) {
                 continue;
             }
         }
-        if (category == "wallet" && context.uncollected_catalog_valid) {
+        if ((category == "wallet" || category == "shop_steal") && context.uncollected_catalog_valid) {
             if (context.uncollected_points.find(p.row_name) ==
                 context.uncollected_points.end()) {
                 continue;
@@ -1602,8 +1662,6 @@ const char* CallGetString(std::uintptr_t fn, void* record, std::int32_t row,
     }
 }
 
-void RecDebug(const std::string& line) noexcept;
-
 bool ResolveRandomItemRecords(Context& context) noexcept {
     if (context.record_owner != 0 && context.fixed_record != 0 &&
         context.dynamic_record != 0) {
@@ -1639,8 +1697,7 @@ bool ResolveRandomItemRecords(Context& context) noexcept {
     return context.fixed_record != 0 && context.dynamic_record != 0;
 }
 
-bool ReadRecordSelections(Context& context, const char* tag,
-                          const std::uintptr_t record,
+bool ReadRecordSelections(const std::uintptr_t record,
                           std::unordered_set<std::string>& points) noexcept {
     if (record == 0) return false;
     std::uintptr_t owner{};
@@ -1652,25 +1709,21 @@ bool ReadRecordSelections(Context& context, const char* tag,
         record_index < 0 || record_index > 4096) {
         return false;
     }
-    RecDebug(std::string(tag) + " idx=" + std::to_string(record_index));
     std::uintptr_t descriptors{};
     if (!Read(reinterpret_cast<const void*>(
                   owner + kRecordDescriptorTableOffset), descriptors) ||
         descriptors == 0) {
         return false;
     }
-    RecDebug(std::string(tag) + " descriptors=" + std::to_string(descriptors));
     const std::uintptr_t descriptor =
         descriptors +
         static_cast<std::uintptr_t>(record_index) * kRecordDescriptorStride;
-    RecDebug(std::string(tag) + " descriptor=" + std::to_string(descriptor));
     std::uintptr_t store{};
     if (!Read(reinterpret_cast<const void*>(
                   descriptor + kRecordDescriptorStoreOffset), store) ||
         store == 0) {
         return false;
     }
-    RecDebug(std::string(tag) + " store=" + std::to_string(store));
     struct RecordArrayHeader {
         std::uintptr_t data{};
         std::int32_t count{};
@@ -1685,9 +1738,6 @@ bool ReadRecordSelections(Context& context, const char* tag,
         (rows.count != 0 && rows.data == 0)) {
         return false;
     }
-    RecDebug(std::string(tag) + " rows.count=" + std::to_string(rows.count) +
-             " capacity=" + std::to_string(rows.capacity) +
-             " data=" + std::to_string(rows.data));
     if (rows.count == 0) return true;
     std::vector<std::uintptr_t> row_objects(static_cast<std::size_t>(rows.count));
     if (!ReadBytes(reinterpret_cast<const void*>(rows.data), row_objects.data(),
@@ -1718,9 +1768,9 @@ bool ReadRecordSelections(Context& context, const char* tag,
 bool RefreshUncollectedCatalog(Context& context) noexcept {
     if (!ResolveRandomItemRecords(context)) return false;
     context.uncollected_points.clear();
-    ReadRecordSelections(context, "fixed", context.fixed_record,
+    ReadRecordSelections(context.fixed_record,
                          context.uncollected_points);
-    ReadRecordSelections(context, "dynamic", context.dynamic_record,
+    ReadRecordSelections(context.dynamic_record,
                          context.uncollected_points);
     context.uncollected_catalog_valid = true;
     return true;
@@ -1733,36 +1783,10 @@ bool RefreshPickedUpCatalog(Context& context) noexcept {
         context.picked_up_valid = false;
         return false;
     }
-    ReadRecordSelections(context, "pickup", context.pickup_record,
+    ReadRecordSelections(context.pickup_record,
                          context.picked_up_points);
     context.picked_up_valid = true;
     return true;
-}
-
-void DumpUncollected(Context& context) noexcept {
-    std::FILE* fp = std::fopen("D:\\randomitem-uncollected.txt", "w");
-    if (fp == nullptr) return;
-    std::fprintf(fp, "controller=0x%llX\n",
-        static_cast<unsigned long long>(context.controller));
-    std::fprintf(fp, "get_record_owner_address=0x%llX\n",
-        static_cast<unsigned long long>(context.get_record_owner_address));
-    std::fprintf(fp, "record_owner=0x%llX fixed=0x%llX dynamic=0x%llX\n",
-        static_cast<unsigned long long>(context.record_owner),
-        static_cast<unsigned long long>(context.fixed_record),
-        static_cast<unsigned long long>(context.dynamic_record));
-    std::fprintf(fp, "uncollected=%zu\n", context.uncollected_points.size());
-    for (const std::string& name : context.uncollected_points) {
-        std::fprintf(fp, "%s\n", name.c_str());
-    }
-    std::fclose(fp);
-}
-
-void RecDebug(const std::string& line) noexcept {
-    std::FILE* fp = std::fopen("D:\\record-debug.txt", "a");
-    if (fp != nullptr) {
-        std::fprintf(fp, "%s\n", line.c_str());
-        std::fclose(fp);
-    }
 }
 
 bool GetPlayerController(Context& context) noexcept {
@@ -1823,345 +1847,13 @@ bool GetPlayerController(Context& context) noexcept {
     return true;
 }
 
-void ProbeYahahaState(Context& context) noexcept {
-    std::FILE* fp = std::fopen("D:\\yahaha-probe.txt", "w");
-    if (fp == nullptr) return;
-    if (context.controller == 0 || context.controller_class == 0) {
-        std::fprintf(fp, "no controller\n");
-        std::fclose(fp);
-        return;
-    }
-    std::uintptr_t get_state_fn{};
-    if (!FindFunction(context.names, context.controller_class, "GetYaHaHaState",
-                      2, 9, get_state_fn)) {
-        std::fprintf(fp, "GetYaHaHaState not found\n");
-        std::fclose(fp);
-        return;
-    }
-    std::fprintf(fp, "GetYaHaHaState=0x%llX\n",
-        static_cast<unsigned long long>(get_state_fn));
-    void* table_object{};
-    AnomalyGenerationHandleV1 handle{};
-    if (context.objects->find_exact(
-            context.objects->user,
-            anomaly::sdk::StringView(kBigWorldYaHaHaTablePath), &handle)
-            .code != ANOMALY_STATUS_V1_OK ||
-        handle.id == 0) {
-        std::fprintf(fp, "yahaha table not found\n");
-        std::fclose(fp);
-        return;
-    }
-    if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
-                            context.g_objects_address)) {
-        std::fprintf(fp, "gobjects failed\n");
-        std::fclose(fp);
-        return;
-    }
-    const auto index = ANOMALY_UE5_OBJECT_HANDLE_INDEX(handle);
-    table_object = ObjectAt(context.g_objects_address, index);
-    if (table_object == nullptr) {
-        std::fprintf(fp, "ObjectAt failed\n");
-        std::fclose(fp);
-        return;
-    }
-    struct Header {
-        std::uintptr_t data{};
-        std::int32_t count{};
-        std::int32_t capacity{};
-    } header;
-    if (!Read(reinterpret_cast<const void*>(
-                  reinterpret_cast<std::uintptr_t>(table_object) +
-                      kDataTableRowMapOffset),
-              header) ||
-        header.count <= 0 || header.capacity < header.count || header.data == 0) {
-        std::fprintf(fp, "rowmap failed\n");
-        std::fclose(fp);
-        return;
-    }
-    const std::int32_t limit = (std::min)(header.count, 15);
-    for (std::int32_t i = 0; i < limit; ++i) {
-        const auto element =
-            header.data + static_cast<std::uintptr_t>(i) * kDataTableRowStride;
-        RawName row_id{};
-        if (!Read(reinterpret_cast<const void*>(element), row_id) ||
-            row_id.comparison_index == 0) {
-            continue;
-        }
-        const std::string name = ResolveName(
-            context.names, static_cast<std::uint32_t>(row_id.comparison_index));
-        std::uint8_t params[9]{};
-        std::int32_t cmp = row_id.comparison_index;
-        std::uint32_t num = row_id.number;
-        std::memcpy(params + 0, &cmp, sizeof(cmp));
-        std::memcpy(params + 4, &num, sizeof(num));
-        const bool ok = Invoke(reinterpret_cast<void*>(context.controller),
-                               reinterpret_cast<void*>(get_state_fn), params);
-        const int state = ok ? static_cast<int>(params[8]) : -1;
-        std::fprintf(fp, "%s => %d\n", name.c_str(), state);
-    }
-    std::fprintf(fp, "--- RandomItemDrop ---\n");
-    void* drop_object{};
-    AnomalyGenerationHandleV1 drop_handle{};
-    if (context.objects->find_exact(
-            context.objects->user,
-            anomaly::sdk::StringView(kRandomItemDropTablePath), &drop_handle)
-            .code != ANOMALY_STATUS_V1_OK ||
-        drop_handle.id == 0) {
-        std::fprintf(fp, "drop table not found\n");
-    } else {
-        const auto drop_index = ANOMALY_UE5_OBJECT_HANDLE_INDEX(drop_handle);
-        drop_object = ObjectAt(context.g_objects_address, drop_index);
-        if (drop_object == nullptr) {
-            std::fprintf(fp, "drop ObjectAt failed\n");
-        } else {
-            Header drop_header;
-            if (!Read(reinterpret_cast<const void*>(
-                          reinterpret_cast<std::uintptr_t>(drop_object) +
-                              kDataTableRowMapOffset),
-                      drop_header) ||
-                drop_header.count <= 0 ||
-                drop_header.capacity < drop_header.count ||
-                drop_header.data == 0) {
-                std::fprintf(fp, "drop rowmap failed\n");
-            } else {
-                const std::int32_t drop_limit =
-                    (std::min)(drop_header.count, 12);
-                for (std::int32_t i = 0; i < drop_limit; ++i) {
-                    const auto element =
-                        drop_header.data +
-                        static_cast<std::uintptr_t>(i) * kDataTableRowStride;
-                    RawName row_id{};
-                    std::uintptr_t row{};
-                    if (!Read(reinterpret_cast<const void*>(element), row_id) ||
-                        row_id.comparison_index == 0 ||
-                        !Read(reinterpret_cast<const void*>(
-                                  element + kDataTableRowPointerOffset), row) ||
-                        row == 0) {
-                        continue;
-                    }
-                    const std::string row_name = ResolveName(
-                        context.names,
-                        static_cast<std::uint32_t>(row_id.comparison_index));
-                    std::fprintf(fp, "[%s]\n", row_name.c_str());
-                    for (const std::ptrdiff_t off : {16, 24, 56}) {
-                        std::uint32_t cmp{};
-                        if (!Read(reinterpret_cast<const void*>(row + off),
-                                  cmp) ||
-                            cmp == 0) {
-                            continue;
-                        }
-                        const std::string nm =
-                            ResolveName(context.names, cmp);
-                        std::uint8_t params[9]{};
-                        std::int32_t c = static_cast<std::int32_t>(cmp);
-                        std::uint32_t n = 0;
-                        std::memcpy(params + 0, &c, sizeof(c));
-                        std::memcpy(params + 4, &n, sizeof(n));
-                        const bool ok = Invoke(
-                            reinterpret_cast<void*>(context.controller),
-                            reinterpret_cast<void*>(get_state_fn), params);
-                        const int state = ok ? static_cast<int>(params[8]) : -1;
-                        std::fprintf(fp, "  off%td %s => %d\n", off,
-                                     nm.c_str(), state);
-                    }
-                }
-            }
-        }
-    }
-    std::fclose(fp);
-}
 
-void ProbeRecords(Context& context) noexcept {
-    std::FILE* fp = std::fopen("D:\\record-probe.txt", "w");
-    if (fp == nullptr) return;
-    if (context.record_owner == 0) {
-        std::fprintf(fp, "record_owner not resolved\n");
-        std::fclose(fp);
-        return;
-    }
-    std::uintptr_t owner_vtable{};
-    std::uintptr_t find_record_address{};
-    if (!Read(reinterpret_cast<const void*>(context.record_owner), owner_vtable) ||
-        owner_vtable == 0 ||
-        !Read(reinterpret_cast<const void*>(
-                  owner_vtable + kRecordOwnerFindRecordVtableOffset),
-              find_record_address) ||
-        find_record_address == 0) {
-        std::fprintf(fp, "find_record resolve failed\n");
-        std::fclose(fp);
-        return;
-    }
-    const char* names[] = {
-        "RandomItemFixedRecord", "RandomItemDynamicRecord",
-        "RandomItemPickUpRecord", "RandomItemRefreshCountRecord",
-        "PropBoxFixedRecord", "PropBoxDynamicRecord", "PropBoxRecord",
-        "RandomItemPropBoxRecord", "RandomItemPropBoxFixedRecord",
-        "RandomItemPropBoxDynamicRecord",
-        "YahahaFixedRecord", "YahahaDynamicRecord", "YahahaRecord",
-        "YahahaStateRecord",
-        "FoodFixedRecord", "FoodDynamicRecord", "FoodRecord",
-        "ItemFixedRecord", "ItemDynamicRecord", "ItemRecord",
-        "OnceFixedRecord", "OnceDynamicRecord", "OnceRecord",
-    };
-    for (const char* name : names) {
-        void* rec = CallFindRecord(
-            find_record_address, reinterpret_cast<void*>(context.record_owner),
-            name);
-        if (rec == nullptr) {
-            std::fprintf(fp, "%s => NULL\n", name);
-            continue;
-        }
-        std::unordered_set<std::string> pts;
-        ReadRecordSelections(context, name,
-                             reinterpret_cast<std::uintptr_t>(rec), pts);
-        std::fprintf(fp, "%s => rows=%zu\n", name, pts.size());
-        int shown = 0;
-        const bool full = (std::strcmp(name, "RandomItemPickUpRecord") == 0 ||
-                           std::strcmp(name, "RandomItemDynamicRecord") == 0);
-        const int limit = full ? 100000 : 6;
-        for (const std::string& pt : pts) {
-            if (shown++ >= limit) break;
-            std::fprintf(fp, "    %s\n", pt.c_str());
-        }
-    }
-    std::fclose(fp);
-}
 
-void ProbeAllRecords(Context& context) noexcept {
-    std::FILE* fp = std::fopen("D:\\all-records.txt", "w");
-    if (fp == nullptr) return;
-    if (context.record_owner == 0) {
-        std::fprintf(fp, "record_owner not resolved\n");
-        std::fclose(fp);
-        return;
-    }
-    std::uintptr_t descriptors{};
-    if (!Read(reinterpret_cast<const void*>(
-                  context.record_owner + kRecordDescriptorTableOffset),
-              descriptors) ||
-        descriptors == 0) {
-        std::fprintf(fp, "descriptor table failed\n");
-        std::fclose(fp);
-        return;
-    }
-    std::fprintf(fp, "descriptors=0x%llX\n",
-        static_cast<unsigned long long>(descriptors));
-    for (std::uint32_t idx = 0; idx < 60; ++idx) {
-        const std::uintptr_t descriptor =
-            descriptors +
-            static_cast<std::uintptr_t>(idx) * kRecordDescriptorStride;
-        std::uintptr_t store{};
-        if (!Read(reinterpret_cast<const void*>(
-                      descriptor + kRecordDescriptorStoreOffset), store) ||
-            store == 0) {
-            continue;
-        }
-        struct Hdr {
-            std::uintptr_t data{};
-            std::int32_t count{};
-            std::int32_t capacity{};
-        } rows;
-        if (!Read(reinterpret_cast<const void*>(
-                      store + kRecordStoreRowsOffset), rows) ||
-            rows.count < 0 || rows.count > 10000 ||
-            (rows.count != 0 && rows.data == 0)) {
-            std::fprintf(fp, "idx=%u store=0x%llX invalid\n", idx,
-                static_cast<unsigned long long>(store));
-            continue;
-        }
-        std::uint32_t name_id{};
-        Read(reinterpret_cast<const void*>(descriptor), name_id);
-        const std::string name = ResolveName(context.names, name_id);
-        std::fprintf(fp, "idx=%u name=%s rows=%d\n", idx, name.c_str(),
-                     rows.count);
-    }
-    std::fclose(fp);
-}
 
-void ProbeClassInteractFuncs(Context& context) noexcept {
-    std::FILE* fp = std::fopen("D:\\class-funcs.txt", "w");
-    if (fp == nullptr) return;
-    if (context.g_objects_address == 0 &&
-        !ResolveRipRelative(context, kGObjectsPattern, kGObjectsAddend,
-                            context.g_objects_address)) {
-        std::fprintf(fp, "gobjects failed\n");
-        std::fclose(fp);
-        return;
-    }
-    std::int32_t count{};
-    std::int32_t num_chunks{};
-    std::uintptr_t items{};
-    if (!Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectItemsOffset), items) ||
-        items == 0 ||
-        !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectCountOffset), count) ||
-        !Read(reinterpret_cast<const void*>(
-                  context.g_objects_address + kObjectNumChunksOffset), num_chunks) ||
-        count <= 0 || num_chunks <= 0) {
-        std::fprintf(fp, "gobjects read failed\n");
-        std::fclose(fp);
-        return;
-    }
-    static const char* kTargetPrefixes[] = {
-        "HunterBox_", "CharacterUpBox_", "ChameleonBox", "FurnitureBox",
-        "PropBox_Geft"};
-    std::unordered_set<std::uint32_t> seen;
-    std::uint32_t cur_chunk = 0xFFFFFFFFu;
-    std::uintptr_t chunk{};
-    for (std::int32_t i = 0; i < count; ++i) {
-        const auto chunk_index = static_cast<std::uint32_t>(i) / kObjectChunkSize;
-        if (chunk_index != cur_chunk) {
-            cur_chunk = chunk_index;
-            if (!Read(reinterpret_cast<const void*>(
-                          items + static_cast<std::uintptr_t>(chunk_index) * sizeof(void*)), chunk) ||
-                chunk == 0) {
-                continue;
-            }
-        }
-        const auto within = static_cast<std::uint32_t>(i) % kObjectChunkSize;
-        std::uintptr_t object{};
-        if (!Read(reinterpret_cast<const void*>(
-                      chunk + static_cast<std::uintptr_t>(within) * kObjectItemStride), object) ||
-            object == 0) {
-            continue;
-        }
-        std::uintptr_t cls{};
-        if (!Read(reinterpret_cast<const void*>(object + kObjectClassOffset), cls) ||
-            cls == 0) {
-            continue;
-        }
-        std::uint32_t name_id{};
-        if (!Read(reinterpret_cast<const void*>(cls + kObjectNameOffset), name_id) ||
-            name_id == 0 || seen.contains(name_id)) {
-            continue;
-        }
-        seen.insert(name_id);
-        const std::string cls_name = ObjectName(context.names, cls);
-        if (cls_name.size() < 2 || cls_name[cls_name.size() - 1] != 'C' ||
-            cls_name[cls_name.size() - 2] != '_') {
-            continue;
-        }
-        bool matched = false;
-        for (const char* prefix : kTargetPrefixes) {
-            if (cls_name.find(prefix) != std::string::npos) {
-                matched = true;
-                break;
-            }
-        }
-        if (!matched) continue;
-        std::uintptr_t entries_fn{};
-        std::uintptr_t can_try_fn{};
-        const bool has_entries = FindFunction(
-            context.names, cls, "BPGetInteractEntries", 2, 24, entries_fn);
-        const bool has_can_try = FindFunction(
-            context.names, cls, "BPCanTryInteract", 3, 13, can_try_fn);
-        std::fprintf(fp, "%s | entries=%d can_try=%d\n", cls_name.c_str(),
-                     has_entries ? 1 : 0, has_can_try ? 1 : 0);
-    }
-    std::fclose(fp);
-}
+
+
+
+
 
 void BuildClassMap(Context& context) noexcept {
     if (context.g_objects_address == 0) return;
@@ -2180,7 +1872,7 @@ void BuildClassMap(Context& context) noexcept {
     }
     static const char* kPrefixes[] = {"HunterBox_", "CharacterUpBox_",
         "ChameleonBox", "FurnitureBox", "PropBox_Geft", "PropBox_Yahaha",
-        "PropBox_Once", "Prison", "InteractBox"};
+        "PropBox_Once", "Prison", "InteractBox", "ShopStealGoods_"};
     std::unordered_map<std::string, std::unordered_set<std::uint32_t>> class_map;
     std::unordered_map<std::uintptr_t, std::string> cache;
     std::uint32_t cur_chunk = 0xFFFFFFFFu;
@@ -2375,6 +2067,8 @@ bool Teleport(Context& context, const Point& p) noexcept {
         ANOMALY_STATUS_V1_OK;
 }
 
+bool HasShopStealthSkill(Context& context);
+
 void Begin(Context& context) {
     std::lock_guard<std::mutex> lock(context.mutex);
     RebuildFilteredLocked(context);
@@ -2383,13 +2077,15 @@ void Begin(Context& context) {
     context.picked = 0;
     context.skipped = 0;
     context.running = true;
-    context.teleported = false;
-    context.moving = false;
-    context.interacted = false;
-    context.target_actor = 0;
-    context.navigation_attempt = 0;
-    context.landmark_transfer_attempted = false;
-    context.landmark_transfer_wait = false;
+    ResetPointState(context);
+    ResetShopStealthSession(context);
+    if (CategoryForChoice(context.type_choice) == "shop_steal" &&
+        !HasShopStealthSkill(context)) {
+        context.running = false;
+        context.status = context.localizer.Text(
+            "status.shop_requires_zankou", "商店偷取需要使用残虹");
+        return;
+    }
     context.status = context.localizer.Text("status.started", "Started");
 }
 
@@ -2487,6 +2183,273 @@ bool TriggerInteractPickup(Context& context, const std::uintptr_t actor) noexcep
         }
     }
     return false;
+}
+
+void LogShop(Context& context, const std::string& message) {
+    const auto* core = anomaly::sdk::Host(context.host).Query<AnomalyCoreServiceV1>(ANOMALY_CORE_SERVICE_V1_ID, 1).get();
+    if (core && core->log) core->log(core->user, ANOMALY_CORE_LOG_LEVEL_V1_INFO, anomaly::sdk::StringView("shop-collect " + message));
+}
+
+bool HasShopStealthSkill(Context& context) {
+    if (!context.skills || !context.skills->frame || !context.skills->snapshot_at ||
+        !context.skills->ability_path_utf8) return false;
+    AnomalyNteSkillFrameV1 frame{sizeof(frame)};
+    if (context.skills->frame(context.skills->user, &frame).code != ANOMALY_STATUS_V1_OK ||
+        (frame.flags & ANOMALY_NTE_SKILL_V1_VALID) == 0 || frame.skill_count > 256) return false;
+    for (std::uint32_t i = 0; i < frame.skill_count; ++i) {
+        AnomalyNteSkillSnapshotV1 skill{sizeof(skill)};
+        if (context.skills->snapshot_at(context.skills->user, frame.generation, i, &skill).code != ANOMALY_STATUS_V1_OK ||
+            (skill.flags & ANOMALY_NTE_SKILL_V1_VALID) == 0 ||
+            skill.character.id != frame.character.id || skill.character.generation != frame.character.generation) continue;
+        std::array<char, 1024> path{};
+        std::size_t size = path.size();
+        if (context.skills->ability_path_utf8(context.skills->user, skill.ability_class,
+                                               path.data(), &size).code == ANOMALY_STATUS_V1_OK &&
+            size > 0 && size <= path.size() && path[size - 1] == '\0' &&
+            std::string_view(path.data(), size - 1).ends_with(
+                "/GA_Zankou_InvisibleSkill.GA_Zankou_InvisibleSkill_C")) return true;
+    }
+    return false;
+}
+
+bool RequestShopStealth(Context& context) {
+    if (!context.skills || !context.skill_invocation || !context.session || !context.session->snapshot ||
+        !context.skills->frame || !context.skills->snapshot_at || !context.skills->ability_path_utf8 ||
+        !context.skill_invocation->activate) return false;
+    AnomalyNteSkillFrameV1 frame{sizeof(frame)};
+    AnomalyNteSessionSnapshotV1 session{sizeof(session)};
+    if (context.skills->frame(context.skills->user, &frame).code != ANOMALY_STATUS_V1_OK ||
+        (frame.flags & ANOMALY_NTE_SKILL_V1_VALID) == 0 || frame.skill_count > 256 ||
+        context.session->snapshot(context.session->user, &session).code != ANOMALY_STATUS_V1_OK || !session.world.id) return false;
+    for (std::uint32_t i = 0; i < frame.skill_count; ++i) {
+        AnomalyNteSkillSnapshotV1 skill{sizeof(skill)};
+        if (context.skills->snapshot_at(context.skills->user, frame.generation, i, &skill).code != ANOMALY_STATUS_V1_OK ||
+            (skill.flags & ANOMALY_NTE_SKILL_V1_VALID) == 0 || skill.character.id != frame.character.id ||
+            skill.character.generation != frame.character.generation) continue;
+        std::array<char, 1024> path{};
+        std::size_t size = path.size();
+        if (context.skills->ability_path_utf8(context.skills->user, skill.ability_class, path.data(), &size).code != ANOMALY_STATUS_V1_OK ||
+            size == 0 || size > path.size() || path[size - 1] != '\0' ||
+            !std::string_view(path.data(), size - 1).ends_with("/GA_Zankou_InvisibleSkill.GA_Zankou_InvisibleSkill_C")) continue;
+        if ((skill.flags & ANOMALY_NTE_SKILL_V1_COOLDOWN_VALID) != 0 && skill.cooldown_remaining_seconds > 0.0F) return false;
+        AnomalyNteSkillInvocationRequestV1 request{sizeof(request)};
+        request.world = session.world;
+        request.character = frame.character;
+        request.skill = skill.handle;
+        AnomalyNteSkillInvocationResultV1 result{sizeof(result)};
+        const auto status = context.skill_invocation->activate(context.skill_invocation->user, &request, &result);
+        if (status.code == ANOMALY_STATUS_V1_OK && result.accepted != 0) {
+            LogShop(context, "fixed safe-point invisibility accepted");
+            return true;
+        }
+        LogShop(context, "fixed safe-point invisibility rejected code=" + std::to_string(status.code) +
+            " accepted=" + std::to_string(result.accepted));
+        return false;
+    }
+    return false;
+}
+
+bool StartShopExitTransfer(Context& context, const Point& target,
+                           const std::chrono::steady_clock::time_point now) {
+    if (context.shop_exit_transfer_attempts >= kShopExitRecoveryAttempts) {
+        return false;
+    }
+    double position[3]{};
+    if (!SnapshotPlayerPosition(context, position)) return false;
+    double dx = position[0] - target.x;
+    double dy = position[1] - target.y;
+    const double length = std::sqrt(dx * dx + dy * dy);
+    if (length < 100.0) {
+        dx = 1.0;
+        dy = 0.0;
+    } else {
+        dx /= length;
+        dy /= length;
+    }
+    const auto attempt = context.shop_exit_transfer_attempts;
+    if (attempt == 1) {
+        std::swap(dx, dy);
+        dy = -dy;
+    } else if (attempt == 2) {
+        dx = -dx;
+        dy = -dy;
+    }
+    Point exit{"shop-exit-recovery", position[0] + dx * kShopExitRecoveryDistance,
+               position[1] + dy * kShopExitRecoveryDistance, position[2],
+               "shop_steal"};
+    if (!Teleport(context, exit)) return false;
+    ++context.shop_exit_transfer_attempts;
+    context.shop_exit_transfer_pending = true;
+    context.shop_exit_ready_at = now + kShopExitRecoverySettle;
+    context.teleported = false;
+    context.target_actor = 0;
+    context.status = "商店拿取：移到店外恢复隐身";
+    LogShop(context, "shop exit transfer attempt=" +
+        std::to_string(context.shop_exit_transfer_attempts));
+    return true;
+}
+
+bool PrepareShopStealth(Context& context, const Point& target, const std::chrono::steady_clock::time_point now) {
+    if (context.shop_exit_recovery_active) {
+        if (context.shop_exit_transfer_pending) {
+            if (now < context.shop_exit_ready_at) {
+                context.due = now + std::chrono::milliseconds(200);
+                return false;
+            }
+            context.shop_exit_transfer_pending = false;
+            if (RequestShopStealth(context)) {
+                context.shop_exit_recovery_active = false;
+                context.shop_exit_transfer_attempts = 0;
+                context.shop_exit_ready_at = {};
+                context.shop_stealth_ready = true;
+                context.teleported = false;
+                context.due = now + std::chrono::seconds(1);
+                context.status = "商店拿取：店外隐身成功，返回目标";
+                return false;
+            }
+        }
+        if (StartShopExitTransfer(context, target, now)) {
+            context.due = now + std::chrono::milliseconds(200);
+            return false;
+        }
+        context.shop_exit_recovery_active = false;
+        context.shop_exit_transfer_pending = false;
+        context.shop_exit_ready_at = {};
+        context.status = "商店拿取：店外恢复失败，前往固定安全点";
+    }
+    if (context.shop_safe_transfer_pending) {
+        double position[3]{};
+        const bool arrived = SnapshotPlayerPosition(context, position) &&
+            PlanarDistanceSquared(position[0], position[1], kShopSafePoint[0], kShopSafePoint[1]) <= 500.0 * 500.0 &&
+            std::abs(position[2] - (kShopSafePoint[2] + kTeleportZOffset)) <= 1500.0;
+        if (arrived && context.shop_safe_arrival == std::chrono::steady_clock::time_point{}) {
+            context.shop_safe_arrival = now;
+            context.shop_safe_deadline = now + kShopSafeDeadline;
+            LogShop(context, "fixed safe point arrived; waiting for character load");
+        }
+        if (!arrived && now >= context.shop_safe_retry_at) {
+            if (context.shop_safe_transfer_attempts >= kShopSafeMaximumTransferAttempts) {
+                context.running = false;
+                context.shop_safe_transfer_pending = false;
+                context.stop_movement_pending = true;
+                context.status = "商店拿取：固定安全点重传次数用尽，已停止";
+                context.due = now + std::chrono::seconds(1);
+                return false;
+            }
+            Point safe{"fixed-shop-safe", kShopSafePoint[0], kShopSafePoint[1], kShopSafePoint[2], "shop_steal"};
+            if (Teleport(context, safe)) {
+                ++context.shop_safe_transfer_attempts;
+                context.shop_safe_retry_at = now + kShopSafeRetryDelay;
+                context.shop_safe_deadline = now + kShopSafeDeadline;
+                context.status = "商店拿取：安全点未加载，正在重传";
+                LogShop(context, "fixed safe point transfer retry=" + std::to_string(context.shop_safe_transfer_attempts));
+            } else {
+                context.shop_safe_retry_at = now + kShopSafeRetryInterval;
+            }
+        }
+        if (!arrived || now - context.shop_safe_arrival < std::chrono::seconds(2)) {
+            if (now >= context.shop_safe_deadline) {
+                context.running = false;
+                context.shop_safe_transfer_pending = false;
+                context.stop_movement_pending = true;
+                context.status = "商店拿取：固定安全点加载超时，已停止";
+            }
+            context.due = now + std::chrono::milliseconds(300);
+            return false;
+        }
+        if (RequestShopStealth(context)) {
+            context.shop_safe_transfer_pending = false;
+            context.shop_stealth_ready = true;
+            context.shop_safe_transfer_attempts = 0;
+            context.shop_safe_arrival = {};
+            context.shop_safe_deadline = {};
+            context.shop_safe_retry_at = {};
+            context.teleported = false;
+            context.due = now + std::chrono::seconds(1);
+            context.status = "商店拿取：固定点隐身成功，返回目标";
+            return false;
+        }
+        if (now >= context.shop_safe_deadline) {
+            context.running = false;
+            context.shop_safe_transfer_pending = false;
+            context.stop_movement_pending = true;
+            context.status = "商店拿取：固定点仍无法开启隐身，已停止";
+        }
+        context.due = now + std::chrono::seconds(1);
+        return false;
+    }
+    double position[3]{};
+    if (!SnapshotPlayerPosition(context, position)) {
+        context.due = now + std::chrono::milliseconds(500);
+        return false;
+    }
+    Point safe{"fixed-shop-safe", kShopSafePoint[0], kShopSafePoint[1], kShopSafePoint[2], "shop_steal"};
+    if (!Teleport(context, safe)) {
+        context.running = false;
+        context.stop_movement_pending = true;
+        context.status = "商店拿取：无法到达固定安全点，已停止";
+        return false;
+    }
+    context.shop_safe_transfer_pending = true;
+    context.shop_safe_transfer_attempts = 1;
+    context.shop_safe_arrival = {};
+    context.shop_safe_deadline = now + kShopSafeDeadline;
+    context.shop_safe_retry_at = now + kShopSafeRetryDelay;
+    context.teleported = false;
+    context.target_actor = 0;
+    context.status = "商店拿取：前往固定安全点";
+    LogShop(context, "fixed safe point transfer point=" + target.row_name);
+    context.due = now + std::chrono::milliseconds(500);
+    return false;
+}
+
+bool ShopProperty(Context& context, std::uintptr_t cls, std::string_view name, std::int32_t size, std::uintptr_t& field, std::int32_t& offset) {
+    field = reinterpret_cast<std::uintptr_t>(ReadPointer(reinterpret_cast<void*>(cls + 112)));
+    for (unsigned i = 0; field && i < 256; ++i) {
+        std::uint32_t name_id{};
+        if (!Read(reinterpret_cast<void*>(field + 32), name_id)) return false;
+        if (ResolveName(context.names, name_id) == name) {
+            std::int32_t actual_size{};
+            return Read(reinterpret_cast<void*>(field + 52), actual_size) && actual_size == size &&
+                Read(reinterpret_cast<void*>(field + 68), offset) && offset >= 0;
+        }
+        const auto next = reinterpret_cast<std::uintptr_t>(ReadPointer(reinterpret_cast<void*>(field + 72)));
+        if (next == field) break;
+        field = next;
+    }
+    return false;
+}
+
+enum class ShopTakeResult : std::uint8_t {
+    retry,
+    not_stealth,
+    triggered,
+};
+
+bool ShopItemUsesBlueprint(Context& context, std::uintptr_t actor,
+                           bool& use_blueprint) {
+    const auto cls = reinterpret_cast<std::uintptr_t>(ReadPointer(reinterpret_cast<void*>(actor + kObjectClassOffset)));
+    if (!cls || !ObjectName(context.names, cls).starts_with("ShopStealGoods_")) return false;
+    std::uintptr_t field{};
+    std::int32_t offset{};
+    if (!ShopProperty(context, cls, "bUseBPInteractEntries", 1, field, offset) ||
+        !Read(reinterpret_cast<void*>(actor + offset), use_blueprint)) return false;
+    return true;
+}
+
+ShopTakeResult TakeShopItem(Context& context, std::uintptr_t actor) {
+    if (!context.trigger_interact_fn) return ShopTakeResult::retry;
+    bool use_blueprint{};
+    if (!ShopItemUsesBlueprint(context, actor, use_blueprint)) {
+        return ShopTakeResult::retry;
+    }
+    if (!use_blueprint) {
+        LogShop(context, "shop item is not in stealth pickup state");
+        return ShopTakeResult::not_stealth;
+    }
+    return TriggerInteractPickup(context, actor)
+        ? ShopTakeResult::triggered
+        : ShopTakeResult::retry;
 }
 
 bool ReadActorLocation(Context& context, const std::uintptr_t actor,
@@ -3095,6 +3058,10 @@ void Tick(Context& context) {
         return;
     }
     const Point& p = context.filtered_points[context.current_index];
+    if (p.category == "shop_steal" && !context.shop_stealth_ready) {
+        PrepareShopStealth(context, p, now);
+        return;
+    }
     if (!context.teleported && !context.moving && !context.landmark_transfer_wait) {
         if (context.developer_mode.load(std::memory_order_acquire)) {
             if (Teleport(context, p)) {
@@ -3331,7 +3298,8 @@ void Tick(Context& context) {
             }
             return;
         }
-        context.target_actor = ScanForActor(context, p, context.type_prefix);
+        context.target_actor = ScanForActor(context, p,
+            p.category == "shop_steal" ? ActorPrefixForCategory(p.category) : context.type_prefix);
         if (context.target_actor == 0) {
             ++context.retry_count;
             if (context.retry_count < 3) {
@@ -3455,14 +3423,61 @@ void Tick(Context& context) {
         context.interact_baseline = baseline;
         std::uint8_t params[12]{};
         std::memcpy(params, &context.target_actor, sizeof(context.target_actor));
-        if (Invoke(reinterpret_cast<void*>(context.controller),
-                   reinterpret_cast<void*>(context.server_interact_fn), params)) {
+        ShopTakeResult shop_result = ShopTakeResult::retry;
+        const bool triggered = p.category == "shop_steal"
+            ? (shop_result = TakeShopItem(context, context.target_actor),
+               shop_result == ShopTakeResult::triggered)
+            : Invoke(reinterpret_cast<void*>(context.controller),
+                     reinterpret_cast<void*>(context.server_interact_fn), params);
+        if (triggered) {
             context.interacted = true;
+            if (p.category == "shop_steal") LogShop(context, "shop interaction requested point=" + p.row_name);
+            context.interact_verify_deadline = now + std::chrono::seconds(p.category == "shop_steal" ? 30 : 8);
             context.due = now + std::chrono::milliseconds(3000);
             const std::array interacted_args{std::string_view(p.row_name)};
             context.status = context.localizer.Format(
                 "status.interacted", "Interacted [{0}]", interacted_args);
         } else {
+            if (p.category == "shop_steal") {
+                if (shop_result == ShopTakeResult::retry) {
+                    if (context.interact_retry < 5) {
+                        ++context.interact_retry;
+                        context.due = now + std::chrono::milliseconds(500);
+                        context.status = context.localizer.Text(
+                            "status.shop_interact_retry",
+                            "隐身有效，等待拾取入口重试");
+                        return;
+                    }
+                    context.target_actor = 0;
+                    context.interact_retry = 0;
+                    context.due = now + std::chrono::milliseconds(700);
+                    context.status = context.localizer.Text(
+                        "status.shop_interact_rescan",
+                        "隐身有效，重新扫描拾取目标");
+                    return;
+                }
+                if (context.shop_take_retries >= 2) {
+                    ++context.skipped;
+                    ++context.current_index;
+                    ResetPointState(context);
+                    context.due = now;
+                    context.status = "商店拿取失败，跳过 " + p.row_name;
+                    return;
+                }
+                ++context.shop_take_retries;
+                BeginShopExitRecovery(context);
+                context.teleported = false;
+                context.interacted = false;
+                context.target_actor = 0;
+                context.retry_count = 0;
+                context.interact_retry = 0;
+                context.teleport_retry = 0;
+                context.due = now + std::chrono::milliseconds(500);
+                context.status = context.localizer.Text(
+                    "status.shop_stealth_retry",
+                    "Shop pickup: stealth not active, moving outside to retry");
+                return;
+            }
             if (context.interact_retry < 2) {
                 ++context.interact_retry;
                 context.due = now + std::chrono::milliseconds(1000);
@@ -3495,6 +3510,71 @@ void Tick(Context& context) {
                 ResetPointState(context);
                 context.due = now;
             }
+        }
+        return;
+    }
+    if (p.category == "shop_steal") {
+        std::uint8_t finish{};
+        const bool disappeared = !IsObjectInGObjects(context, context.target_actor);
+        bool completed = disappeared ||
+            (Read(reinterpret_cast<const void*>(context.target_actor + kInteractFinishOffset), finish) &&
+             finish != context.interact_baseline);
+        if (!completed && now >= context.interact_verify_deadline) {
+            RefreshUncollectedCatalog(context);
+            completed = context.uncollected_catalog_valid &&
+                context.uncollected_points.find(p.row_name) ==
+                    context.uncollected_points.end();
+        }
+        if (completed) {
+            LogShop(context, std::string(completed ? "take confirmed point=" : "take timed out point=") + p.row_name);
+            const std::array args{std::string_view(p.row_name)};
+            context.status = context.localizer.Format(
+                "status.picked", "Picked [{0}]", args);
+            ++context.picked;
+            ++context.current_index;
+            ResetPointState(context);
+            context.due = now;
+        } else if (now >= context.interact_verify_deadline) {
+            bool still_stealth{};
+            if (ShopItemUsesBlueprint(context, context.target_actor, still_stealth) &&
+                still_stealth) {
+                context.interacted = false;
+                context.target_actor = 0;
+                context.interact_retry = 0;
+                context.interact_verify_deadline = {};
+                context.due = now + std::chrono::milliseconds(700);
+                context.status = context.localizer.Text(
+                    "status.shop_stealth_wait",
+                    "隐身仍有效，重新扫描拾取目标");
+                return;
+            }
+            if (context.shop_take_retries < 2) {
+                ++context.shop_take_retries;
+                BeginShopExitRecovery(context);
+                context.teleported = false;
+                context.moving = false;
+                context.interacted = false;
+                context.target_actor = 0;
+                context.retry_count = 0;
+                context.interact_retry = 0;
+                context.teleport_retry = 0;
+                context.can_interact_retries = 0;
+                context.due = now + std::chrono::milliseconds(500);
+                context.status = context.localizer.Text(
+                    "status.shop_take_retry",
+                    "Pickup not confirmed, moving outside to retry");
+            } else {
+                LogShop(context, "take timed out point=" + p.row_name);
+                const std::array args{std::string_view(p.row_name)};
+                context.status = context.localizer.Format(
+                    "status.pickup_timeout", "Pickup timed out [{0}]", args);
+                ++context.skipped;
+                ++context.current_index;
+                ResetPointState(context);
+                context.due = now;
+            }
+        } else {
+            context.due = now + std::chrono::milliseconds(300);
         }
         return;
     }
@@ -3592,6 +3672,11 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
     context->pickup = view.Query<AnomalyNtePickupServiceV1>(
         ANOMALY_NTE_PICKUP_SERVICE_V1_ID,
         ANOMALY_NTE_PICKUP_SERVICE_V1_VERSION).get();
+    context->skills = view.Query<AnomalyNteSkillsServiceV1>(
+        ANOMALY_NTE_SKILLS_SERVICE_V1_ID, ANOMALY_NTE_SKILLS_SERVICE_V1_VERSION).get();
+    context->skill_invocation = view.Query<AnomalyNteSkillInvocationServiceV1>(
+        ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_ID,
+        ANOMALY_NTE_SKILL_INVOCATION_SERVICE_V1_VERSION).get();
     context->oracle = new (std::nothrow) oracle_stone_impl::Context{};
     if (context->oracle != nullptr) {
         oracle_stone_impl::OracleInitialize(*context->oracle, host);
@@ -3634,15 +3719,10 @@ void ANOMALY_CALL Update(void* plugin_context, const double delta_seconds) {
     auto& context = *static_cast<Context*>(plugin_context);
     if (context.read_pending.exchange(false, std::memory_order_acq_rel)) {
         GetPlayerController(context);
-        ProbeYahahaState(context);
         RefreshUncollectedCatalog(context);
         RefreshPickedUpCatalog(context);
-        ProbeRecords(context);
-        ProbeAllRecords(context);
-        DumpUncollected(context);
         ReadTable(context);
         BuildClassMap(context);
-        ProbeClassInteractFuncs(context);
     }
     if (context.begin_pending.exchange(false, std::memory_order_acq_rel)) {
         if (!GetPlayerController(context)) {
@@ -3857,7 +3937,7 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
     if (ui->button(ui->user, anomaly::sdk::StringView(read_table_label), 0.0F, 0.0F) != 0) {
         context.read_pending.store(true, std::memory_order_release);
     }
-    const std::array<std::string, 11> type_names = {
+    const std::array<std::string, 12> type_names = {
         context.localizer.Text("type.all", "All"),
         context.localizer.Text("type.hunter", "Hunter Box"),
         context.localizer.Text("type.character", "Character Box"),
@@ -3869,14 +3949,15 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
         context.localizer.Text("type.prison", "Prison Resource"),
         context.localizer.Text("type.wallet", "钱包"),
         context.localizer.Text("type.oracle", "乌鸦石头"),
+        context.localizer.Text("type.shop_steal", "Shop Items"),
     };
-    for (int i = 0; i < 11; ++i) {
+    for (std::size_t i = 0; i < type_names.size(); ++i) {
         if (ui->button(ui->user, anomaly::sdk::StringView(type_names[i]), 0.0F, 0.0F) != 0) {
             std::lock_guard<std::mutex> lock(context.mutex);
             context.type_choice = static_cast<std::uint32_t>(i);
             RebuildFilteredLocked(context);
         }
-        if (i < 10 && ui->same_line != nullptr) {
+        if (i + 1 < type_names.size() && (i + 1) % 6 != 0 && ui->same_line != nullptr) {
             ui->same_line(ui->user, 0.0F, 4.0F);
         }
     }
@@ -3885,11 +3966,16 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
         std::lock_guard<std::mutex> lock(context.mutex);
         type_choice = context.type_choice;
     }
-    if (type_choice < 11) {
+    if (type_choice < type_names.size()) {
         const std::array current_type_args{std::string_view(type_names[type_choice])};
         const std::string current_type = context.localizer.Format(
             "label.current_type", "Type: {0}", current_type_args);
         ui->text(ui->user, anomaly::sdk::StringView(current_type));
+    }
+    if (type_choice == 11) {
+        const std::string requirement = context.localizer.Text(
+            "status.shop_requires_zankou", "商店偷取需要使用残虹");
+        ui->text(ui->user, anomaly::sdk::StringView(requirement));
     }
     const bool developer_mode = context.developer_mode.load(std::memory_order_acquire);
     const std::string mode_label = context.localizer.Text(
@@ -4065,6 +4151,6 @@ ANOMALY_SDK_EXPORT AnomalyStatusV1 ANOMALY_CALL AnomalyPluginEntryV1(
         anomaly::sdk::StringView("anomaly.local.box-auto"),
         anomaly::sdk::StringView("Resource Auto Pickup"),
         anomaly::sdk::StringView("CCYellowStar"),
-        anomaly::sdk::StringView("0.1.0"), Load, Start, Stop, Unload, Update, Draw};
+        anomaly::sdk::StringView("0.1.14"), Load, Start, Stop, Unload, Update, Draw};
     return anomaly::sdk::Ok();
 }
