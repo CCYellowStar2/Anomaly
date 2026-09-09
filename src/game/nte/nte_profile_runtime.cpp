@@ -786,7 +786,8 @@ FeatureValidationResult ValidateEscMenuHooks(
 }
 
 FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
-    const bool preserve_hooked_process_event_abi) {
+    const bool preserve_hooked_process_event_abi,
+    const bool preserve_hooked_actor_process_event_abi) {
     FeatureLayoutValidatorRegistry validators = Ue5FeatureLayoutValidators();
     validators.Register(
         std::string(kOutgoingTransformAbiValidator), ValidateOutgoingTransformAbi);
@@ -817,6 +818,30 @@ FeatureLayoutValidatorRegistry NteFeatureLayoutValidators(
                 if (process_event == nullptr || !process_event->Available()) {
                     return FeatureValidationResult{
                         false, "ue5.ProcessEvent is unavailable"};
+                }
+                // Runtime owns the entry bytes after installing its detour. The
+                // unhooked ABI was validated before the adapter was constructed.
+                return FeatureValidationResult{true, {}};
+            });
+    }
+    if (preserve_hooked_actor_process_event_abi) {
+        validators.Register(
+            std::string(kUe5ActorProcessEventAbiValidator), [](
+                const BuildProfile&,
+                const std::string_view feature,
+                const ProfileResolutionSnapshot& snapshot,
+                const SymbolMemory&) {
+                if (feature != kUe5ActorProcessEventFeature) {
+                    return FeatureValidationResult{
+                        false,
+                        "startup AActor ProcessEvent ABI evidence used by another feature"};
+                }
+                const auto* const actor_process_event =
+                    snapshot.FindSymbol(kUe5ActorProcessEventSymbol);
+                if (actor_process_event == nullptr ||
+                    !actor_process_event->Available()) {
+                    return FeatureValidationResult{
+                        false, "ue5.AActorProcessEvent is unavailable"};
                 }
                 // Runtime owns the entry bytes after installing its detour. The
                 // unhooked ABI was validated before the adapter was constructed.
@@ -1163,7 +1188,8 @@ public:
             return false;
         }
 
-        SymbolResolver resolver(memory_, {}, {}, NteFeatureLayoutValidators(false));
+        SymbolResolver resolver(
+            memory_, {}, {}, NteFeatureLayoutValidators(false, false));
         ProfileResolutionSnapshot resolved =
             resolver.Resolve(adapter_context, selected ? &*selected : nullptr);
         if (!selected) {
@@ -1193,7 +1219,8 @@ public:
             ProcessAdapterServices(),
             options_.snapshot_sampling,
             NteFeatureLayoutValidators(
-                resolution_->FeatureAvailable(kUe5ProcessEventFeature)),
+                resolution_->FeatureAvailable(kUe5ProcessEventFeature),
+                resolution_->FeatureAvailable(kUe5ActorProcessEventFeature)),
             process_event_invoker,
             profile_ ? CreateUe5ObjectLookup(*profile_, *resolution_, *memory_)
                       : Ue5NteAdapter::ObjectLookup{},
