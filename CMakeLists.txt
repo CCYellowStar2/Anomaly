@@ -1319,6 +1319,50 @@ if(ANOMALY_BUILD_WINSOCK_TRACE_PROBES)
         anomaly_winsock_trace_wsarecv
         anomaly_winsock_trace_wsarecvfrom)
     add_dependencies(anomaly_test_host ${ANOMALY_WINSOCK_TRACE_PROBE_TARGETS})
+
+    anomaly_add_plugin(anomaly_netproto_pipeline_trace NO_RELEASE
+        SOURCES tools/netproto_probe/plugin.cpp
+        MANIFEST tools/netproto_probe/manifests/NetProtoPipelineTrace.json
+        PACKAGE_NAME NetProtoPipelineTrace
+        OUTPUT_DIRECTORY
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/winsock-trace-probes/NetProtoPipelineTrace")
+    target_compile_definitions(anomaly_netproto_pipeline_trace PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(anomaly_netproto_pipeline_trace PRIVATE Bcrypt)
+    add_dependencies(anomaly_test_host anomaly_netproto_pipeline_trace)
+
+    anomaly_add_plugin(anomaly_secur32_tls_trace NO_RELEASE
+        SOURCES tools/tls_trace_probe/plugin.cpp
+        MANIFEST tools/tls_trace_probe/manifests/Secur32TlsTrace.json
+        PACKAGE_NAME Secur32TlsTrace
+        OUTPUT_DIRECTORY
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/winsock-trace-probes/Secur32TlsTrace")
+    target_compile_definitions(anomaly_secur32_tls_trace PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX SECURITY_WIN32)
+    target_link_libraries(anomaly_secur32_tls_trace PRIVATE Bcrypt)
+    add_dependencies(anomaly_test_host anomaly_secur32_tls_trace)
+
+    anomaly_add_plugin(anomaly_winhttp_trace NO_RELEASE
+        SOURCES tools/http_trace_probe/plugin.cpp
+        MANIFEST tools/http_trace_probe/manifests/WinHttpTrace.json
+        PACKAGE_NAME WinHttpTrace
+        OUTPUT_DIRECTORY
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/winsock-trace-probes/WinHttpTrace")
+    target_compile_definitions(anomaly_winhttp_trace PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(anomaly_winhttp_trace PRIVATE Bcrypt Winhttp)
+    add_dependencies(anomaly_test_host anomaly_winhttp_trace)
+
+    anomaly_add_plugin(anomaly_bcrypt_trace NO_RELEASE
+        SOURCES tools/bcrypt_trace_probe/plugin.cpp
+        MANIFEST tools/bcrypt_trace_probe/manifests/BcryptTrace.json
+        PACKAGE_NAME BcryptTrace
+        OUTPUT_DIRECTORY
+            "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/winsock-trace-probes/BcryptTrace")
+    target_compile_definitions(anomaly_bcrypt_trace PRIVATE
+        UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
+    target_link_libraries(anomaly_bcrypt_trace PRIVATE Bcrypt)
+    add_dependencies(anomaly_test_host anomaly_bcrypt_trace)
 endif()
 
 option(ANOMALY_BUILD_BIDKING_OBJECT_CATALOG
