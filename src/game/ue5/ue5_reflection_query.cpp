@@ -394,6 +394,234 @@ bool DescribeObject(
     return true;
 }
 
+std::string FunctionPropsQuery(
+    const Ue5ReflectionQueryContext& context, std::string_view argument) noexcept {
+    const auto [address_text, trailing] = Shift(argument);
+    if (address_text.empty() || !trailing.empty()) return Error("usage: ue fnprops <address>");
+    const auto function = ParseAddress(address_text);
+    if (!function) return Error("UFunction address is invalid");
+    if (!context.resolution.FeatureAvailable("ue5.functions")) {
+        return Error("ue5.functions is unavailable for the selected profile");
+    }
+    if (!HasLayout(context.profile, {
+            "object.class", "object.nameOffset", "object.outer",
+            "ustruct.propertyLink", "ffield.next", "ffield.class", "ffield.name",
+            "ffieldClass.name", "fproperty.arrayDim", "fproperty.elementSize",
+            "fproperty.offsetInternal", "fboolProperty.fieldSize",
+            "fboolProperty.byteOffset", "fboolProperty.byteMask",
+            "fboolProperty.fieldMask", "fstructProperty.struct",
+            "fobjectProperty.propertyClass", "farrayProperty.inner",
+            "fclassProperty.metaClass"})) {
+        return Error("ue5.fnprops layout is unavailable for the selected profile");
+    }
+    const NameResolver names(context.profile, context.resolution, context.memory);
+    if (!names.Available()) {
+        return Error("ue5.FNamePool layout is unavailable for the selected profile");
+    }
+    ObjectDescription description;
+    if (!DescribeObject(context, names, *function, description) ||
+        (description.name.empty() && description.class_name.empty())) {
+        return Error("UFunction object is unreadable");
+    }
+
+    std::uintptr_t field{};
+    std::uint8_t num_parms{};
+    std::uint16_t parms_size{};
+    std::uint16_t return_offset{};
+    const auto num_parms_key = Layout(context.profile, "ufunction.numParms");
+    const auto parms_size_key = Layout(context.profile, "ufunction.parmsSize");
+    const auto return_offset_key = Layout(context.profile, "ufunction.returnValueOffset");
+    const bool metadata_readable =
+        num_parms_key.has_value() &&
+        AddAddress(*function, *num_parms_key, field) &&
+        ReadValue(context.memory, field, num_parms) &&
+        parms_size_key.has_value() &&
+        AddAddress(*function, *parms_size_key, field) &&
+        ReadValue(context.memory, field, parms_size) &&
+        return_offset_key.has_value() &&
+        AddAddress(*function, *return_offset_key, field) &&
+        ReadValue(context.memory, field, return_offset);
+
+    const auto children_key = *Layout(context.profile, "ustruct.propertyLink");
+    const auto next_key = *Layout(context.profile, "ffield.next");
+    const auto name_key = *Layout(context.profile, "ffield.name");
+    const auto class_key = *Layout(context.profile, "ffield.class");
+    const auto class_name_key = *Layout(context.profile, "ffieldClass.name");
+    const auto array_dim_key = *Layout(context.profile, "fproperty.arrayDim");
+    const auto element_size_key = *Layout(context.profile, "fproperty.elementSize");
+    const auto offset_internal_key = *Layout(context.profile, "fproperty.offsetInternal");
+    const auto bool_field_size_key = *Layout(context.profile, "fboolProperty.fieldSize");
+    const auto bool_byte_offset_key = *Layout(context.profile, "fboolProperty.byteOffset");
+    const auto bool_byte_mask_key = *Layout(context.profile, "fboolProperty.byteMask");
+    const auto bool_field_mask_key = *Layout(context.profile, "fboolProperty.fieldMask");
+    const auto struct_struct_key = *Layout(context.profile, "fstructProperty.struct");
+    const auto object_property_class_key = *Layout(context.profile, "fobjectProperty.propertyClass");
+    const auto array_inner_key = *Layout(context.profile, "farrayProperty.inner");
+    const auto class_meta_class_key = *Layout(context.profile, "fclassProperty.metaClass");
+
+    const auto resolve_object_name = [&](const std::uintptr_t object,
+                                        const std::string fallback) -> std::string {
+        std::uintptr_t slot{};
+        std::uint32_t id{};
+        const auto name_offset = Layout(context.profile, "object.nameOffset");
+        if (object == 0 || !name_offset ||
+            !AddAddress(object, *name_offset, slot) ||
+            !ReadValue(context.memory, slot, id)) {
+            return fallback;
+        }
+        const auto resolved = names.Resolve(id);
+        return resolved.empty() ? fallback : resolved;
+    };
+    const auto resolve_ffield_name = [&](const std::uintptr_t ffield) -> std::string {
+        std::uintptr_t slot{};
+        std::uint32_t id{};
+        if (ffield == 0 || !AddAddress(ffield, name_key, slot) ||
+            !ReadValue(context.memory, slot, id)) {
+            return {};
+        }
+        return names.Resolve(id);
+    };
+    const auto resolve_ffield_class = [&](const std::uintptr_t ffield) -> std::string {
+        std::uintptr_t slot{};
+        std::uintptr_t field_class{};
+        std::uint32_t id{};
+        if (ffield == 0 || !AddAddress(ffield, class_key, slot) ||
+            !ReadValue(context.memory, slot, field_class) || field_class == 0 ||
+            !AddAddress(field_class, class_name_key, slot) ||
+            !ReadValue(context.memory, slot, id)) {
+            return {};
+        }
+        return names.Resolve(id);
+    };
+
+    std::string properties;
+    std::size_t property_count{};
+    std::uintptr_t child_slot{};
+    std::uintptr_t child{};
+    if (AddAddress(*function, children_key, child_slot)) {
+        ReadValue(context.memory, child_slot, child);
+        while (child != 0 && property_count < 512U) {
+            const auto property_name = resolve_ffield_name(child);
+            const auto property_class = resolve_ffield_class(child);
+            std::int32_t offset_internal{};
+            std::int32_t array_dim{};
+            std::int32_t element_size{};
+            std::uintptr_t slot{};
+            const bool base_readable =
+                AddAddress(child, offset_internal_key, slot) &&
+                ReadValue(context.memory, slot, offset_internal) &&
+                AddAddress(child, array_dim_key, slot) &&
+                ReadValue(context.memory, slot, array_dim) &&
+                AddAddress(child, element_size_key, slot) &&
+                ReadValue(context.memory, slot, element_size);
+            if (property_count != 0) properties.push_back(',');
+            properties += "{\"name\":";
+            properties += Quote(property_name);
+            properties += ",\"type\":";
+            properties += Quote(property_class);
+            if (base_readable) {
+                properties += ",\"offset\":" + std::to_string(offset_internal) +
+                    ",\"arrayDim\":" + std::to_string(array_dim) +
+                    ",\"elementSize\":" + std::to_string(element_size);
+            }
+            if (property_class == "BoolProperty") {
+                std::uint8_t field_size{};
+                std::uint8_t byte_offset{};
+                std::uint8_t byte_mask{};
+                std::uint8_t field_mask{};
+                const bool bool_readable =
+                    AddAddress(child, bool_field_size_key, slot) &&
+                    ReadValue(context.memory, slot, field_size) &&
+                    AddAddress(child, bool_byte_offset_key, slot) &&
+                    ReadValue(context.memory, slot, byte_offset) &&
+                    AddAddress(child, bool_byte_mask_key, slot) &&
+                    ReadValue(context.memory, slot, byte_mask) &&
+                    AddAddress(child, bool_field_mask_key, slot) &&
+                    ReadValue(context.memory, slot, field_mask);
+                if (bool_readable) {
+                    properties += ",\"bit\":" + std::to_string(field_size) +
+                        ",\"byteOffset\":" + std::to_string(byte_offset) +
+                        ",\"byteMask\":" + std::to_string(byte_mask) +
+                        ",\"fieldMask\":" + std::to_string(field_mask);
+                }
+            } else if (property_class == "StructProperty") {
+                std::uintptr_t structure{};
+                if (AddAddress(child, struct_struct_key, slot) &&
+                    ReadValue(context.memory, slot, structure)) {
+                    properties += ",\"struct\":";
+                    properties += Quote(resolve_object_name(structure, {}));
+                }
+            } else if (property_class == "ObjectProperty" ||
+                       property_class == "ObjectPtrProperty" ||
+                       property_class == "SoftObjectProperty") {
+                std::uintptr_t property_class_object{};
+                if (AddAddress(child, object_property_class_key, slot) &&
+                    ReadValue(context.memory, slot, property_class_object)) {
+                    properties += ",\"objectClass\":";
+                    properties += Quote(resolve_object_name(property_class_object, {}));
+                }
+            } else if (property_class == "ArrayProperty") {
+                std::uintptr_t inner{};
+                if (AddAddress(child, array_inner_key, slot) &&
+                    ReadValue(context.memory, slot, inner) && inner != 0) {
+                    properties += ",\"inner\":{\"name\":";
+                    properties += Quote(resolve_ffield_name(inner));
+                    properties += ",\"type\":";
+                    properties += Quote(resolve_ffield_class(inner));
+                    std::int32_t inner_element_size{};
+                    if (AddAddress(inner, element_size_key, slot) &&
+                        ReadValue(context.memory, slot, inner_element_size)) {
+                        properties += ",\"elementSize\":" + std::to_string(inner_element_size);
+                    }
+                    if (const auto inner_class = resolve_ffield_class(inner);
+                        inner_class == "StructProperty") {
+                        std::uintptr_t structure{};
+                        if (AddAddress(inner, struct_struct_key, slot) &&
+                            ReadValue(context.memory, slot, structure)) {
+                            properties += ",\"struct\":";
+                            properties += Quote(resolve_object_name(structure, {}));
+                        }
+                    }
+                    properties += '}';
+                }
+            } else if (property_class == "ClassProperty" ||
+                       property_class == "SoftClassProperty") {
+                std::uintptr_t meta_class{};
+                if (AddAddress(child, class_meta_class_key, slot) &&
+                    ReadValue(context.memory, slot, meta_class)) {
+                    properties += ",\"metaClass\":";
+                    properties += Quote(resolve_object_name(meta_class, {}));
+                }
+            }
+            properties += '}';
+            ++property_count;
+            std::uintptr_t next{};
+            if (!AddAddress(child, next_key, slot) ||
+                !ReadValue(context.memory, slot, next)) {
+                break;
+            }
+            child = next;
+        }
+    }
+
+    std::string payload =
+        "\"kind\":\"fnprops\",\"address\":" + HexAddress(*function) +
+        ",\"name\":" + Quote(description.name) +
+        ",\"class\":" + Quote(description.class_name) +
+        ",\"owner\":" + Quote(description.outer_name) +
+        ",\"metadataReadable\":" + std::string(metadata_readable ? "true" : "false");
+    if (metadata_readable) {
+        payload += ",\"numParms\":" + std::to_string(num_parms) +
+            ",\"parmsSize\":" + std::to_string(parms_size) +
+            ",\"returnValueOffset\":" + std::to_string(return_offset);
+    }
+    payload += ",\"propertyCount\":" + std::to_string(property_count) +
+        ",\"properties\":[" + properties + "]";
+    return Ok(payload);
+}
+
+
+
 bool Matches(const ObjectDescription& value, const std::string_view filter) noexcept {
     return ContainsInsensitive(value.name, filter) ||
         ContainsInsensitive(value.class_name, filter) ||
@@ -772,6 +1000,7 @@ std::string ExecuteUe5ReflectionQuery(
         const auto [kind, arguments] = Shift(request);
         if (kind == "fname") return NameQuery(context, arguments);
         if (kind == "ftext") return FTextQuery(context, arguments);
+        if (kind == "fnprops") return FunctionPropsQuery(context, arguments);
         std::string error;
         const auto parsed = ParseRequest(request, context.options, error);
         if (!parsed) return Error(error);

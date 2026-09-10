@@ -368,6 +368,7 @@
     "escMenu.buttonClickedVtableOffset": 1392,
     "ffield.class": 8,
     "ffield.name": 32,
+    "ffield.next": 24,
     "ffieldClass.name": 0,
     "fproperty.arrayDim": 48,
     "fproperty.elementSize": 52,
