@@ -142,6 +142,7 @@ struct NormalAttackBinding {
 struct Context {
     const AnomalyHostApiV1* host{};
     const AnomalyCoreServiceV1* core{};
+    const AnomalyUiServiceV1* ui{};
     const AnomalyInputServiceV1* input{};
     const AnomalySignatureServiceV1* signature{};
     const AnomalyUe5NamesServiceV1* names{};
@@ -155,6 +156,7 @@ struct Context {
     const AnomalyNteSkillsServiceV1* skills{};
     const AnomalyNteSkillInvocationServiceV1* skill_invocation{};
     const AnomalyNteNavigationServiceV1* navigation{};
+    const AnomalyNtePlayerTeleportServiceV1* teleport{};
     const AnomalyNtePickupServiceV1* pickup{};
     std::string cache_path;
     std::uintptr_t g_objects_address{};
@@ -231,6 +233,7 @@ struct Context {
     std::atomic_bool claim_double_pending{};
     std::atomic_bool chest_choices_pending{};
     std::atomic_bool chest_funcs_pending{};
+    std::atomic_bool developer_mode{};
     std::atomic_bool reward_params_pending{};
     std::atomic_bool award_funcs_pending{};
     std::atomic_bool award_ui_funcs_pending{};
@@ -348,6 +351,14 @@ bool InputReady(const AnomalyInputServiceV1* s) noexcept {
                s, offsetof(AnomalyInputServiceV1, release_hotkey)) &&
         s->was_pressed != nullptr && s->register_hotkey != nullptr &&
         s->release_hotkey != nullptr;
+}
+
+bool DeveloperModeEnabled(const AnomalyUiServiceV1* ui) noexcept {
+    return HasField<AnomalyUiServiceV1,
+               decltype(AnomalyUiServiceV1::developer_mode_enabled)>(
+               ui, offsetof(AnomalyUiServiceV1, developer_mode_enabled)) &&
+        ui->developer_mode_enabled != nullptr &&
+        ui->developer_mode_enabled(ui->user) != 0;
 }
 
 bool ValidHotkey(const std::uint32_t key) noexcept {
@@ -6205,6 +6216,43 @@ void OpenRewardWindow(Context& context) {
         ? "已请求打开领奖窗口，" + distance : "宝箱交互调用失败，" + distance;
 }
 
+// 宝箱原点偏低，传送落点抬高一些，避免落进地面/箱体里。
+constexpr double kTeleportChestZOffset = 200.0;
+
+// 开发者模式下代替寻路：直接传送到目标点。world/player 句柄取自当前快照，
+// 过期句柄由 Host 拒绝，不暴露 UE 对象指针。
+bool TeleportToPosition(Context& context, const double (&position)[3]) noexcept {
+    if (context.session == nullptr) {
+        // session 服务可能晚于插件加载才发布（加载时世界还没初始化），惰性重试。
+        context.session = anomaly::sdk::Host(context.host)
+            .Query<AnomalyNteSessionServiceV1>(
+                ANOMALY_NTE_SESSION_SERVICE_V1_ID,
+                ANOMALY_NTE_SESSION_SERVICE_V1_VERSION).get();
+    }
+    if (context.session == nullptr || context.player == nullptr ||
+        context.teleport == nullptr || context.teleport->teleport == nullptr) {
+        return false;
+    }
+    AnomalyNteSessionSnapshotV1 session_snapshot{sizeof(session_snapshot)};
+    AnomalyNtePlayerSnapshotV1 player_snapshot{sizeof(player_snapshot)};
+    if (context.session->snapshot(context.session->user, &session_snapshot).code !=
+            ANOMALY_STATUS_V1_OK ||
+        context.player->snapshot(context.player->user, &player_snapshot).code !=
+            ANOMALY_STATUS_V1_OK) {
+        return false;
+    }
+    if (session_snapshot.world.id == 0 || player_snapshot.handle.id == 0) return false;
+    AnomalyNtePlayerTeleportRequestV1 request{sizeof(request)};
+    request.flags = 0;
+    request.world = session_snapshot.world;
+    request.player = player_snapshot.handle;
+    request.position[0] = position[0];
+    request.position[1] = position[1];
+    request.position[2] = position[2] + kTeleportChestZOffset;
+    return context.teleport->teleport(context.teleport->user, &request).code ==
+        ANOMALY_STATUS_V1_OK;
+}
+
 void AutoClaimTick(Context& context) noexcept {
     if (!context.auto_claim_active) return;
     const auto now = std::chrono::steady_clock::now();
@@ -6273,6 +6321,15 @@ void AutoClaimTick(Context& context) noexcept {
                     const double dy = chest_pos[1] - player_pos[1];
                     const double dz = chest_pos[2] - player_pos[2];
                     const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    if (dist > 1200.0 &&
+                        context.developer_mode.load(std::memory_order_acquire) &&
+                        TeleportToPosition(context, chest_pos)) {
+                        // 开发者模式：直接传送到宝箱，跳过原版寻路。
+                        // 传送失败（服务未发布/句柄过期）时不 return，回退到下面的寻路。
+                        context.combat_status = "自动领取：传送到宝箱";
+                        context.auto_claim_deadline = now + std::chrono::milliseconds(500);
+                        return;
+                    }
                     const bool nav_timed_out =
                         context.auto_claim_nav_deadline !=
                             std::chrono::steady_clock::time_point{} &&
@@ -6532,6 +6589,8 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
     LoadExitConfig(*context);
     LoadWeeklyConfig(*context);
     const auto view = anomaly::sdk::Host(host);
+    context->ui = view.Query<AnomalyUiServiceV1>(
+        ANOMALY_UI_SERVICE_V1_ID, ANOMALY_UI_SERVICE_V1_VERSION).get();
     context->signature = view.Query<AnomalySignatureServiceV1>(
         ANOMALY_SIGNATURE_SERVICE_V1_ID, ANOMALY_SIGNATURE_SERVICE_V1_VERSION).get();
     context->names = view.Query<AnomalyUe5NamesServiceV1>(
@@ -6555,6 +6614,10 @@ AnomalyStatusV1 ANOMALY_CALL Load(const AnomalyHostApiV1* host, void** plugin_co
         ANOMALY_NTE_NAVIGATION_SERVICE_V1_VERSION).get();
     context->pickup = view.Query<AnomalyNtePickupServiceV1>(
         ANOMALY_NTE_PICKUP_SERVICE_V1_ID, ANOMALY_NTE_PICKUP_SERVICE_V1_VERSION).get();
+    // 开发者模式下用于代替寻路到宝箱；未发布时为 null，自动回退到寻路。
+    context->teleport = view.Query<AnomalyNtePlayerTeleportServiceV1>(
+        ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_ID,
+        ANOMALY_NTE_PLAYER_TELEPORT_SERVICE_V1_VERSION).get();
     context->core = view.Query<AnomalyCoreServiceV1>(
         ANOMALY_CORE_SERVICE_V1_ID, ANOMALY_CORE_SERVICE_V1_VERSION).get();
     context->input = view.Query<AnomalyInputServiceV1>(
@@ -6636,6 +6699,12 @@ void ANOMALY_CALL Unload(void* plugin_context) {
 void ANOMALY_CALL Update(void* plugin_context, const double /*delta_seconds*/) {
     if (!plugin_context) return;
     auto& context = *static_cast<Context*>(plugin_context);
+    // 开发者模式在 on_draw/on_update 期间有效；但 on_draw 只在插件窗口可见时被框架
+    // 调用，所以必须在这里（每帧都执行的 on_update）刷新，否则窗口关着时检测不到。
+    if (context.ui != nullptr) {
+        context.developer_mode.store(
+            DeveloperModeEnabled(context.ui), std::memory_order_release);
+    }
     if (context.open_reward_pending.exchange(false, std::memory_order_acq_rel)) {
         OpenRewardWindow(context);
         return;
@@ -7034,6 +7103,8 @@ void ANOMALY_CALL Draw(void* plugin_context, const AnomalyUiServiceV1* supplied_
                  .get();
     }
     if (ui == nullptr || ui->text == nullptr || ui->button == nullptr) return;
+    // 开发者模式仅在 on_draw/on_update 期间可查询，这里缓存供 Update 的自动领取使用。
+    context.developer_mode.store(DeveloperModeEnabled(ui), std::memory_order_release);
     int open = 1;
     anomaly::sdk::UiWindow window(ui, "自动副本", &open);
     if (!window) return;
