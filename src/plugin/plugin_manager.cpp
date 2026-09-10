@@ -3661,6 +3661,7 @@ PluginManager::PluginManager(
       logger_(std::move(logger)),
       shadow_store_(cache_directory_ / L"packages"),
        file_watcher_(plugin_directory_),
+      enablement_file_watcher_(root_ / L"config", L"plugin-enablement.json"),
       enablement_store_(root_ / L"config" / L"plugin-enablement.json"),
        ui_window_state_file_(root_ / L"state" / L"ui-window-state.json"),
        input_service_(std::move(input_dispatcher)),
@@ -3687,6 +3688,7 @@ PluginManager::PluginManager(
 
 PluginManager::~PluginManager() {
     file_watcher_.Stop();
+    enablement_file_watcher_.Stop();
     SavePersistentUiWindowState(true);
     UnloadAll();
     if (host_nte_esc_menu_scope_ != nullptr) {
@@ -4551,6 +4553,7 @@ bool PluginManager::LoadBinary(
 
 void PluginManager::LoadAll() {
     file_watcher_.Stop();
+    enablement_file_watcher_.Stop();
     {
         std::scoped_lock lock(pending_package_changes_mutex_);
         pending_package_changes_.clear();
@@ -4618,6 +4621,9 @@ void PluginManager::LoadAll() {
             QueuePackageChanges(std::move(package_names));
         })) {
         Log(ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "plugin file watcher failed to start");
+    }
+    if (!enablement_file_watcher_.Start([this] { QueueEnablementReload(); })) {
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "plugin enablement file watcher failed to start");
     }
     if (!loaded) Log(ANOMALY_CORE_LOG_LEVEL_V1_WARNING, "one or more plugin packages were not activated");
 }
@@ -4910,7 +4916,7 @@ bool PluginManager::StopForRuntime(std::chrono::milliseconds timeout) {
 void PluginManager::UnloadIndices(
     const std::vector<std::size_t>& indices, const bool retire_shadow_generations) {
     static_cast<void>(UnloadIndicesWithDeadline(
-        indices, retire_shadow_generations, std::chrono::milliseconds(1000)));
+        indices, retire_shadow_generations, std::chrono::milliseconds(5000)));
 }
 
 bool PluginManager::UnloadIndicesWithDeadline(
@@ -5455,6 +5461,7 @@ void PluginManager::PollForChanges() {
     std::sort(changed.begin(), changed.end());
     changed.erase(std::unique(changed.begin(), changed.end()), changed.end());
     if (!changed.empty()) static_cast<void>(ReloadPackages(changed));
+    ApplyQueuedEnablementReload();
 }
 
 void PluginManager::QueuePackageChanges(
@@ -5466,6 +5473,25 @@ void PluginManager::QueuePackageChanges(
         }
     } catch (...) {
     }
+}
+
+void PluginManager::QueueEnablementReload() noexcept {
+    pending_enablement_reload_.store(true, std::memory_order_release);
+}
+
+void PluginManager::ApplyQueuedEnablementReload() {
+    if (!pending_enablement_reload_.exchange(false, std::memory_order_acq_rel)) return;
+    std::string error;
+    if (!enablement_store_.Load(&error)) {
+        Log(ANOMALY_CORE_LOG_LEVEL_V1_ERROR, "plugin enablement reload failed: " + error);
+        return;
+    }
+    const anomaly::PluginCatalogSnapshot catalog =
+        anomaly::DiscoverPluginCatalog(plugin_directory_);
+    const bool reconciled = ReconcileEnablement(catalog);
+    Log(reconciled ? ANOMALY_CORE_LOG_LEVEL_V1_INFO : ANOMALY_CORE_LOG_LEVEL_V1_WARNING,
+        std::string("plugin enablement config applied: reconciliation=") +
+            (reconciled ? "succeeded" : "failed"));
 }
 
 void PluginManager::Draw(void* imgui_context) {

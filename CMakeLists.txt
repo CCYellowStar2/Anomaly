@@ -687,7 +687,8 @@ target_link_libraries(anomaly_plugin_native_dependency PUBLIC Psapi)
 
 add_library(anomaly_plugin_shadow STATIC
     src/plugin/plugin_shadow_store.cpp
-    src/plugin/plugin_file_watcher.cpp)
+    src/plugin/plugin_file_watcher.cpp
+    src/plugin/plugin_config_watcher.cpp)
 target_include_directories(anomaly_plugin_shadow PUBLIC include)
 target_compile_definitions(
     anomaly_plugin_shadow PUBLIC UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

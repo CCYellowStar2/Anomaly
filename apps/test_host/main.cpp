@@ -1,4 +1,5 @@
 #include "anomaly/host_ui_service.hpp"
+#include "anomaly/plugin_config_watcher.hpp"
 #include "anomaly/plugin_file_watcher.hpp"
 #include "pattern.hpp"
 #include "plugin_manager.hpp"
@@ -61,7 +62,7 @@ constexpr std::uint64_t kDefaultPrivateGrowthBudgetBytes = 10ULL * 1024ULL * 102
 constexpr std::uint64_t kMaxPrivateGrowthBudgetBytes = 4ULL * 1024ULL * 1024ULL * 1024ULL;
 
 void Usage() {
-    std::cerr << "usage: anomaly-test-host --watcher-fixture | "
+    std::cerr << "usage: anomaly-test-host --watcher-fixture | --config-watcher-fixture | "
                  "--plugin <package-or-root> [--reload N] [--ticks N] "
                  "[--duration-seconds N] [--tick-interval-ms N] [--reload-every-ticks N] "
                  "[--private-growth-budget-bytes N]\n";
@@ -175,11 +176,147 @@ bool VerifyPluginFileWatcher() {
     return valid;
 }
 
+bool VerifyPluginConfigFileWatcher() {
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"anomaly-config-watcher-fixture-" + std::to_wstring(GetCurrentProcessId()));
+    const auto config = root / L"config";
+    const auto file = config / L"plugin-enablement.json";
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(config, error);
+    if (error) return false;
+    {
+        std::ofstream output(file, std::ios::binary | std::ios::trunc);
+        output << "{}";
+        if (!output) return false;
+    }
+
+    std::mutex mutex;
+    std::condition_variable changed_condition;
+    std::uint64_t changes{};
+    anomaly::PluginConfigFileWatcher watcher(
+        config, L"plugin-enablement.json",
+        {std::chrono::milliseconds(100)});
+    if (!watcher.Start([&] {
+            {
+                std::scoped_lock lock(mutex);
+                ++changes;
+            }
+            changed_condition.notify_all();
+        })) {
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    bool idle_quiet{};
+    {
+        std::scoped_lock lock(mutex);
+        idle_quiet = changes == 0;
+    }
+
+    {
+        std::ofstream output(file, std::ios::binary | std::ios::app);
+        output << '\n';
+    }
+    bool first_delivered{};
+    {
+        std::unique_lock lock(mutex);
+        first_delivered = changed_condition.wait_for(lock, std::chrono::seconds(3), [&] {
+            return changes >= 1;
+        });
+    }
+
+    // Atomic publish: temp file then rename in the watched directory.
+    const auto temporary = file.wstring() + L".tmp";
+    {
+        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+        output << "{}";
+    }
+    std::filesystem::remove(file, error);
+    error.clear();
+    std::filesystem::rename(temporary, file, error);
+    if (error) {
+        watcher.Stop();
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+    bool second_delivered{};
+    {
+        std::unique_lock lock(mutex);
+        second_delivered = changed_condition.wait_for(lock, std::chrono::seconds(3), [&] {
+            return changes >= 2;
+        });
+    }
+
+    watcher.Stop();
+    std::filesystem::remove_all(root, error);
+    const bool valid = idle_quiet && first_delivered && second_delivered;
+    if (!valid) {
+        std::cerr << "config watcher diagnostics: idle_quiet=" << (idle_quiet ? 1 : 0)
+                  << " first_delivered=" << (first_delivered ? 1 : 0)
+                  << " second_delivered=" << (second_delivered ? 1 : 0)
+                  << " changes=" << changes << '\n';
+    }
+    return valid;
+}
+
+bool VerifyEnablementConfigReload(const std::filesystem::path& root) {
+    const auto inline_dispatch = [](
+        std::string, std::uint64_t, std::function<void()> callback) -> bool {
+        if (!callback) return false;
+        callback();
+        return true;
+    };
+    ue5mem::PluginManager manager(
+        root, root, {}, {}, {}, inline_dispatch, inline_dispatch);
+    manager.SetUiService(&kUi);
+    manager.LoadAll();
+
+    const auto views = manager.Plugins();
+    if (views.empty() ||
+        std::ranges::any_of(views, [](const auto& plugin) { return plugin.enabled; })) {
+        std::cerr << "enablement fixture expected a disabled catalog first\n";
+        return false;
+    }
+    const std::string target_id = views.front().id;
+    const std::filesystem::path store = root / L"config" / L"plugin-enablement.json";
+    {
+        std::ofstream output(store, std::ios::binary | std::ios::trunc);
+        output << "{\"defaultEnabled\": false, \"plugins\": {\"" << target_id
+               << "\": true}, \"schemaVersion\": 1}\n";
+        if (!output) return false;
+    }
+
+    bool enabled{};
+    for (int attempt = 0; attempt < 40 && !enabled; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        static_cast<void>(manager.MaintenancePluginState());
+        enabled = std::ranges::any_of(manager.Plugins(), [&](const auto& plugin) {
+            return plugin.id == target_id && plugin.enabled;
+        });
+    }
+    if (!enabled) {
+        std::cerr << "enablement config change was not applied for " << target_id << '\n';
+        return false;
+    }
+    manager.UnloadAll();
+    manager.LoadAll();
+    const bool reloaded = std::ranges::any_of(manager.Plugins(), [&](const auto& plugin) {
+        return plugin.id == target_id && plugin.enabled;
+    });
+    std::cout << "ok enablement_config_reload target=" << target_id << '\n';
+    return reloaded;
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
     std::filesystem::path input;
     bool watcher_fixture{};
+    bool config_watcher_fixture{};
+    bool enablement_fixture{};
     int reloads = 1;
     int ticks = 3;
     int duration_seconds = 0;
@@ -189,6 +326,8 @@ int wmain(int argc, wchar_t** argv) {
     for (int index = 1; index < argc; ++index) {
         const std::wstring_view argument(argv[index]);
         if (argument == L"--watcher-fixture") watcher_fixture = true;
+        else if (argument == L"--config-watcher-fixture") config_watcher_fixture = true;
+        else if (argument == L"--enablement-fixture") enablement_fixture = true;
         else if (argument == L"--plugin" && index + 1 < argc) input = argv[++index];
         else if (argument == L"--reload" && index + 1 < argc) reloads = _wtoi(argv[++index]);
         else if (argument == L"--ticks" && index + 1 < argc) ticks = _wtoi(argv[++index]);
@@ -210,6 +349,14 @@ int wmain(int argc, wchar_t** argv) {
             return 10;
         }
         std::cout << "ok plugin_file_watcher idle_scans=0 change_delivered=1\n";
+        return 0;
+    }
+    if (config_watcher_fixture) {
+        if (!VerifyPluginConfigFileWatcher()) {
+            std::cerr << "plugin config file watcher fixture failed\n";
+            return 11;
+        }
+        std::cout << "ok plugin_config_file_watcher idle_quiet=1 change_delivered=2\n";
         return 0;
     }
     if (input.empty() || reloads < 0 || ticks < 0 || duration_seconds < 0 ||
@@ -236,6 +383,16 @@ int wmain(int argc, wchar_t** argv) {
             std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing, error);
         if (error) { std::cerr << "staging failed: " << error.message() << '\n'; return 3; }
         root = staging;
+    }
+    if (enablement_fixture) {
+        const bool ok = VerifyEnablementConfigReload(root);
+        if (!staging.empty()) std::filesystem::remove_all(staging, error);
+        if (!ok) {
+            std::cerr << "plugin enablement reload fixture failed\n";
+            return 12;
+        }
+        std::cout << "ok enablement_config_reload enable_applied=1\n";
+        return 0;
     }
     int result = 0;
     try {

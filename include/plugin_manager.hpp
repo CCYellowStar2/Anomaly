@@ -2,6 +2,7 @@
 
 #include "anomaly/sdk/anomaly_sdk.h"
 #include "anomaly/plugin_file_watcher.hpp"
+#include "anomaly/plugin_config_watcher.hpp"
 #include "anomaly/plugin_enablement.hpp"
 #include "anomaly/input_service.hpp"
 #include "anomaly/ipc_registry.hpp"
@@ -318,6 +319,8 @@ private:
     [[nodiscard]] bool ReloadPackages(const std::vector<std::string>& package_names);
     void PollForChanges();
     void QueuePackageChanges(std::vector<std::string> package_names) noexcept;
+    void QueueEnablementReload() noexcept;
+    void ApplyQueuedEnablementReload();
     void LoadPersistentUiWindowState();
     void SavePersistentUiWindowState(bool force = false) noexcept;
 
@@ -346,6 +349,8 @@ private:
     std::uint64_t observed_adapter_service_revision_{};
     anomaly::PluginShadowStore shadow_store_;
     anomaly::PluginFileWatcher file_watcher_;
+    anomaly::PluginConfigFileWatcher enablement_file_watcher_;
+    std::atomic_bool pending_enablement_reload_{};
     std::atomic_bool performance_diagnostics_enabled_{};
     std::atomic_bool plugin_load_step_in_progress_{};
     mutable std::mutex pending_package_changes_mutex_;
