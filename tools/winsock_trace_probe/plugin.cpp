@@ -34,11 +34,18 @@ namespace {
 
 constexpr std::size_t kTraceRingCapacity = 512;
 // A v2 event includes up to 16 return addresses; this stays below the host's 4 MiB storage limit.
-constexpr std::size_t kMaximumHistoryRecords = 2048;
+constexpr std::size_t kMaximumHistoryRecords = 1024;
 constexpr std::size_t kMaximumCallsites = 128;
 constexpr std::size_t kTraceStackDepth = 16;
+constexpr std::size_t kTracePayloadCapacity = 1536;
 constexpr DWORD kMaximumScatterGatherBuffers = 64;
-constexpr std::uint32_t kFlushIntervalMilliseconds = 250;
+constexpr std::uint32_t kFlushIntervalMilliseconds = 5000;
+constexpr std::size_t kStreamWindowSlots = 4;
+constexpr std::size_t kStreamWindowBytes = 2000000;
+constexpr std::uint32_t kStreamActivationBytes = 4096;
+constexpr std::uint32_t kStreamChunkBytesCap = 262144;
+constexpr std::uint64_t kStreamQuietMilliseconds = 30000;
+constexpr std::uint64_t kStreamWriteCooldownMilliseconds = 2000;
 constexpr std::uint64_t kUnixEpochFileTimeTicks = 116444736000000000ULL;
 constexpr std::uint64_t kFileTimeTicksPerMillisecond = 10000ULL;
 
@@ -126,9 +133,25 @@ struct TraceRecord final {
     EndpointMetadata local_endpoint{};
     EndpointMetadata peer_endpoint{};
     std::uint8_t stack_depth{};
+    std::array<std::uint8_t, kTracePayloadCapacity> payload{};
+    std::uint16_t payload_size{};
 };
 
 static_assert(std::is_trivially_copyable_v<TraceRecord>);
+
+struct StreamWindowSlot final {
+    std::uint64_t socket{};
+    std::uint64_t total_bytes{};
+    std::uint64_t chunks{};
+    std::uint64_t last_append_ms{};
+    std::uint64_t last_large_append_ms{};
+    bool closed{};
+    std::uint32_t start{};
+    std::uint32_t retained{};
+    std::uint32_t dropped_bytes{};
+    std::uint32_t truncated_chunks{};
+    std::array<std::uint8_t, kOutbound ? 4U : kStreamWindowBytes> bytes{};
+};
 
 template <typename T, std::size_t Capacity>
 class BoundedMpmcRing final {
@@ -226,6 +249,12 @@ struct Context final {
     std::mutex persistence_mutex;
     std::mutex flush_mutex;
     AnomalyGenerationHandleV1 flush_task{};
+    std::mutex stream_mutex;
+    std::array<StreamWindowSlot, kStreamWindowSlots> stream_slots{};
+    std::atomic_bool stream_dirty{};
+    std::atomic_bool stream_quieted{};
+    std::uint64_t last_stream_write_ms{};
+    std::uint64_t persisted_records_count{};
     std::vector<TraceRecord> history;
     std::map<std::uint64_t, CallsiteStats> callsites;
     std::uint64_t records_drained{};
@@ -251,11 +280,11 @@ struct Context final {
         TraceRecord record;
         while (ring.Pop(record)) {
             ++records_drained;
-            if (history.size() < kMaximumHistoryRecords) {
-                history.push_back(record);
-                ++records_recorded;
-            } else {
+            history.push_back(record);
+            ++records_recorded;
+            if (history.size() > kMaximumHistoryRecords) {
                 ++history_dropped;
+                history.erase(history.begin());
             }
             auto found = callsites.find(record.return_address);
             if (found == callsites.end() && callsites.size() >= kMaximumCallsites) {
@@ -332,6 +361,10 @@ std::uint64_t QueryUnixTimeMilliseconds() noexcept {
     return (ticks.QuadPart - kUnixEpochFileTimeTicks) / kFileTimeTicksPerMillisecond;
 }
 
+std::uint64_t MonotonicMilliseconds() noexcept {
+    return static_cast<std::uint64_t>(GetTickCount64());
+}
+
 void CaptureStack(TraceRecord& record) noexcept {
     void* addresses[kTraceStackDepth]{};
     const USHORT captured = RtlCaptureStackBackTrace(
@@ -373,6 +406,23 @@ std::uint32_t SafeScatterGatherBytes(
         return 0;
     }
     return static_cast<std::uint32_t>(result);
+}
+
+void CapturePayload(
+    const void* buffer, const std::uint32_t length,
+    std::array<std::uint8_t, kTracePayloadCapacity>& destination,
+    std::uint16_t& payload_size) noexcept {
+    destination.fill(0);
+    payload_size = 0;
+    if (buffer == nullptr || length == 0) return;
+    const std::uint32_t bounded = (std::min)(
+        length, static_cast<std::uint32_t>(destination.size()));
+    __try {
+        std::memcpy(destination.data(), buffer, bounded);
+        payload_size = static_cast<std::uint16_t>(bounded);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        payload_size = 0;
+    }
 }
 
 void CaptureEndpoint(
@@ -472,6 +522,81 @@ void EndCapture(
     }
 }
 
+void AppendStreamChunk(
+    Context& context, const std::uint64_t socket, const std::uint8_t* data,
+    const std::uint32_t length) {
+    if (data == nullptr || length == 0) return;
+    constexpr std::uint32_t kCapacity = static_cast<std::uint32_t>(kStreamWindowBytes);
+    StreamWindowSlot* slot = nullptr;
+    StreamWindowSlot* oldest = nullptr;
+    std::scoped_lock lock(context.stream_mutex);
+    for (StreamWindowSlot& candidate : context.stream_slots) {
+        if (candidate.socket == socket) {
+            slot = &candidate;
+            break;
+        }
+        if (candidate.socket == 0 && slot == nullptr) {
+            slot = &candidate;
+        }
+        if (candidate.socket != 0 &&
+            (oldest == nullptr || candidate.last_append_ms < oldest->last_append_ms)) {
+            oldest = &candidate;
+        }
+    }
+    if (slot == nullptr && oldest != nullptr && length >= kStreamActivationBytes) {
+        oldest->socket = 0;
+        slot = oldest;
+    }
+    if (slot == nullptr) return;
+    if (slot->socket != socket) {
+        if (length < kStreamActivationBytes) return;
+        slot->total_bytes = 0;
+        slot->chunks = 0;
+        slot->last_append_ms = 0;
+        slot->last_large_append_ms = 0;
+        slot->closed = false;
+        slot->start = 0;
+        slot->retained = 0;
+        slot->dropped_bytes = 0;
+        slot->truncated_chunks = 0;
+        slot->socket = socket;
+    }
+    if (slot->closed && length < kStreamActivationBytes) return;
+    const std::uint64_t now_ms = MonotonicMilliseconds();
+    std::uint32_t bytes = length;
+    if (bytes > kStreamChunkBytesCap) {
+        slot->truncated_chunks += 1U;
+        bytes = kStreamChunkBytesCap;
+    }
+    slot->chunks += 1U;
+    slot->total_bytes += bytes;
+    slot->last_append_ms = now_ms;
+    if (length >= kStreamActivationBytes) {
+        slot->last_large_append_ms = now_ms;
+        slot->closed = false;
+    }
+    if (slot->retained + bytes > kCapacity) {
+        const std::uint32_t evict = slot->retained + bytes - kCapacity;
+        slot->dropped_bytes += evict;
+        if (evict >= slot->retained) {
+            slot->start = 0U;
+            slot->retained = 0U;
+        } else {
+            slot->start = (slot->start + evict) % kCapacity;
+            slot->retained -= evict;
+        }
+    }
+    const std::uint32_t position = (slot->start + slot->retained) % kCapacity;
+    const std::uint32_t first = (std::min)(bytes, kCapacity - position);
+    std::memcpy(slot->bytes.data() + position, data, first);
+    if (bytes > first) {
+        std::memcpy(slot->bytes.data(), data + first, bytes - first);
+    }
+    slot->retained += bytes;
+    context.stream_dirty.store(true, std::memory_order_release);
+    context.stream_quieted.store(false, std::memory_order_relaxed);
+}
+
 TraceRecord NewRecord(
     const SOCKET socket, const void* return_address, const std::uint64_t qpc,
     const std::uint32_t requested_bytes, const std::uint32_t buffer_count,
@@ -494,6 +619,9 @@ void FinishRecord(Context& context, TraceRecord& record) noexcept {
 }
 
 int WSAAPI SendDetour(const SOCKET socket, const char* buffer, const int length, const int flags) {
+    std::array<std::uint8_t, kTracePayloadCapacity> captured_payload{};
+    std::uint16_t captured_payload_size{};
+    CapturePayload(buffer, ClampByteCount(length), captured_payload, captured_payload_size);
     const std::uint64_t qpc = QueryPerformanceCounterValue();
     const void* const return_address = _ReturnAddress();
     const AnomalyHookServiceV1* service{};
@@ -509,6 +637,8 @@ int WSAAPI SendDetour(const SOCKET socket, const char* buffer, const int length,
     const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (context != nullptr) {
         TraceRecord record = NewRecord(socket, return_address, qpc, ClampByteCount(length), 1U, 0U);
+        record.payload = captured_payload;
+        record.payload_size = captured_payload_size;
         record.result = result;
         record.wsa_error = error;
         if (result != SOCKET_ERROR) {
@@ -527,6 +657,9 @@ int WSAAPI SendDetour(const SOCKET socket, const char* buffer, const int length,
 int WSAAPI SendToDetour(
     const SOCKET socket, const char* buffer, const int length, const int flags,
     const sockaddr* address, const int address_length) {
+    std::array<std::uint8_t, kTracePayloadCapacity> captured_payload{};
+    std::uint16_t captured_payload_size{};
+    CapturePayload(buffer, ClampByteCount(length), captured_payload, captured_payload_size);
     const std::uint64_t qpc = QueryPerformanceCounterValue();
     const void* const return_address = _ReturnAddress();
     const AnomalyHookServiceV1* service{};
@@ -542,6 +675,8 @@ int WSAAPI SendToDetour(
     const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (context != nullptr) {
         TraceRecord record = NewRecord(socket, return_address, qpc, ClampByteCount(length), 1U, 0U);
+        record.payload = captured_payload;
+        record.payload_size = captured_payload_size;
         record.result = result;
         record.wsa_error = error;
         CaptureEndpoint(address, address_length, EndpointProvenance::SendToArgument,
@@ -565,6 +700,15 @@ int WSAAPI WsaSendDetour(
     const DWORD flags, LPWSAOVERLAPPED overlapped, LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     bool buffers_truncated{};
     const std::uint32_t requested = SafeScatterGatherBytes(buffers, buffer_count, buffers_truncated);
+    std::array<std::uint8_t, kTracePayloadCapacity> captured_payload{};
+    std::uint16_t captured_payload_size{};
+    if (buffers != nullptr && buffer_count != 0) {
+        __try {
+            CapturePayload(buffers[0].buf, buffers[0].len, captured_payload, captured_payload_size);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            captured_payload_size = 0;
+        }
+    }
     const std::uint64_t qpc = QueryPerformanceCounterValue();
     const void* const return_address = _ReturnAddress();
     const AnomalyHookServiceV1* service{};
@@ -583,6 +727,8 @@ int WSAAPI WsaSendDetour(
         if (overlapped != nullptr || completion != nullptr) record_flags |= TraceOverlapped;
         if (buffers_truncated) record_flags |= TraceScatterGatherTruncated;
         TraceRecord record = NewRecord(socket, return_address, qpc, requested, buffer_count, record_flags);
+        record.payload = captured_payload;
+        record.payload_size = captured_payload_size;
         record.result = result;
         record.wsa_error = error;
         if (result == 0) {
@@ -610,6 +756,15 @@ int WSAAPI WsaSendToDetour(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE completion) {
     bool buffers_truncated{};
     const std::uint32_t requested = SafeScatterGatherBytes(buffers, buffer_count, buffers_truncated);
+    std::array<std::uint8_t, kTracePayloadCapacity> captured_payload{};
+    std::uint16_t captured_payload_size{};
+    if (buffers != nullptr && buffer_count != 0) {
+        __try {
+            CapturePayload(buffers[0].buf, buffers[0].len, captured_payload, captured_payload_size);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            captured_payload_size = 0;
+        }
+    }
     const std::uint64_t qpc = QueryPerformanceCounterValue();
     const void* const return_address = _ReturnAddress();
     const AnomalyHookServiceV1* service{};
@@ -629,6 +784,8 @@ int WSAAPI WsaSendToDetour(
         if (overlapped != nullptr || completion != nullptr) record_flags |= TraceOverlapped;
         if (buffers_truncated) record_flags |= TraceScatterGatherTruncated;
         TraceRecord record = NewRecord(socket, return_address, qpc, requested, buffer_count, record_flags);
+        record.payload = captured_payload;
+        record.payload_size = captured_payload_size;
         record.result = result;
         record.wsa_error = error;
         CaptureEndpoint(address, address_length, EndpointProvenance::SendToArgument,
@@ -669,6 +826,14 @@ int WSAAPI RecvDetour(const SOCKET socket, char* buffer, const int length, const
     const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (context != nullptr) {
         TraceRecord record = NewRecord(socket, return_address, qpc, ClampByteCount(length), 1U, 0U);
+        CapturePayload(buffer, ClampByteCount(result), record.payload, record.payload_size);
+        if constexpr (!kOutbound) {
+            if (result > 0 && buffer != nullptr) {
+                AppendStreamChunk(*context, static_cast<std::uint64_t>(socket),
+                    reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::uint32_t>(result));
+            }
+        }
         record.result = result;
         record.wsa_error = error;
         if (result != SOCKET_ERROR) {
@@ -702,6 +867,14 @@ int WSAAPI RecvFromDetour(
     const int error = result == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (context != nullptr) {
         TraceRecord record = NewRecord(socket, return_address, qpc, ClampByteCount(length), 1U, 0U);
+        CapturePayload(buffer, ClampByteCount(result), record.payload, record.payload_size);
+        if constexpr (!kOutbound) {
+            if (result > 0 && buffer != nullptr) {
+                AppendStreamChunk(*context, static_cast<std::uint64_t>(socket),
+                    reinterpret_cast<const std::uint8_t*>(buffer),
+                    static_cast<std::uint32_t>(result));
+            }
+        }
         record.result = result;
         record.wsa_error = error;
         int peer_length{};
@@ -749,6 +922,18 @@ int WSAAPI WsaRecvDetour(
         if (overlapped != nullptr || completion != nullptr) record_flags |= TraceOverlapped;
         if (buffers_truncated) record_flags |= TraceScatterGatherTruncated;
         TraceRecord record = NewRecord(socket, return_address, qpc, requested, buffer_count, record_flags);
+        if (result == 0 && buffers != nullptr && buffer_count != 0) {
+            const std::uint32_t received = SafeDword(bytes_received);
+            __try {
+                CapturePayload(buffers[0].buf, received, record.payload, record.payload_size);
+                if constexpr (!kOutbound) {
+                    AppendStreamChunk(*context, static_cast<std::uint64_t>(socket),
+                        reinterpret_cast<const std::uint8_t*>(buffers[0].buf), received);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                record.payload_size = 0;
+            }
+        }
         record.result = result;
         record.wsa_error = error;
         if (result == 0) {
@@ -795,6 +980,18 @@ int WSAAPI WsaRecvFromDetour(
         if (overlapped != nullptr || completion != nullptr) record_flags |= TraceOverlapped;
         if (buffers_truncated) record_flags |= TraceScatterGatherTruncated;
         TraceRecord record = NewRecord(socket, return_address, qpc, requested, buffer_count, record_flags);
+        if (result == 0 && buffers != nullptr && buffer_count != 0) {
+            const std::uint32_t received = SafeDword(bytes_received);
+            __try {
+                CapturePayload(buffers[0].buf, received, record.payload, record.payload_size);
+                if constexpr (!kOutbound) {
+                    AppendStreamChunk(*context, static_cast<std::uint64_t>(socket),
+                        reinterpret_cast<const std::uint8_t*>(buffers[0].buf), received);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                record.payload_size = 0;
+            }
+        }
         record.result = result;
         record.wsa_error = error;
         int peer_length{};
@@ -994,7 +1191,15 @@ std::string Serialize(
             AppendHex(output, record.stack[index]);
             output.push_back('\"');
         }
-        output += "]}";
+        output += "],\"payload\":\"";
+        static constexpr char kHexDigits[] = "0123456789abcdef";
+        for (std::size_t index = 0; index < record.payload_size; ++index) {
+            const std::uint8_t byte = record.payload[index];
+            output.push_back(kHexDigits[byte >> 4U]);
+            output.push_back(kHexDigits[byte & 15U]);
+        }
+        output.push_back('"');
+        output += "}";
     }
     output += "]}";
     return output;
@@ -1003,6 +1208,9 @@ std::string Serialize(
 bool Persist(Context& context, const bool final_snapshot, const bool hook_quiesced) {
     std::scoped_lock lock(context.persistence_mutex);
     context.Drain();
+    if (!final_snapshot && context.records_recorded == context.persisted_records_count) {
+        return true;
+    }
     if (final_snapshot) {
         const std::uint64_t qpc_before_clock = QueryPerformanceCounterValue();
         context.ended_utc_unix_milliseconds = QueryUnixTimeMilliseconds();
@@ -1027,10 +1235,104 @@ bool Persist(Context& context, const bool final_snapshot, const bool hook_quiesc
             ANOMALY_STATUS_V1_OK;
     if (written) {
         context.persistence_successes = persistence_successes;
+        context.persisted_records_count = context.records_recorded;
     } else {
         ++context.persistence_failures;
     }
     return written;
+}
+
+bool PersistStreams(Context& context, const bool final_snapshot) {
+    const std::uint64_t now = MonotonicMilliseconds();
+    bool dirty{};
+    std::uint64_t latest_large_ms{};
+    {
+        std::scoped_lock lock(context.stream_mutex);
+        dirty = context.stream_dirty.exchange(false, std::memory_order_acq_rel);
+        for (const StreamWindowSlot& slot : context.stream_slots) {
+            latest_large_ms = (std::max)(latest_large_ms, slot.last_large_append_ms);
+        }
+    }
+    if (!dirty && !final_snapshot) return true;
+    const bool quiet = latest_large_ms == 0 ||
+        (now - latest_large_ms) >= kStreamQuietMilliseconds;
+    if (!final_snapshot) {
+        if (!quiet && context.last_stream_write_ms != 0 &&
+            now - context.last_stream_write_ms < kStreamWriteCooldownMilliseconds) {
+            context.stream_dirty.store(true, std::memory_order_release);
+            return true;
+        }
+    }
+    bool all_written = true;
+    const bool close_now = !final_snapshot && quiet;
+    for (std::size_t index = 0; index < context.stream_slots.size(); ++index) {
+        std::uint64_t socket{};
+        std::uint64_t total_bytes{};
+        std::uint64_t chunks{};
+        std::uint64_t last_append_ms{};
+        std::uint32_t start{};
+        std::uint32_t retained{};
+        std::uint32_t dropped_bytes{};
+        std::uint32_t truncated_chunks{};
+        std::vector<std::uint8_t> snapshot;
+        {
+            std::scoped_lock lock(context.stream_mutex);
+            StreamWindowSlot& slot = context.stream_slots[index];
+            if (slot.socket == 0 || slot.retained == 0) continue;
+            const std::uint32_t capacity = static_cast<std::uint32_t>(kStreamWindowBytes);
+            socket = slot.socket;
+            total_bytes = slot.total_bytes;
+            chunks = slot.chunks;
+            last_append_ms = slot.last_append_ms;
+            start = slot.start;
+            retained = slot.retained;
+            dropped_bytes = slot.dropped_bytes;
+            truncated_chunks = slot.truncated_chunks;
+            snapshot.resize(retained);
+            const std::uint32_t first = (std::min)(retained, capacity - start);
+            std::memcpy(snapshot.data(), slot.bytes.data() + start, first);
+            if (retained > first) {
+                std::memcpy(snapshot.data() + first, slot.bytes.data(), retained - first);
+            }
+            if (close_now) slot.closed = true;
+        }
+        std::string document;
+        document.reserve(360U + static_cast<std::size_t>(retained) * 2U);
+        document += "{\"schemaVersion\":1,\"operation\":\"";
+        document += kOperationName;
+        document += "\",\"direction\":\"inbound\",\"slot\":" + std::to_string(index);
+        document += ",\"socket\":" + std::to_string(socket);
+        document += ",\"totalBytes\":" + std::to_string(total_bytes);
+        document += ",\"chunks\":" + std::to_string(chunks);
+        document += ",\"retained\":" + std::to_string(retained);
+        document += ",\"droppedBytes\":" + std::to_string(dropped_bytes);
+        document += ",\"truncatedChunks\":" + std::to_string(truncated_chunks);
+        document += ",\"lastAppendMs\":" + std::to_string(last_append_ms);
+        document += ",\"captureId\":\"";
+        AppendCaptureId(document, context.capture_id);
+        document += "\",\"bytesHex\":\"";
+        static constexpr char kHexDigits[] = "0123456789abcdef";
+        for (std::uint32_t offset = 0; offset < retained; ++offset) {
+            const std::uint8_t byte = snapshot[offset];
+            document.push_back(kHexDigits[byte >> 4U]);
+            document.push_back(kHexDigits[byte & 15U]);
+        }
+        document += "\"}";
+        const std::string file_name = "transport-stream-s" + std::to_string(index) + ".json";
+        const AnomalyByteSpanV1 bytes{
+            reinterpret_cast<const std::uint8_t*>(document.data()), document.size()};
+        const bool written = context.storage != nullptr &&
+            context.storage->write_atomic != nullptr &&
+            context.storage->write_atomic(
+                context.storage->user, anomaly::sdk::StringView(file_name.c_str()), bytes).code ==
+                ANOMALY_STATUS_V1_OK;
+        if (!written) all_written = false;
+    }
+    context.last_stream_write_ms = now;
+    if (final_snapshot || close_now) {
+        context.stream_quieted.store(true, std::memory_order_relaxed);
+    }
+    return all_written;
 }
 
 void ScheduleFlush(Context* context, const std::uint32_t delay_milliseconds);
@@ -1044,6 +1346,7 @@ void ANOMALY_CALL FlushTask(void* user, const AnomalyGenerationHandleV1 task) {
     }
     if (context->stop_started.load(std::memory_order_acquire)) return;
     static_cast<void>(Persist(*context, false, false));
+    static_cast<void>(PersistStreams(*context, false));
     if (context->stop_started.load(std::memory_order_acquire)) return;
     ScheduleFlush(context, kFlushIntervalMilliseconds);
 }
@@ -1198,6 +1501,7 @@ AnomalyStatusV1 ANOMALY_CALL Stop(void* plugin_context, std::uint32_t) {
     CancelFlush(*context);
     const bool hook_quiesced = ReleaseTraceHook(*context);
     if (hook_quiesced) ClearDetourState();
+    static_cast<void>(PersistStreams(*context, true));
     const bool persisted = Persist(*context, true, hook_quiesced);
     if (!hook_quiesced) {
         return Status(ANOMALY_STATUS_V1_FAILED, "trace hook did not quiesce");
