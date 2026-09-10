@@ -36,7 +36,14 @@ param(
 
     [string]$OutputDirectory = '',
 
-    [switch]$SkipCandidateProfile
+    [switch]$SkipCandidateProfile,
+
+    # When a symbol is currently sitting under a MinHook-style entry patch, the
+    # fallback E9 pattern is the only pattern that matches the live process.
+    # Enabled: write that hook-aware pattern into the candidate profile.
+    # Disabled (default): keep the original pattern, which stays valid for a
+    # fresh, unhooked start. The JSON report always records both patterns.
+    [switch]$WriteHookedPatterns
 )
 
 Set-StrictMode -Version Latest
@@ -341,6 +348,20 @@ $reportPath = Join-Path $resolvedOutputDirectory "signature-scan-$stamp.json"
 $candidatePath = $null
 $validation = $null
 
+$rewritten = @($results | Where-Object { $_.HookedEntry -and $_.Status -eq 'unique' })
+$wroteHooked = $false
+if ($WriteHookedPatterns -and $rewritten.Count -gt 0) {
+    $byId = @{}
+    foreach ($row in $rewritten) { $byId[[string]$row.Id] = [string]$row.Pattern }
+    foreach ($property in @($profile.symbols.PSObject.Properties)) {
+        $id = [string]$property.Name
+        if ($byId.ContainsKey($id)) {
+            $property.Value.pattern = $byId[$id]
+            $wroteHooked = $true
+        }
+    }
+}
+
 if ($allUnique -and -not $SkipCandidateProfile) {
     $candidatePath = Join-Path $resolvedOutputDirectory "$($fingerprint.id).candidate.json"
     $profile | ConvertTo-Json -Depth 100 |
@@ -371,6 +392,7 @@ $report = [pscustomobject][ordered]@{
         HookAwareUnique = @($results | Where-Object {
             $_.HookedEntry -eq $true
         }).Count
+        PatternsRewritten = if ($wroteHooked) { $rewritten.Count } else { 0 }
         NotFound = @($results | Where-Object Status -eq 'not-found').Count
         Ambiguous = @($results | Where-Object Status -eq 'ambiguous').Count
         Failed = @($results | Where-Object {
@@ -384,6 +406,18 @@ $report = [pscustomobject][ordered]@{
 }
 $report | ConvertTo-Json -Depth 100 |
     Set-Content -LiteralPath $reportPath -Encoding utf8
+
+foreach ($row in $results) {
+    $suffix = if ($row.HookedEntry -and $row.Status -eq 'unique') {
+        'hook-aware-pattern-platform'
+    } else { '' }
+    Write-Host ("{0,-34} {1,-12} {2}" -f $row.Id, $row.Status, $suffix)
+}
+$hookAwareCount = @($results | Where-Object { $_.HookedEntry -eq $true }).Count
+$rewrittenCount = if ($wroteHooked) { $rewritten.Count } else { 0 }
+$candidateText = if ($null -eq $candidatePath) { '<none>' } else { $candidatePath }
+Write-Host ("unique={0}/{1} hooked={2} rewritten={3} candidate={4}" -f `
+    $uniqueCount, $results.Count, $hookAwareCount, $rewrittenCount, $candidateText)
 
 [pscustomobject][ordered]@{
     ReportPath = $reportPath
