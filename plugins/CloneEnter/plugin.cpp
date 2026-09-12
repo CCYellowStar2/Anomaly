@@ -139,6 +139,16 @@ struct NormalAttackBinding {
     std::array<std::uint8_t, 8> released_value{};
 };
 
+// 大世界怪死后尸体仍留在实体/角色快照里（位置、类名都不变），会被每轮重新选为
+// "最近的怪"，导致对着空气一直打。框架没有暴露死亡位，因此改用唯一可靠的信号：
+// 玩家打出的伤害流。在攻击距离内持续打不出伤害，就把该目标判为尸体并拉黑一段时间，
+// 让选靶跳过它，直到它真正从快照里消失。
+struct AutoCombatDeadTarget {
+    AnomalyGenerationHandleV1 handle{};
+    double pos[3]{};
+    std::chrono::steady_clock::time_point until{};
+};
+
 struct Context {
     const AnomalyHostApiV1* host{};
     const AnomalyCoreServiceV1* core{};
@@ -258,8 +268,20 @@ struct Context {
     bool target_valid{false};
     std::atomic_uint32_t combat_search_radius_m{50};
     bool combat_scan_valid{false};
+    std::chrono::steady_clock::time_point auto_combat_nav_retry_at{};
     bool auto_combat_moving{false};
     std::chrono::steady_clock::time_point next_target_update{};
+    // 尸体判定：当前目标句柄、玩家句柄、伤害流游标、最近一次玩家造成伤害的时刻、
+    // 进入攻击距离的时刻，以及已拉黑的尸体列表。
+    AnomalyGenerationHandleV1 auto_combat_target_handle{};
+    std::uint64_t auto_combat_player_handle{0};
+    std::uint64_t auto_combat_damage_cursor{0};
+    std::chrono::steady_clock::time_point auto_combat_last_player_hit_at{};
+    std::chrono::steady_clock::time_point auto_combat_attack_since{};
+    // 当前目标锁定期间是否至少命中过一次。命中的目标被打死用短拉黑，
+    // 从头到尾打不中的目标（道具）用长拉黑。
+    bool auto_combat_target_hit{false};
+    std::vector<AutoCombatDeadTarget> auto_combat_dead_targets;
     std::uint64_t monster_class_id{0};
     std::vector<std::uint32_t> monster_class_name_ids;
     std::chrono::steady_clock::time_point next_class_rescan{};
@@ -4113,77 +4135,46 @@ bool InvokeNormalAttack(Context& context) {
 }
 
 
+void LogRewardDiagnostic(Context& context, const std::string& message);
+
 bool IsMonsterClassName(const std::string& name) noexcept {
-    if (name.rfind("mon_", 0) != 0 && name.rfind("boss_", 0) != 0 &&
-        name.rfind("Boss_", 0) != 0) return false;
+    // 以怪物前缀开头是最强信号，直接认定，不参与下面的辅助对象排除：
+    // 例如 mon_038_BP_World_CityEvent_Passive_01_C 名字里带 World/Passive，
+    // 但它确实是怪物，按关键词+排除词会被误杀。
+    if (name.rfind("mon_", 0) == 0 || name.rfind("boss", 0) == 0 ||
+        name.rfind("Boss_", 0) == 0) {
+        return true;
+    }
+    // 其余命名（大世界/事件怪等）按关键词命中识别，再排除同名族里的辅助对象。
+    // "mon_" 必须落在名字段边界上：Common_ 里也含 "mon_"，但 BP_MB_Graffiti_Decal_Common_C
+    // 是涂鸦贴花而不是怪，直接 find 会把它当成怪物。
+    bool candidate = false;
+    for (std::size_t at = name.find("mon_"); at != std::string::npos;
+         at = name.find("mon_", at + 1)) {
+        if (at == 0 || name[at - 1] == '_') {
+            candidate = true;
+            break;
+        }
+    }
+    if (!candidate) {
+        for (const char* kw : {"Monster", "monster", "boss", "Boss",
+                               "RainMan", "Enemy", "enemy"}) {
+            if (name.find(kw) != std::string::npos) {
+                candidate = true;
+                break;
+            }
+        }
+    }
+    if (!candidate) return false;
     for (const char* kw : {"Controller", "bullet", "World", "Vision", "FX",
-                           "Child", "summon", "Body", "anim", "back", "act",
-                           "begin", "Dead", "Play", "Hide", "Open", "Passive",
-                           "Skin", "Weapon", "Montage", "Material", "Texture"}) {
+                           "Child", "summon", "Body", "anim", "back", "begin",
+                           "Dead", "Play", "Hide", "Open", "Passive", "Skin",
+                           "Weapon", "Montage", "Material", "Texture",
+                           "LogicBox", "Spawn", "Manager"}) {
         if (name.find(kw) != std::string::npos) return false;
     }
     return true;
 }
-
-bool FindMonsterClassIds(Context& context) noexcept {
-    const auto now = std::chrono::steady_clock::now();
-    if (!context.monster_class_name_ids.empty() && now < context.next_class_rescan) return true;
-    std::vector<std::uint32_t> next_ids;
-    std::FILE* fp = std::fopen("D:\\monster-classids.txt", "w");
-    const auto* ents = context.entities;
-    if (ents == nullptr || ents->frame == nullptr || ents->page == nullptr ||
-        ents->class_name_utf8 == nullptr) {
-        if (fp != nullptr) std::fclose(fp);
-        return false;
-    }
-    AnomalyNteEntityFrameV1 frame{sizeof(frame)};
-    if (ents->frame(ents->user, &frame).code != ANOMALY_STATUS_V1_OK) {
-        if (fp != nullptr) std::fclose(fp);
-        return false;
-    }
-    std::array<AnomalyNteEntitySnapshotV1, 256> buf{};
-    for (auto& s : buf) s.struct_size = sizeof(s);
-    std::uint32_t offset = 0;
-    while (true) {
-        AnomalyNteEntityPageRequestV1 req{sizeof(req)};
-        req.generation = frame.generation;
-        req.offset = offset;
-        req.capacity = 256;
-        AnomalyNteEntityPageResultV1 res{sizeof(res)};
-        if (ents->page(ents->user, &req, buf.data(), &res).code != ANOMALY_STATUS_V1_OK) {
-            if (fp != nullptr) std::fclose(fp);
-            return false;
-        }
-        for (std::uint32_t j = 0; j < res.returned; ++j) {
-            const auto& snap = buf[j];
-            std::size_t sz = 0;
-            if (ents->class_name_utf8(ents->user, snap.class_id, nullptr, &sz).code !=
-                    ANOMALY_STATUS_V1_OK || sz == 0) continue;
-            std::string cn(sz, '\0');
-            if (ents->class_name_utf8(ents->user, snap.class_id, cn.data(), &sz).code !=
-                ANOMALY_STATUS_V1_OK) continue;
-            cn.resize(sz - 1);
-            if (!IsMonsterClassName(cn)) continue;
-            bool exists = false;
-            for (const std::uint32_t id : next_ids) {
-                if (id == snap.class_name_id) { exists = true; break; }
-            }
-            if (!exists) {
-                next_ids.push_back(snap.class_name_id);
-                if (fp != nullptr) {
-                    std::fprintf(fp, "%s class_name_id=%u\n", cn.c_str(), snap.class_name_id);
-                }
-            }
-        }
-        if (res.next_offset == 0 || res.next_offset >= res.total_matches) break;
-        offset = res.next_offset;
-    }
-    if (fp != nullptr) std::fclose(fp);
-    context.monster_class_name_ids = std::move(next_ids);
-    context.next_class_rescan = now + std::chrono::seconds(5);
-    return true;
-}
-
 
 bool TryGetCurrentCloneId(Context& context, std::uint64_t& id) noexcept {
     if (!GetPlayerState(context)) return false;
@@ -4223,6 +4214,10 @@ void ResetAutoCombatTarget(Context& context) noexcept {
     context.target_valid = false;
     context.combat_scan_valid = false;
     context.next_target_update = {};
+    // 计时必须跟着目标一起清掉：否则同一只怪离开半径后再回来时，
+    // 会继承上一轮的进入时刻，一锁定就被判成尸体。
+    context.auto_combat_attack_since = {};
+    context.auto_combat_target_hit = false;
 }
 
 double CombatDistanceSquared(const double* from, const double* to) noexcept {
@@ -4231,6 +4226,234 @@ double CombatDistanceSquared(const double* from, const double* to) noexcept {
     const double dz = to[2] - from[2];
     return dx * dx + dy * dy + dz * dz;
 }
+
+// 进入攻击距离后，玩家在这么长时间里一次伤害都没打出来，就认定目标无效。
+constexpr auto kAutoCombatNoDamageGrace = std::chrono::seconds(3);
+// 打死之后的尸体：拉黑到它从快照消失即可。
+constexpr auto kAutoCombatDeadTargetTtl = std::chrono::seconds(45);
+// 从头到尾一次都没打中过的目标（雨人的湖面/底座这类道具）：拉黑久一些，
+// 否则它会一直是最"近"的目标，让你反复对着空气挥。
+constexpr auto kAutoCombatNeverHitTargetTtl = std::chrono::seconds(120);
+// 大世界里带 RainMan/mon_ 字样却不是怪的道具（湖面、底座、贴花）实测最大边只有约 42cm，
+// 真正的怪都在 74cm 以上，因此按尺寸做一道物理预筛，三条边都小于阈值就不算怪物候选。
+constexpr double kAutoCombatMinimumExtentCm = 60.0;
+// 判定"同一具尸体"的位置容差（厘米）。
+constexpr double kAutoCombatDeadPosTolerance = 150.0;
+// 攻击分支使用的距离阈值（厘米）。
+constexpr double kAutoCombatAttackRangeCm = 600.0;
+
+// 实体快照句柄与伤害参与者句柄不在同一 ID 空间，句柄和位置任一命中都算同一具尸体。
+bool IsDeadAutoCombatTarget(
+    const Context& context, const AnomalyNteEntitySnapshotV1& snap,
+    const std::chrono::steady_clock::time_point now) noexcept {
+    for (const auto& dead : context.auto_combat_dead_targets) {
+        if (now >= dead.until) continue;
+        if (dead.handle.id != 0 && dead.handle.id == snap.handle.id &&
+            dead.handle.generation == snap.handle.generation) {
+            return true;
+        }
+        if (CombatDistanceSquared(dead.pos, snap.bounds_center) <=
+            kAutoCombatDeadPosTolerance * kAutoCombatDeadPosTolerance) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void BlacklistAutoCombatTarget(
+    Context& context, const AnomalyGenerationHandleV1& handle, const double* pos,
+    const std::chrono::steady_clock::time_point now, bool ever_hit) noexcept {
+    std::erase_if(context.auto_combat_dead_targets,
+        [now](const AutoCombatDeadTarget& dead) { return now >= dead.until; });
+    AutoCombatDeadTarget dead;
+    dead.handle = handle;
+    dead.pos[0] = pos[0];
+    dead.pos[1] = pos[1];
+    dead.pos[2] = pos[2];
+    dead.until = now +
+        (ever_hit ? kAutoCombatDeadTargetTtl : kAutoCombatNeverHitTargetTtl);
+    context.auto_combat_dead_targets.push_back(dead);
+}
+
+// entities 与 actors 两个服务的读取接口完全一致（frame/page/class_name_utf8），
+// 因此用模板统一处理：同一份逻辑同时覆盖两个实体来源。
+// 二者覆盖面不同——例如 boss18_* 只出现在 actors 服务，雨人只出现在 entities 服务。
+struct CombatTargetPick {
+    bool valid{};
+    double pos[3]{};
+    double best_distance_squared{};
+    AnomalyGenerationHandleV1 handle{};
+    std::uint32_t class_name_id{};
+};
+
+template <typename Service>
+bool CollectMonsterClassIdsFrom(
+    Service* service,
+    std::vector<std::uint32_t>& ids) {
+    if (service == nullptr || service->frame == nullptr || service->page == nullptr ||
+        service->class_name_utf8 == nullptr) {
+        return false;
+    }
+    AnomalyNteEntityFrameV1 frame{sizeof(frame)};
+    if (service->frame(service->user, &frame).code != ANOMALY_STATUS_V1_OK) return false;
+    std::array<AnomalyNteEntitySnapshotV1, 256> buf{};
+    for (auto& s : buf) s.struct_size = sizeof(s);
+    std::uint32_t offset = 0;
+    while (true) {
+        AnomalyNteEntityPageRequestV1 req{sizeof(req)};
+        req.generation = frame.generation;
+        req.offset = offset;
+        req.capacity = 256;
+        AnomalyNteEntityPageResultV1 res{sizeof(res)};
+        if (service->page(service->user, &req, buf.data(), &res).code !=
+            ANOMALY_STATUS_V1_OK) {
+            return false;
+        }
+        for (std::uint32_t j = 0; j < res.returned; ++j) {
+            const auto& snap = buf[j];
+            std::size_t sz = 0;
+            if (service->class_name_utf8(service->user, snap.class_id, nullptr, &sz).code !=
+                    ANOMALY_STATUS_V1_OK || sz == 0) {
+                continue;
+            }
+            std::string cn(sz, '\0');
+            if (service->class_name_utf8(service->user, snap.class_id, cn.data(), &sz).code !=
+                ANOMALY_STATUS_V1_OK) {
+                continue;
+            }
+            cn.resize(sz - 1);
+            if (!IsMonsterClassName(cn)) continue;
+            bool exists = false;
+            for (const std::uint32_t id : ids) {
+                if (id == snap.class_name_id) { exists = true; break; }
+            }
+            if (!exists) ids.push_back(snap.class_name_id);
+        }
+        if (res.next_offset == 0 || res.next_offset >= res.total_matches) break;
+        offset = res.next_offset;
+    }
+    return true;
+}
+
+template <typename Service, typename Skip>
+bool PickNearestMonsterFrom(
+    Service* service,
+    const std::vector<std::uint32_t>& ids,
+    const double* player_pos,
+    const double radius_squared,
+    Skip&& skip,
+    CombatTargetPick& pick) {
+    if (service == nullptr || service->frame == nullptr || service->page == nullptr ||
+        service->class_name_utf8 == nullptr) {
+        return false;
+    }
+    AnomalyNteEntityFrameV1 frame{sizeof(frame)};
+    if (service->frame(service->user, &frame).code != ANOMALY_STATUS_V1_OK) return false;
+    // 缓冲区在类名循环外复用：一次调用只初始化一份，而不是每个类名各一份
+    // （256 × sizeof(snapshot) ≈ 24KB，按类名数翻倍放大）。
+    std::array<AnomalyNteEntitySnapshotV1, 256> buf{};
+    for (auto& s : buf) s.struct_size = sizeof(s);
+    for (const std::uint32_t cid : ids) {
+        std::uint32_t offset = 0;
+        while (true) {
+            AnomalyNteEntityPageRequestV1 req{sizeof(req)};
+            req.generation = frame.generation;
+            req.offset = offset;
+            req.capacity = 256;
+            req.class_name_id = cid;
+            req.excluded_flags = ANOMALY_NTE_ENTITY_V1_LOCAL_PLAYER;
+            AnomalyNteEntityPageResultV1 res{sizeof(res)};
+            if (service->page(service->user, &req, buf.data(), &res).code !=
+                ANOMALY_STATUS_V1_OK) {
+                return false;
+            }
+            for (std::uint32_t j = 0; j < res.returned; ++j) {
+                const auto& snap = buf[j];
+                if (skip(snap)) continue;
+                // 物理预筛：三条边都小于阈值的不是怪物体型（雨人湖面/底座这类道具）。
+                const double largest_extent = (std::max)({snap.bounds_extent[0],
+                    snap.bounds_extent[1], snap.bounds_extent[2]});
+                if (!(largest_extent >= kAutoCombatMinimumExtentCm)) continue;
+                const double d2 = CombatDistanceSquared(player_pos, snap.bounds_center);
+                if (!std::isfinite(d2) || d2 > radius_squared) continue;
+                if (!pick.valid || d2 < pick.best_distance_squared) {
+                    pick.best_distance_squared = d2;
+                    pick.pos[0] = snap.bounds_center[0];
+                    pick.pos[1] = snap.bounds_center[1];
+                    pick.pos[2] = snap.bounds_center[2];
+                    pick.valid = true;
+                    pick.handle = snap.handle;
+                    pick.class_name_id = cid;
+                }
+            }
+            if (res.next_offset == 0 || res.next_offset >= res.total_matches) break;
+            offset = res.next_offset;
+        }
+    }
+    return true;
+}
+
+// 同时扫描 entities 与 actors 两个来源。二者覆盖面确实不同：entities 只覆盖
+// world.persistentLevel，包含大世界怪物的 actors 只在全部关卡的扫描里出现。
+bool FindMonsterClassIds(Context& context) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (!context.monster_class_name_ids.empty() && now < context.next_class_rescan) return true;
+    std::vector<std::uint32_t> next_ids;
+    const bool entities_ok = CollectMonsterClassIdsFrom(context.entities, next_ids);
+    const bool actors_ok = CollectMonsterClassIdsFrom(context.actors, next_ids);
+    if (!entities_ok && !actors_ok) return false;
+    context.monster_class_name_ids = std::move(next_ids);
+    context.next_class_rescan = now + std::chrono::seconds(5);
+    return true;
+}
+
+// 伤害流是否可用。不可用时不能做尸体判定，否则会误把所有目标判成尸体。
+bool CombatStreamAvailable(const Context& context) noexcept {
+    return context.combat != nullptr &&
+        context.combat->latest_damage_sequence != nullptr &&
+        context.combat->next_damage_event != nullptr;
+}
+
+// 消费战斗伤害流，记录"玩家最近一次打出了伤害"的时刻。
+// 该时刻是判断当前目标是否还能打的依据：尸体和道具类目标仍在快照里，但打不出任何伤害。
+void PumpAutoCombatCombatStream(Context& context) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (context.combat == nullptr) return;
+    if (context.combat->current_combatant != nullptr) {
+        AnomalyNteCombatantSnapshotV1 combatant{sizeof(combatant)};
+        if (context.combat->current_combatant(context.combat->user, &combatant).code ==
+            ANOMALY_STATUS_V1_OK) {
+            context.auto_combat_player_handle = combatant.character.id;
+        }
+    }
+    if (!CombatStreamAvailable(context)) return;
+    const std::uint64_t latest =
+        context.combat->latest_damage_sequence(context.combat->user);
+    // 首次进入或序列被重置时，从当前序列起步，避免把历史伤害当成刚刚命中。
+    if (context.auto_combat_damage_cursor == 0 ||
+        context.auto_combat_damage_cursor > latest) {
+        context.auto_combat_damage_cursor = latest;
+        return;
+    }
+    int drained = 0;
+    while (context.auto_combat_damage_cursor < latest && drained < 64) {
+        AnomalyNteDamageEventV1 event{sizeof(event)};
+        if (context.combat->next_damage_event(
+                context.combat->user, context.auto_combat_damage_cursor, &event).code !=
+            ANOMALY_STATUS_V1_OK) {
+            break;
+        }
+        if (event.sequence <= context.auto_combat_damage_cursor) break;
+        context.auto_combat_damage_cursor = event.sequence;
+        ++drained;
+        if (context.auto_combat_player_handle != 0 &&
+            event.attacker.id == context.auto_combat_player_handle) {
+            context.auto_combat_last_player_hit_at = now;
+        }
+    }
+}
+
+bool TeleportToPosition(Context& context, const double (&position)[3]) noexcept;
 
 void AutoCombatTick(Context& context) noexcept {
     if (context.navigation == nullptr || context.navigation->move_to_location == nullptr ||
@@ -4248,6 +4471,7 @@ void AutoCombatTick(Context& context) noexcept {
         return;
     }
     const auto now = std::chrono::steady_clock::now();
+    PumpAutoCombatCombatStream(context);
     const double radius_cm = static_cast<double>(context.combat_search_radius_m.load(
         std::memory_order_acquire)) * 100.0;
     const double radius_squared = radius_cm * radius_cm;
@@ -4265,56 +4489,62 @@ void AutoCombatTick(Context& context) noexcept {
         const double cached_distance = CombatDistanceSquared(player_pos, context.target_pos);
         if (!std::isfinite(cached_distance) || cached_distance > radius_squared) {
             ResetAutoCombatTarget(context);
+        } else if (cached_distance <=
+                   kAutoCombatAttackRangeCm * kAutoCombatAttackRangeCm) {
+            // 已经在打它了。若连着 kAutoCombatNoDamageGrace 一点伤害都没打出来，
+            // 说明这个目标打不动：可能是还留在快照里的尸体，也可能是类名像怪、
+            // 实际是道具的对象。拉黑并重新选靶。
+            if (context.auto_combat_attack_since.time_since_epoch().count() == 0) {
+                context.auto_combat_attack_since = now;
+            }
+            const bool hit_recent =
+                context.auto_combat_last_player_hit_at.time_since_epoch().count() != 0 &&
+                now - context.auto_combat_last_player_hit_at <= kAutoCombatNoDamageGrace;
+            if (hit_recent) context.auto_combat_target_hit = true;
+            if (!hit_recent && CombatStreamAvailable(context) &&
+                now - context.auto_combat_attack_since > kAutoCombatNoDamageGrace) {
+                BlacklistAutoCombatTarget(context, context.auto_combat_target_handle,
+                    context.target_pos, now, context.auto_combat_target_hit);
+                ResetAutoCombatTarget(context);
+            }
+        } else {
+            context.auto_combat_attack_since = {};
         }
     }
-    // 每秒重新找一次最近的怪
-    if (!context.target_valid || now >= context.next_target_update) {
+    // 每秒重新找一次最近的怪。这里不能再用 !target_valid 做条件：没有目标时它会让
+    // 整段扫描每帧都跑（两个服务 × 每个类名一次分页，每帧几十次分页调用），
+    // 这正是"开了自动战斗就掉帧"的来源。目标释放一律走 ResetAutoCombatTarget，
+    // 而它会清空 next_target_update，所以"释放后立刻重新选靶"的行为不受影响。
+    if (now >= context.next_target_update) {
         context.target_valid = false;
         context.combat_scan_valid = false;
-        const auto* ents = context.entities;
-        if (ents != nullptr && ents->frame != nullptr && ents->page != nullptr) {
-            AnomalyNteEntityFrameV1 frame{sizeof(frame)};
-            if (ents->frame(ents->user, &frame).code == ANOMALY_STATUS_V1_OK &&
-                FindMonsterClassIds(context)) {
-                bool complete = true;
-                double best_distance_squared = radius_squared;
-                for (const std::uint32_t cid : context.monster_class_name_ids) {
-                    std::array<AnomalyNteEntitySnapshotV1, 256> buf{};
-                    for (auto& s : buf) s.struct_size = sizeof(s);
-                    std::uint32_t offset = 0;
-                    while (true) {
-                        AnomalyNteEntityPageRequestV1 req{sizeof(req)};
-                        req.generation = frame.generation;
-                        req.offset = offset;
-                        req.capacity = 256;
-                        req.class_name_id = cid;
-                        req.excluded_flags = ANOMALY_NTE_ENTITY_V1_LOCAL_PLAYER;
-                        AnomalyNteEntityPageResultV1 res{sizeof(res)};
-                        if (ents->page(ents->user, &req, buf.data(), &res).code !=
-                            ANOMALY_STATUS_V1_OK) {
-                            complete = false;
-                            break;
-                        }
-                        for (std::uint32_t j = 0; j < res.returned; ++j) {
-                            const auto& snap = buf[j];
-                            const double distance_squared = CombatDistanceSquared(
-                                player_pos, snap.bounds_center);
-                            if (!std::isfinite(distance_squared) || distance_squared > radius_squared) continue;
-                            if (!context.target_valid || distance_squared < best_distance_squared) {
-                                best_distance_squared = distance_squared;
-                                context.target_pos[0] = snap.bounds_center[0];
-                                context.target_pos[1] = snap.bounds_center[1];
-                                context.target_pos[2] = snap.bounds_center[2];
-                                context.target_valid = true;
-                            }
-                        }
-                        if (res.next_offset == 0 || res.next_offset >= res.total_matches) break;
-                        offset = res.next_offset;
-                    }
-                    if (!complete) break;
+        if (FindMonsterClassIds(context)) {
+            CombatTargetPick pick;
+            pick.best_distance_squared = radius_squared;
+            // 同一份逻辑扫两个来源，取二者中更近的那个。
+            const auto skip_dead =
+                [&context, now](const AnomalyNteEntitySnapshotV1& snap) {
+                    return IsDeadAutoCombatTarget(context, snap, now);
+                };
+            const bool entities_ok = PickNearestMonsterFrom(
+                context.entities, context.monster_class_name_ids, player_pos,
+                radius_squared, skip_dead, pick);
+            const bool actors_ok = PickNearestMonsterFrom(
+                context.actors, context.monster_class_name_ids, player_pos,
+                radius_squared, skip_dead, pick);
+            context.combat_scan_valid = entities_ok || actors_ok;
+            if (pick.valid) {
+                context.target_pos[0] = pick.pos[0];
+                context.target_pos[1] = pick.pos[1];
+                context.target_pos[2] = pick.pos[2];
+                context.target_valid = true;
+                if (context.auto_combat_target_handle.id != pick.handle.id ||
+                    context.auto_combat_target_handle.generation !=
+                        pick.handle.generation) {
+                    context.auto_combat_target_handle = pick.handle;
+                    context.auto_combat_attack_since = {};
+                    context.auto_combat_target_hit = false;
                 }
-                context.combat_scan_valid = complete;
-                if (!complete) context.target_valid = false;
             }
         }
         context.next_target_update = now + std::chrono::milliseconds(1000);
@@ -4334,7 +4564,10 @@ void AutoCombatTick(Context& context) noexcept {
             }
         }
     }
-    if (!context.target_valid) return;
+    if (!context.target_valid) {
+        context.auto_combat_attack_since = {};
+        return;
+    }
     const double dx = context.target_pos[0] - player_pos[0];
     const double dy = context.target_pos[1] - player_pos[1];
     const double dz = context.target_pos[2] - player_pos[2];
@@ -4342,10 +4575,30 @@ void AutoCombatTick(Context& context) noexcept {
     char status[128]{};
     std::snprintf(status, sizeof(status), "目标 %.1f米", dist / 100.0);
     context.combat_status = status;
-    if (dist > 600.0) {
-        if (context.navigation->move_to_location(
-                context.navigation->user, context.target_pos).code == ANOMALY_STATUS_V1_OK) {
-            context.auto_combat_moving = true;
+    if (dist > kAutoCombatAttackRangeCm) {
+        // 怪物包围盒中心常常无法直接寻路抵达（悬空/湖面/特殊地形），游戏导航会原地不动。
+        // 开发者模式下改用传送接近，绕过不可达的寻路；抬高 200cm 避免落进地面。
+        if (context.developer_mode.load(std::memory_order_acquire)) {
+            double tp_target[3] = {
+                context.target_pos[0], context.target_pos[1],
+                context.target_pos[2] + 200.0};
+            if (TeleportToPosition(context, tp_target)) {
+                StopAutoCombatMovement(context);
+                return;
+            }
+        }
+        // 寻路只取水平位置，高度用玩家当前高度。
+        double nav_target[3] = {
+            context.target_pos[0], context.target_pos[1], player_pos[2]};
+        // 游戏原生寻路被每帧重复下发会反复重置（角色原地不动），
+        // 因此按间隔先 stop 再下发，与 BoxAuto 的成熟做法一致。
+        if (now >= context.auto_combat_nav_retry_at) {
+            context.auto_combat_nav_retry_at = now + std::chrono::seconds(2);
+            StopAutoCombatMovement(context);
+            if (context.navigation->move_to_location(
+                    context.navigation->user, nav_target).code == ANOMALY_STATUS_V1_OK) {
+                context.auto_combat_moving = true;
+            }
         }
     } else {
         StopAutoCombatMovement(context);
@@ -4374,7 +4627,6 @@ void AutoCombatTick(Context& context) noexcept {
         }
     }
 }
-
 
 void DumpCombatTarget(Context& context) noexcept {
     std::FILE* fp = std::fopen("D:\\combat-target.txt", "w");
