@@ -282,6 +282,10 @@ struct Context {
     // 从头到尾打不中的目标（道具）用长拉黑。
     bool auto_combat_target_hit{false};
     std::vector<AutoCombatDeadTarget> auto_combat_dead_targets;
+    // 领奖窗口扫描失败是概率性的，重试很密集：这条诊断按 2 秒节流。
+    std::chrono::steady_clock::time_point next_reward_scan_diag{};
+    // 同上，「打开领奖窗口」失败的诊断也按 2 秒节流。
+    std::chrono::steady_clock::time_point next_reward_open_diag{};
     std::uint64_t monster_class_id{0};
     std::vector<std::uint32_t> monster_class_name_ids;
     std::chrono::steady_clock::time_point next_class_rescan{};
@@ -321,9 +325,17 @@ struct Context {
     std::uint64_t auto_claim_clone_id{};
     std::int32_t auto_claim_phase{0};
     std::int32_t auto_claim_retries{0};
-    std::chrono::steady_clock::time_point auto_claim_deadline{};
+    // 领取流程的时限按"采样次数"计，而不是墙钟：状态机靠被调用推进，
+    // 游戏 tick 一旦停摆（失焦/加载/卡顿），墙钟 deadline 会在恢复调用的第一刻
+    // 立刻判超时，于是变成概率性失败。按次数计则等价于"观察够 N 次才放弃"。
+    std::uint32_t auto_claim_polls{0};
+    std::uint32_t auto_claim_deadline_polls{0};
+    std::uint32_t auto_claim_limit_polls{0};
+    // 本次交互用的宝箱 actor：窗口没出现时需要重发交互。
+    std::uintptr_t auto_claim_chest{0};
+    // 已经为了交互而接近宝箱的轮数（有上限，避免落点不可达时卡在接近阶段）。
+    std::uint32_t auto_claim_approach_polls{0};
     std::chrono::steady_clock::time_point auto_claim_poll{};
-    std::chrono::steady_clock::time_point auto_claim_limit{};
     std::chrono::steady_clock::time_point auto_claim_nav_issue{};
     std::chrono::steady_clock::time_point auto_claim_nav_deadline{};
     bool one_key_active{false};
@@ -4972,11 +4984,13 @@ struct RewardWindows {
     bool complete{};
     std::uint32_t scanned{};
     std::uint32_t candidates{};
+    std::uint32_t skipped{};
     const char* reason{"not started"};
 };
 
 RewardWindows FindRewardWindows(Context& context, bool diagnose = false) {
     RewardWindows result;
+    const auto now = std::chrono::steady_clock::now();
     const auto finish = [&](const char* reason) {
         result.reason = reason;
         if (diagnose) {
@@ -4986,9 +5000,20 @@ RewardWindows FindRewardWindows(Context& context, bool diagnose = false) {
                 " registry=" + address +
                 " scanned=" + std::to_string(result.scanned) +
                 " candidates=" + std::to_string(result.candidates) +
+                " skipped=" + std::to_string(result.skipped) +
                 " award=" + std::to_string(result.award != 0) +
                 " settlement=" + std::to_string(result.settlement != 0) +
                 " ambiguous=" + std::to_string(result.ambiguous));
+        } else if (!result.complete && now >= context.next_reward_scan_diag) {
+            // 这条路径是按 500ms 轮询的，失败是概率性的：按 2 秒节流留一条线索，
+            // 否则"找不到领奖窗口"只能看到结论、看不到原因。
+            context.next_reward_scan_diag = now + std::chrono::seconds(2);
+            LogRewardDiagnostic(context, "reward-window scan incomplete: " + std::string(reason) +
+                " scanned=" + std::to_string(result.scanned) +
+                " candidates=" + std::to_string(result.candidates) +
+                " skipped=" + std::to_string(result.skipped) +
+                " award=" + std::to_string(result.award != 0) +
+                " settlement=" + std::to_string(result.settlement != 0));
         }
         return result;
     };
@@ -5031,10 +5056,11 @@ RewardWindows FindRewardWindows(Context& context, bool diagnose = false) {
         if (inserted) {
             const std::string name = ResolveName(context.names, class_name_id);
             if (name.empty()) {
+                // 扫描整个对象注册表时，个别条目读到撕裂的 class 指针是正常现象。
+                // 跳过它即可：一个无关对象不能让整次扫描作废（否则会变成概率性失败）。
                 context.reward_class_kinds.erase(entry);
-                if (diagnose) LogRewardDiagnostic(context, "reward-window unresolved class_name_id=" +
-                    std::to_string(class_name_id));
-                return finish("class name unresolved");
+                ++result.skipped;
+                continue;
             }
             if (name.find("CombatAwardReceive") != std::string::npos) entry->second = 1;
             else if (name.find("CloneSystemAwards") != std::string::npos) entry->second = 2;
@@ -5044,9 +5070,15 @@ RewardWindows FindRewardWindows(Context& context, bool diagnose = false) {
         ++result.candidates;
         AnomalyUe5ObjectSnapshotV1 snapshot{sizeof(snapshot)};
         if (context.objects->snapshot_at(context.objects->user, static_cast<std::uint32_t>(i),
-                &snapshot).code != ANOMALY_STATUS_V1_OK) return finish("candidate snapshot unavailable");
+                &snapshot).code != ANOMALY_STATUS_V1_OK) {
+            ++result.skipped;
+            continue;
+        }
         const auto object_name = ResolveName(context.names, snapshot.name_id);
-        if (object_name.empty()) return finish("candidate name unresolved");
+        if (object_name.empty()) {
+            ++result.skipped;
+            continue;
+        }
         if (object_name.starts_with("Default__") || !IsActiveRewardWidget(context, object, diagnose)) continue;
         auto& selected = entry->second == 2 ? result.settlement : result.award;
         if (selected != 0) result.ambiguous = true;
@@ -5055,6 +5087,11 @@ RewardWindows FindRewardWindows(Context& context, bool diagnose = false) {
             result.award_button = "Button_Single";
             result.award_double_button = "Button_Double";
         }
+    }
+    // 有条目读失败时不能断言"没有窗口"：标记为不完整，让调用方下一轮重试，
+    // 而不是把一次瞬时读取失败变成"未发现领奖窗口"。
+    if (result.award == 0 && result.settlement == 0 && result.skipped != 0) {
+        return finish("skipped unreadable registry entries");
     }
     result.complete = true;
     return finish("complete");
@@ -6394,6 +6431,8 @@ void StopAutoClaim(Context& context, const std::string& reason) noexcept {
     context.auto_claim_active = false;
     context.auto_claim_succeeded = false;
     context.combat_status = reason;
+    // 临时诊断：自动领取终止只写 UI 状态，日志里只剩"没打开窗口"这个结论。
+    LogRewardDiagnostic(context, "autoclaim stop: " + reason);
 }
 
 void StartAutoClaim(Context& context) noexcept {
@@ -6401,21 +6440,38 @@ void StartAutoClaim(Context& context) noexcept {
     context.auto_claim_succeeded = false;
     context.auto_claim_phase = 0;
     context.auto_claim_retries = 0;
-    context.auto_claim_deadline = {};
+    context.auto_claim_polls = 0;
+    context.auto_claim_deadline_polls = 0;
+    context.auto_claim_limit_polls = 90;
+    context.auto_claim_chest = 0;
+    context.auto_claim_approach_polls = 0;
     context.auto_claim_poll = {};
-    context.auto_claim_limit = std::chrono::steady_clock::now() + std::chrono::seconds(90);
     context.auto_claim_nav_issue = {};
     context.auto_claim_nav_deadline = {};
     context.combat_status = "自动领取：开始";
 }
 
-bool TriggerRewardChest(Context& context, std::uintptr_t chest) noexcept {
+bool TriggerRewardChest(Context& context, std::uintptr_t chest,
+                        const char** reason = nullptr) noexcept {
+    const auto fail = [reason](const char* text) {
+        if (reason != nullptr) *reason = text;
+        return false;
+    };
     std::uintptr_t cls{}, fn{};
-    if (chest == 0 || !Read(reinterpret_cast<const void*>(context.controller + kObjectClassOffset), cls) ||
-        !FindFunction(context.names, cls, "TriggerInteract", 3, 13, fn)) return false;
+    if (chest == 0) return fail("chest handle is null");
+    if (!Read(reinterpret_cast<const void*>(context.controller + kObjectClassOffset), cls) ||
+        cls == 0) return fail("controller class unreadable");
+    if (!FindFunction(context.names, cls, "TriggerInteract", 3, 13, fn)) {
+        return fail("TriggerInteract not found on the controller class hierarchy");
+    }
     std::array<std::uint8_t, 13> parameters{};
     std::memcpy(parameters.data(), &chest, sizeof(chest));
-    return Invoke(reinterpret_cast<void*>(context.controller), reinterpret_cast<void*>(fn), parameters.data());
+    if (!Invoke(reinterpret_cast<void*>(context.controller), reinterpret_cast<void*>(fn),
+                parameters.data())) {
+        return fail("TriggerInteract process-event call failed");
+    }
+    if (reason != nullptr) *reason = "ok";
+    return true;
 }
 
 void OpenRewardWindow(Context& context) {
@@ -6441,8 +6497,20 @@ void OpenRewardWindow(Context& context) {
         return;
     }
     const auto windows = FindRewardWindows(context);
+    // 这条路径原本失败时只写 UI 状态，"打开窗口失败"就查不出原因。按 2 秒节流记录分支。
+    const auto report_failure = [&context](const std::string& text) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now < context.next_reward_open_diag) return;
+        context.next_reward_open_diag = now + std::chrono::seconds(2);
+        LogRewardDiagnostic(context, "open-reward-window failed: " + text);
+    };
     if (!windows.complete || windows.ambiguous) {
         context.combat_status = "打开领奖窗口：窗口状态不可用";
+        report_failure("window state unavailable complete=" +
+            std::to_string(windows.complete ? 1 : 0) + " ambiguous=" +
+            std::to_string(windows.ambiguous ? 1 : 0) + " reason=" + windows.reason +
+            " scanned=" + std::to_string(windows.scanned) + " candidates=" +
+            std::to_string(windows.candidates) + " skipped=" + std::to_string(windows.skipped));
         return;
     }
     if (windows.award != 0 || windows.settlement != 0) {
@@ -6453,6 +6521,7 @@ void OpenRewardWindow(Context& context) {
     const auto chest = FindChestActor(context, chest_position);
     if (chest == 0) {
         context.combat_status = "打开领奖窗口：未找到宝箱";
+        report_failure("chest actor not found in the entity snapshot");
         return;
     }
     std::string distance = "距离未知";
@@ -6464,8 +6533,11 @@ void OpenRewardWindow(Context& context) {
             distance = text;
         }
     }
-    context.combat_status = TriggerRewardChest(context, chest)
+    const char* reason = "not attempted";
+    const bool triggered = TriggerRewardChest(context, chest, &reason);
+    context.combat_status = triggered
         ? "已请求打开领奖窗口，" + distance : "宝箱交互调用失败，" + distance;
+    if (!triggered) report_failure("chest interaction failed: " + std::string(reason));
 }
 
 // 宝箱原点偏低，传送落点抬高一些，避免落进地面/箱体里。
@@ -6505,14 +6577,24 @@ bool TeleportToPosition(Context& context, const double (&position)[3]) noexcept 
         ANOMALY_STATUS_V1_OK;
 }
 
+// 宝箱交互的实际有效距离。实测从 4.3~10.8 米外调用 TriggerInteract，每次都返回成功
+// 但游戏不开窗；贴到约 2 米（坐标 z 抬高 200cm 后）再交互才会生效。原先接近阈值写成
+// 1200cm，导致从未执行接近动作、一直从远处交互。这里统一成一个常量。
+constexpr double kAutoClaimApproachRangeCm = 300.0;
+// 等待窗口状态变化的采样次数上限。实测有一次成功的领取用了约 13 次采样才等到结算窗口，
+// 原先的 15 次余量太薄，所以放宽。
+constexpr std::uint32_t kAutoClaimWaitPolls = 25;
+
 void AutoClaimTick(Context& context) noexcept {
     if (!context.auto_claim_active) return;
     const auto now = std::chrono::steady_clock::now();
-    if (now >= context.auto_claim_limit) {
+    // 时限按采样次数判定：游戏 tick 停摆时不会把"没被调用"算成"等待超时"。
+    if (context.auto_claim_polls >= context.auto_claim_limit_polls) {
         StopAutoClaim(context, "自动领取停止：等待玩家/窗口超时");
         return;
     }
-    if (context.auto_claim_phase != 0 && now >= context.auto_claim_deadline) {
+    if (context.auto_claim_phase != 0 &&
+        context.auto_claim_polls >= context.auto_claim_deadline_polls) {
         StopAutoClaim(context, context.auto_claim_phase == 3 ?
             "自动领取停止：退出后未确认离开副本" : "自动领取停止：未观察到预期的领奖/结算窗口");
         return;
@@ -6520,6 +6602,7 @@ void AutoClaimTick(Context& context) noexcept {
     if (!GetPlayerState(context)) { context.combat_status = "自动领取：等待玩家"; return; }
     if (now < context.auto_claim_poll) return;
     context.auto_claim_poll = now + std::chrono::seconds(1);
+    ++context.auto_claim_polls;
     if (context.auto_claim_phase == 3) {
         std::uint64_t clone_id{};
         const bool left_clone = context.auto_claim_clone_id != 0 &&
@@ -6547,15 +6630,15 @@ void AutoClaimTick(Context& context) noexcept {
         context.auto_claim_clone_id = GetCurrentCloneId(context);
         if (windows.award != 0 || windows.settlement != 0) {
             context.auto_claim_phase = windows.award != 0 ? 1 : 2;
-            context.auto_claim_deadline = now + std::chrono::seconds(15);
+            context.auto_claim_deadline_polls = context.auto_claim_polls + kAutoClaimWaitPolls;
             return;
         }
-        if (now < context.auto_claim_deadline) return;
+        if (context.auto_claim_polls < context.auto_claim_deadline_polls) return;
         const std::uintptr_t chest = FindChestActor(context);
         if (chest == 0) {
             ++context.auto_claim_retries;
             if (context.auto_claim_retries < 20) {
-                context.auto_claim_deadline = now + std::chrono::milliseconds(500);
+                context.auto_claim_deadline_polls = context.auto_claim_polls;
                 context.combat_status = "自动领取：等待宝箱加载";
             } else {
                 StopAutoClaim(context, "自动领取：找不到宝箱");
@@ -6573,36 +6656,42 @@ void AutoClaimTick(Context& context) noexcept {
                     const double dy = chest_pos[1] - player_pos[1];
                     const double dz = chest_pos[2] - player_pos[2];
                     const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    if (dist > 1200.0 &&
-                        context.developer_mode.load(std::memory_order_acquire) &&
+                    // 开发者模式：交互前一律先传送到宝箱，不按距离判断。
+                    // 实测"只是靠近"不够 —— 玩家距宝箱约 1 米时交互调用照样返回成功
+                    // 但游戏不开窗；同一批 10 次成功全部是"刚传送过去再交互"。
+                    // 插件算出的距离用的是包围盒中心，并不等于到可交互点的真实距离，
+                    // 所以不能用它决定要不要传送。
+                    if (context.developer_mode.load(std::memory_order_acquire) &&
+                        context.auto_claim_approach_polls < 5 &&
                         TeleportToPosition(context, chest_pos)) {
-                        // 开发者模式：直接传送到宝箱，跳过原版寻路。
-                        // 传送失败（服务未发布/句柄过期）时不 return，回退到下面的寻路。
+                        ++context.auto_claim_approach_polls;
                         context.combat_status = "自动领取：传送到宝箱";
-                        context.auto_claim_deadline = now + std::chrono::milliseconds(500);
-                        return;
-                    }
-                    const bool nav_timed_out =
-                        context.auto_claim_nav_deadline !=
-                            std::chrono::steady_clock::time_point{} &&
-                        now >= context.auto_claim_nav_deadline;
-                    if (dist > 1200.0 &&
-                        context.navigation != nullptr &&
-                        context.navigation->move_to_location != nullptr &&
-                        !nav_timed_out) {
-                        if (now >= context.auto_claim_nav_issue) {
-                            static_cast<void>(context.navigation->move_to_location(
-                                context.navigation->user, chest_pos));
-                            context.auto_claim_nav_issue = now + std::chrono::seconds(4);
-                            if (context.auto_claim_nav_deadline ==
-                                std::chrono::steady_clock::time_point{}) {
-                                context.auto_claim_nav_deadline =
-                                    now + std::chrono::seconds(10);
+                        // 不 return：本轮紧接着交互，保持实测有效的先后顺序。
+                    } else if (dist > kAutoClaimApproachRangeCm &&
+                               context.auto_claim_approach_polls < 5) {
+                        // 非开发者模式（或传送不可用）：按距离先靠近再交互。
+                        const bool nav_timed_out =
+                            context.auto_claim_nav_deadline !=
+                                std::chrono::steady_clock::time_point{} &&
+                            now >= context.auto_claim_nav_deadline;
+                        if (context.navigation != nullptr &&
+                            context.navigation->move_to_location != nullptr &&
+                            !nav_timed_out) {
+                            ++context.auto_claim_approach_polls;
+                            if (now >= context.auto_claim_nav_issue) {
+                                static_cast<void>(context.navigation->move_to_location(
+                                    context.navigation->user, chest_pos));
+                                context.auto_claim_nav_issue = now + std::chrono::seconds(4);
+                                if (context.auto_claim_nav_deadline ==
+                                    std::chrono::steady_clock::time_point{}) {
+                                    context.auto_claim_nav_deadline =
+                                        now + std::chrono::seconds(10);
+                                }
                             }
+                            context.combat_status = "自动领取：移动向宝箱";
+                            context.auto_claim_deadline_polls = context.auto_claim_polls;
+                            return;
                         }
-                        context.combat_status = "自动领取：移动向宝箱";
-                        context.auto_claim_deadline = now + std::chrono::milliseconds(500);
-                        return;
                     }
                 }
             }
@@ -6614,21 +6703,41 @@ void AutoClaimTick(Context& context) noexcept {
                 chest_cls != 0 ? ObjectName(context.names, chest_cls) : std::string();
             context.auto_claim_is_weekly =
                 chest_cls_name.find("Weekly") != std::string::npos;
+            // 临时诊断：交互时玩家离宝箱多远，是区分"距离不够导致游戏忽略交互"与
+            // "宝箱本身不可交互"的关键数据。
+            double log_chest[3]{}, log_player[3]{};
+            const bool have_chest = FindChestPos(context, log_chest);
+            const bool have_player = SnapshotPlayerPosition(context, log_player);
+            const double dist_cm = (have_chest && have_player)
+                ? std::sqrt(CombatDistanceSquared(log_player, log_chest))
+                : -1.0;
+            LogRewardDiagnostic(context, "autoclaim chest: class=" + chest_cls_name +
+                " handle=0x" + [&chest] {
+                    char text[24]{};
+                    std::snprintf(text, sizeof(text), "%llX",
+                        static_cast<unsigned long long>(chest));
+                    return std::string(text);
+                }() + " dist_cm=" + std::to_string(static_cast<long long>(dist_cm)) +
+                " chest_pos_ok=" + std::to_string(have_chest ? 1 : 0) +
+                " player_ok=" + std::to_string(have_player ? 1 : 0));
         }
-        if (!TriggerRewardChest(context, chest)) {
-            StopAutoClaim(context, "自动领取停止：宝箱交互调用失败");
+        context.auto_claim_chest = chest;
+        const char* chest_reason = "not attempted";
+        if (!TriggerRewardChest(context, chest, &chest_reason)) {
+            StopAutoClaim(context,
+                "自动领取停止：宝箱交互调用失败（" + std::string(chest_reason) + "）");
             return;
         }
         context.auto_claim_phase = 1;
         context.auto_claim_poll = now + std::chrono::milliseconds(2500);
-        context.auto_claim_deadline = now + std::chrono::seconds(15);
+        context.auto_claim_deadline_polls = context.auto_claim_polls + kAutoClaimWaitPolls;
         context.combat_status = "自动领取：打开窗口中";
         return;
     }
     case 1: {
         if (windows.settlement != 0 && windows.award == 0) {
             context.auto_claim_phase = 2;
-            context.auto_claim_deadline = now + std::chrono::seconds(15);
+            context.auto_claim_deadline_polls = context.auto_claim_polls + kAutoClaimWaitPolls;
             return;
         }
         if (windows.award != 0 && windows.settlement == 0) {
@@ -6641,9 +6750,43 @@ void AutoClaimTick(Context& context) noexcept {
                 return;
             }
             context.auto_claim_phase = 2;
-            context.auto_claim_deadline = now + std::chrono::seconds(15);
+            context.auto_claim_deadline_polls = context.auto_claim_polls + kAutoClaimWaitPolls;
             context.combat_status = std::string_view(button) == windows.award_double_button
                 ? "已调用双倍领取，等待奖励列表" : "已调用普通领取，等待奖励列表";
+            return;
+        }
+        // 两个窗口都不在：交互调用虽然被接受，游戏却可能没真的开窗（UI 未生效时会吞掉这次交互，
+        // 上手实测过整整 15 秒 award=0 settlement=0 然后被判超时）。被动等只会误判失败，
+        // 这里按节拍重发交互，让它在 UI 可用后生效；重发次数受剩余预算约束。
+        const std::uint32_t left_polls = context.auto_claim_deadline_polls >
+                context.auto_claim_polls
+            ? context.auto_claim_deadline_polls - context.auto_claim_polls
+            : 0;
+        if (context.auto_claim_chest != 0 && left_polls > 0 &&
+            context.auto_claim_polls % 3 == 0) {
+            // 窗口没出现时不要只重发交互：先把玩家重新贴回宝箱再交互。
+            // 游戏很可能按"玩家是否在交互范围内"决定是否真的响应。
+            double again_chest[3]{}, again_player[3]{};
+            const bool again_have_chest = FindChestPos(context, again_chest);
+            const bool again_have_player = SnapshotPlayerPosition(context, again_player);
+            const double again_dist = (again_have_chest && again_have_player)
+                ? std::sqrt(CombatDistanceSquared(again_player, again_chest))
+                : -1.0;
+            bool teleported = false;
+            if (again_have_chest &&
+                context.developer_mode.load(std::memory_order_acquire)) {
+                // 与主路径一致：先传送再交互，不按距离判断（实测这是唯一稳定有效的顺序）。
+                teleported = TeleportToPosition(context, again_chest);
+            }
+            const char* again_reason = "not attempted";
+            const bool accepted =
+                TriggerRewardChest(context, context.auto_claim_chest, &again_reason);
+            LogRewardDiagnostic(context, "autoclaim retrigger: polls=" +
+                std::to_string(context.auto_claim_polls) + " left=" +
+                std::to_string(left_polls) + " dist_cm=" +
+                std::to_string(static_cast<long long>(again_dist)) + " teleported=" +
+                std::to_string(teleported ? 1 : 0) + " accepted=" +
+                std::to_string(accepted ? 1 : 0) + " reason=" + again_reason);
         }
         return;
     }
@@ -6656,7 +6799,7 @@ void AutoClaimTick(Context& context) noexcept {
                 return;
             }
             context.auto_claim_phase = 3;
-            context.auto_claim_deadline = now + std::chrono::seconds(20);
+            context.auto_claim_deadline_polls = context.auto_claim_polls + kAutoClaimWaitPolls;
             context.combat_status = "已显示奖励并调用退出，等待离开副本";
         }
         return;
